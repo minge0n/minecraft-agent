@@ -1,0 +1,109 @@
+#!/bin/sh
+set -eu
+
+cd "$(dirname "$0")/.."
+root=$(pwd)
+mkdir -p .tools .runtime/minecraft .runtime/gradle
+
+for tool in curl tar python3; do
+  command -v "$tool" >/dev/null 2>&1 || { echo "Missing bootstrap prerequisite: $tool" >&2; exit 1; }
+done
+
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64)
+    uv_target=aarch64-apple-darwin
+    java_target=aarch64_mac
+    lefthook_target=MacOS_arm64
+    uv_sha=a9a8df1eedeb192f2e47e40e2faabfb387db4b850209118786d42f89dde3e0ba
+    java_sha=61979887f7506a24a57439ff99adb8b3a7fc89977d9cfe3b8984f58a981b7b9d
+    lefthook_sha=22881605cdf99b3d7da67005d6a08d4bb90fed4730dde6e2d39e316750be1afe
+    ;;
+  Darwin-x86_64)
+    uv_target=x86_64-apple-darwin
+    java_target=x64_mac
+    lefthook_target=MacOS_x86_64
+    uv_sha=cb5fa57bafe68fc0fb94b17f06bee0b0b9a7feb94ccbd110445afa0696e39273
+    java_sha=e6229d9504f7922053ab31821b9e6bee8761daf7b026a3476d1a027563009880
+    lefthook_sha=6b72981f76138abcd5af4eab65eb72435f4c0b48ba20abadd12b0aaad551d647
+    ;;
+  Linux-x86_64)
+    uv_target=x86_64-unknown-linux-gnu
+    java_target=x64_linux
+    lefthook_target=Linux_x86_64
+    uv_sha=23bf5552d220e0842b65c862097b2ebaeba0064b74eda5e565e77fd25969d8c8
+    java_sha=dbb698396d478e7fa2b1e50f4103324b2a99b90569ee27c33f2261f9215cf41e
+    lefthook_sha=3a00d7c023a701a72ee071a91d4c9f347a862fcd68295d8dffd02f92d81ddf
+    ;;
+  Linux-aarch64|Linux-arm64)
+    uv_target=aarch64-unknown-linux-gnu
+    java_target=aarch64_linux
+    lefthook_target=Linux_arm64
+    uv_sha=0804e9b164c64b6914182d5920c08551958a095986f10a3731056df701126436
+    java_sha=69df11a02cfa3ef7d7ca645e03edce6778ec090e100f6ae2b42097865730ac52
+    lefthook_sha=9ae4807cac0956c67387e5a5cbd2d54ec712d59c48b44e2ce5e601be2f727baf
+    ;;
+  *) echo 'Unsupported host: expected macOS/Linux on arm64/x86_64' >&2; exit 1 ;;
+esac
+
+verify() {
+  python3 - "$1" "$2" <<'PY'
+import hashlib
+import sys
+
+path, expected = sys.argv[1:]
+with open(path, "rb") as file:
+    digest = hashlib.file_digest(file, "sha256").hexdigest()
+if digest != expected:
+    raise SystemExit(f"SHA-256 mismatch: {path}: {digest}")
+PY
+}
+
+work=$(mktemp -d "$root/.tools/bootstrap.XXXXXXXX")
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+
+if [ ! -x .tools/uv ]; then
+  curl -fL --retry 3 "https://github.com/astral-sh/uv/releases/download/0.12.19/uv-${uv_target}.tar.gz" -o "$work/uv.tar.gz"
+  verify "$work/uv.tar.gz" "$uv_sha"
+  tar -xzf "$work/uv.tar.gz" -C "$work"
+  cp "$work/uv-${uv_target}/uv" .tools/uv
+  chmod +x .tools/uv
+fi
+case "$(.tools/uv --version)" in
+  'uv 0.12.19 '*) ;;
+  *)
+    echo 'Unexpected local uv version; remove .tools/uv and retry.' >&2
+    exit 1
+    ;;
+esac
+
+if [ ! -x .tools/jdk/bin/java ]; then
+  curl -fL --retry 3 "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.4.1%2B1/OpenJDK25U-jdk_${java_target}_hotspot_25.0.4.1_1.tar.gz" -o "$work/jdk.tar.gz"
+  verify "$work/jdk.tar.gz" "$java_sha"
+  mkdir "$work/jdk"
+  tar -xzf "$work/jdk.tar.gz" -C "$work/jdk"
+  if [ "$(uname -s)" = Darwin ]; then
+    mv "$work"/jdk/*/Contents/Home .tools/jdk
+  else
+    mv "$work"/jdk/* .tools/jdk
+  fi
+fi
+.tools/jdk/bin/java -version 2>&1 | grep -q '25.0.4.1' || { echo 'Unexpected local JDK version.' >&2; exit 1; }
+
+if [ ! -x .tools/lefthook ]; then
+  curl -fL --retry 3 "https://github.com/evilmartians/lefthook/releases/download/v2.1.14/lefthook_2.1.14_${lefthook_target}" -o "$work/lefthook"
+  verify "$work/lefthook" "$lefthook_sha"
+  mv "$work/lefthook" .tools/lefthook
+  chmod +x .tools/lefthook
+fi
+.tools/lefthook version | grep -q '2.1.14' || { echo 'Unexpected local Lefthook version.' >&2; exit 1; }
+
+export UV_PYTHON_INSTALL_DIR="$root/.tools/uv-python"
+.tools/uv python install 3.12.11 --install-dir "$UV_PYTHON_INSTALL_DIR"
+.tools/uv sync --locked --managed-python --python 3.12.11 --extra dev
+
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  .tools/lefthook install
+else
+  echo 'Not a Git checkout: initialize Git and run ./.tools/lefthook install to activate hooks.'
+fi
+printf 'Bootstrap complete. Run ./scripts/check and ./scripts/gradle build.\n'

@@ -1,0 +1,62 @@
+plugins {
+    // `net.fabricmc.fabric-loom` (not the legacy `fabric-loom`) is the plugin ID for
+    // unobfuscated Minecraft versions, which 26.3 is.
+    id 'net.fabricmc.fabric-loom' version "${loom_version}"
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = 'mcbot'
+}
+
+// Game run data lives in the repository-owned .runtime directory that
+// ./scripts/gradle creates, so runs never touch a personal Minecraft install.
+def runtimeMinecraftDir = layout.projectDirectory.dir('../../.runtime/minecraft')
+
+loom {
+    runs {
+        configureEach {
+            runDirectory = runtimeMinecraftDir.dir(name)
+        }
+    }
+}
+
+dependencies {
+    // Minecraft 26.3 ships official Mojang names, so no `mappings` dependency
+    // is needed or accepted here.
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+}
+
+processResources {
+    def props = [
+        version       : project.version,
+        minecraft     : project.minecraft_version,
+        loader        : project.loader_version,
+        java          : project.java_version,
+    ]
+    props.each { key, value -> inputs.property key, value }
+
+    filesMatching('fabric.mod.json') {
+        expand props
+    }
+}
+
+def javaVersion = JavaLanguageVersion.of(project.java_version as int)
+
+java {
+    // ./scripts/gradle runs Gradle on the pinned local Temurin JDK 25, so the
+    // toolchain is satisfied without downloading another JDK.
+    toolchain {
+        languageVersion = javaVersion
+    }
+    withSourcesJar()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = project.java_version as int
+    options.encoding = 'UTF-8'
+}

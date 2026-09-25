@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "mcbot",
+  "version": "${version}",
+  "name": "MC Bot Bridge",
+  "description": "Environment-integration layer that will expose Minecraft to the RL training process. No bridge protocol is implemented yet.",
+  "authors": [],
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.mcbot.McBotMod"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=${loader}",
+    "minecraft": "~${minecraft}",
+    "java": ">=${java}",
+    "fabric-api": "*"
+  }
+}

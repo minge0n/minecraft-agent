@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+[ -x .venv/bin/ruff ] && [ -x .venv/bin/pytest ] || { echo 'Run ./scripts/bootstrap first.' >&2; exit 1; }
+.venv/bin/ruff format --check src tests
+.venv/bin/ruff check src tests
+.venv/bin/pytest -q

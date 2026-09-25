@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+root=$(pwd)
+[ -x "$root/.tools/jdk/bin/java" ] || { echo 'Run ./scripts/bootstrap first.' >&2; exit 1; }
+export JAVA_HOME="$root/.tools/jdk"
+export GRADLE_USER_HOME="$root/.runtime/gradle"
+export PATH="$JAVA_HOME/bin:$PATH"
+mkdir -p "$GRADLE_USER_HOME" "$root/.runtime/minecraft"
+cd minecraft/fabric-mod
+exec ./gradlew --no-daemon "$@"
