@@ -6,6 +6,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.AccessibilityOnboardingScreen;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.TitleScreen;
+import net.minecraft.client.tutorial.TutorialSteps;
 import net.minecraft.core.HolderLookup;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.world.Difficulty;
@@ -21,6 +22,8 @@ import org.slf4j.LoggerFactory;
 public class McBotClient implements ClientModInitializer {
     private static final Logger LOGGER = LoggerFactory.getLogger(McBotMod.MOD_ID);
 
+    public static volatile boolean observerMode;
+
     private boolean probeWorldRequested;
 
     @Override
@@ -31,12 +34,12 @@ public class McBotClient implements ClientModInitializer {
         }
 
         long worldSeed = Long.parseLong(System.getenv().getOrDefault("MCBOT_WORLD_SEED", "12345"));
+        observerMode = true;
         new TickControl().start(Integer.parseInt(port));
         ClientTickEvents.END_CLIENT_TICK.register(minecraft -> openProbeWorld(minecraft, worldSeed));
     }
 
     private void openProbeWorld(Minecraft minecraft, long worldSeed) {
-        minecraft.options.pauseOnLostFocus = false;
         if (probeWorldRequested || minecraft.gui.overlay() != null) {
             return;
         }
@@ -46,6 +49,7 @@ public class McBotClient implements ClientModInitializer {
         }
 
         probeWorldRequested = true;
+        minecraft.options.tutorialStep = TutorialSteps.NONE;
         String levelId = "mcbot-tick-probe-" + System.currentTimeMillis();
         LevelSettings settings = new LevelSettings(
                 levelId,

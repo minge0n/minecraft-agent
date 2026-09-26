@@ -123,6 +123,21 @@ def run_probes(
     }
 
 
+def keep_open(control: TickControlClient, port: int) -> None:
+    print("Probes passed; stepping ~20 ticks/s for observation. Ctrl+C to quit.")
+    try:
+        while True:
+            if control.status().paused:
+                raise AssertionError(
+                    "singleplayer pause state appeared while observing"
+                )
+            control.step()
+    except KeyboardInterrupt:
+        control.close()
+        with TickControlClient.connect(port) as fresh:
+            fresh.quit()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run the Minecraft world tick-gate probe"
@@ -132,6 +147,11 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--wait", type=float, default=5.0)
     parser.add_argument("--startup-timeout", type=float, default=240.0)
+    parser.add_argument(
+        "--keep-open",
+        action="store_true",
+        help="keep the client running and stepping for observation until Ctrl+C",
+    )
     parser.add_argument(
         "--output", type=Path, default=Path("runs/minecraft-tick-gate/result.json")
     )
@@ -160,7 +180,10 @@ def main() -> None:
                 args.port, time.monotonic() + args.startup_timeout
             ) as control:
                 result |= run_probes(control, args.wait, args.steps)
-                control.quit()
+                if args.keep_open:
+                    keep_open(control, args.port)
+                else:
+                    control.quit()
             result["passed"] = True
         except Exception as error:
             result |= {"passed": False, "error": f"{type(error).__name__}: {error}"}
