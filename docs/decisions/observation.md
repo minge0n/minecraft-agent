@@ -1,6 +1,6 @@
 # Policy observation: structured visible field
 
-Status: **decided for schema `visible-field-v1`; implementation and runtime validation tracked in `docs/minecraft-spike.md`.** Supersedes the earlier target of a primarily RGB/visual policy input (RGB is deferred, not rejected) and the earlier allowance of the vanilla Recipe Book as policy information.
+Status: **decided for schema `visible-field-v1`; implemented over protocol v2 and runtime-verified for a scripted occlusion scene (see `docs/minecraft-spike.md`).** Supersedes the earlier target of a primarily RGB/visual policy input (RGB is deferred, not rejected) and the earlier allowance of the vanilla Recipe Book as policy information.
 
 ## Principle
 
@@ -19,7 +19,7 @@ A block or entity behind the player, outside the camera field of view, or hidden
 | --- | --- | --- | --- | --- |
 | Hidden-information leakage | Needs a separate per-element visibility test (face culling plus line of sight); easy to get subtly wrong and leak occluded faces | First hit per ray is visible by construction; nothing behind it is reported | Leaks everything in range by design | None beyond vanilla |
 | Tensor shape | Variable length; needs padding, masks and ordering rules | Fixed `H x W` per channel | Fixed | Fixed |
-| Cost | Visible-set search over a volume | `H*W` voxel traversals (measured per step, see spike ledger) | Cheap | Needs render sync and capture |
+| Cost | Visible-set search over a volume | `H*W` voxel traversals; measured 0.7-0.8 ms per step for 825 rays including JSON | Cheap | Needs render sync and capture |
 | Neural encoding | Set/attention encoder | Small conv or MLP encoder, like a depth + semantic camera | 3D conv | Conv encoder plus vision learning |
 | Dreamer fit | Awkward observation-reconstruction loss over sets | Per-ray categorical and distance reconstruction losses | n/a | Standard but expensive |
 | Version stability | Depends on culling details | Depends on `BlockGetter.clip` and outline shapes, stable vanilla APIs | n/a | Depends on renderer |
@@ -41,7 +41,7 @@ A pinhole camera at the player's eye with vertical field of view 70 degrees (the
 | `ray_type` | `H x W` | categorical | Registry index within the kind's registry: block, fluid or entity type. `0` when kind is none. Never treat as ordinal; encode with embeddings or one-hot. Vocabulary sizes come from `SCHEMA`. |
 | `ray_distance` | `H x W` | continuous, float | Euclidean distance from the eye to the hit, in blocks, in `[0, 32]`; `32` when kind is none. Suggested normalization: divide by 32. |
 
-Visibility rules: blocks use their outline shape (the same shape the crosshair targets), so glass and leaves occlude; this is conservative and never reveals more than vanilla rendering. Fluids are hit at their surface. Entities are hit by their bounding box when closer than the block hit; the player itself, spectators and entities invisible to the player are excluded. Only the entity type is exposed: no AI target, path, hidden health, UUID-derived data or status.
+Visibility rules: blocks use their outline shape (the same shape the crosshair targets), so glass and leaves occlude; this is conservative and never reveals more than vanilla rendering. Blocks with an invisible render shape (air, barrier, light, structure void) are skipped unless they carry a block entity; infested blocks report their host block type, because that is what a player sees. Unloaded chunks end the ray as none. Fluids are hit at their surface. Entities are hit by their bounding box when closer than the block hit; the player itself, spectators, markers, interaction entities and entities invisible to the player are excluded. Only the entity type is exposed: no AI target, path, hidden health, UUID-derived data or status.
 
 ### Self state (always available, HUD-like)
 
@@ -70,4 +70,4 @@ While an inventory or crafting GUI is open, a later schema version may expose in
 
 ## Separation and versioning
 
-Policy observations and privileged/debug data travel in separate protocol fields and parse into separate Python types (`PolicyObservation` versus `StepInfo` and `Debug*`). The parser rejects unknown observation fields so a protocol change cannot silently widen the policy input. A change to any field, shape, range or visibility rule bumps the schema version.
+Policy observations and privileged/debug data travel in separate protocol commands and parse into separate Python types: `PolicyObservation` (in `minecraft_rl.minecraft_interface`) versus `StepInfo`, `ResetInfo` and the `PrivilegedProbe` debug commands (in `minecraft_rl.minecraft_client`). The parser rejects missing or unknown observation fields, wrong types, out-of-range categorical IDs and distances, so a protocol change cannot silently widen the policy input. A change to any field, shape, range or visibility rule bumps the schema version. Vocabulary sizes come from `v2 SCHEMA`; human-readable registry names come only from privileged `DEBUG_REGISTRY` for tests and are never a policy input.

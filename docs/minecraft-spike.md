@@ -8,18 +8,18 @@ Revised by the observation architecture update (`docs/decisions/observation.md`)
 
 | Requirement | Status |
 | --- | --- |
-| Exact world/client/player one-tick stepping | proven (v1 probe, 3 runs) |
-| No wall-clock simulation progress while idle | proven (v1 probe) |
+| Exact world/client/player one-tick stepping | proven (v1 probe 3 runs; v1 regression after v2 changes) |
+| No wall-clock simulation progress while idle | proven (v1 probe; v2 observation unchanged over 3 s idle) |
 | Physics and hostile-mob progression only on steps | proven (v1 probe) |
-| Same-step action application | proven for `FORWARD`; factorized actions open |
-| Basic combat timing | open |
-| Structured visible observation | open |
-| Observation/action tick alignment | open |
-| Visibility and occlusion boundary, hidden-information audit | open |
-| Episode reset semantics for experiments | open |
-| Replay/determinism characterization | partial: scripted player trajectory repeated; mob AI diverged between same-seed runs |
-| Protocol and schema correctness | partial: v1 unit-tested; v2 open |
-| Measured throughput with per-phase breakdown | partial: ~10 steps/s total only |
+| Same-step action application | proven for v2 factorized yaw, pitch, forward, attack, hotbar |
+| Basic combat timing | proven: first attack damages on its step; held attack does not re-hit; see below |
+| Structured visible observation | proven: `visible-field-v1` over v2 |
+| Observation/action tick alignment | proven: post-step yaw/pitch and positions appear in the same step's observation |
+| Visibility and occlusion boundary, hidden-information audit | proven for the scripted scene (4 runs); see limitations |
+| Episode reset semantics for experiments | proven: fresh disposable world per reset, gated and frozen, `terminated` after death |
+| Replay/determinism characterization | partial: scripted player trajectory and combat/mining timing repeated; mob AI diverged between same-seed runs; no replay comparison yet |
+| Protocol and schema correctness | proven: v1 and v2 unit tests, strict schema parsing, JUnit for actions and ray geometry |
+| Measured throughput with per-phase breakdown | measured: ~10 steps/s, dominated by server-loop pacing; optimization open |
 | RGB framebuffer synchronization | deferred, not required |
 
 ## Automated runtime probe
@@ -31,9 +31,63 @@ Revised by the observation architecture update (`docs/decisions/observation.md`)
 
 The script launches the Loom `runClient` configuration through `./scripts/gradle` (project-local JDK 25, `.runtime/` game data), waits until the world is frozen, gated and unpaused, runs every check, asks the client to quit, and writes `runs/minecraft-tick-gate/result.json` plus `result.minecraft.log`. A full run takes about 80 s. It is an explicit integration test, not a Lefthook hook. The Loom dev launch uses an offline development profile (`Player###`); no Mojang login or authentication bypass is involved, and Realms fails to authorize as expected.
 
-When `MCBOT_TICK_PORT` is set, the client runs in **observer mode**: the pause menu never opens (ESC or focus loss), the cursor is not captured, and window input cannot act on the player. Pressing **`` ` `` (grave/backtick)** in the window toggles **human control**: the mod captures the mouse and passes keyboard and mouse input through; pressing it again releases the mouse and all held keys. The pause menu stays suppressed in both states. Human input only acts during granted ticks, so the player moves at the probe's stepping rate. The client disables the tutorial overlay and creates a disposable flat survival world named `mcbot-tick-probe-<millis>` from `MCBOT_WORLD_SEED` (default 12345). The integrated server freezes world ticking when it starts, and the client arms player/client gating once the player has loaded. With `--keep-open` the probe keeps stepping after the checks, fails if the pause state ever appears, and quits on Ctrl+C. The probe enables `MCBOT_TICK_TRACE` and fails unless the log shows `Server thread` tick callbacks.
+When `MCBOT_TICK_PORT` is set, the client runs in **observer mode**: the pause menu never opens (ESC or focus loss), the cursor is not captured, and window input cannot act on the player. Pressing **`` ` `` (grave/backtick)** in the window toggles **human control**: the mod captures the mouse and passes keyboard and mouse input through; pressing it again releases the mouse and all held keys. The pause menu stays suppressed in both states. Human input only acts during granted ticks, so the player moves at the probe's stepping rate. The client disables the tutorial overlay and creates a disposable flat survival world named `mcbot-episode-<millis>` from `MCBOT_WORLD_SEED` (default 12345). The integrated server freezes world ticking when it starts, and the client arms player/client gating once the player has loaded. With `--keep-open` the probe keeps stepping after the checks, fails if the pause state ever appears, and quits on Ctrl+C. The probe enables `MCBOT_TICK_TRACE` and fails unless the log shows `Server thread` tick callbacks.
 
 The Python protocol client lives in `src/minecraft_rl/tick_control.py`; `tests/test_tick_control.py` covers request encoding, reply parsing, actions, error and EOF handling over a socket pair, so it runs in the normal fast checks.
+
+## Structured-observation probe (v2)
+
+```sh
+.venv/bin/python scripts/minecraft-observation-probe.py
+```
+
+Same launch and observer mode as the tick-gate probe, on port 47124. It builds deterministic scenes through privileged `v2 DEBUG_*` commands (arena cleared, player teleported to face south, inventory cleared) and checks only the policy observation for visibility claims. It writes `runs/minecraft-observation/result.json`; a run takes about 80 s.
+
+### Protocol v2
+
+Newline-delimited `v2 <COMMAND> <json>` on the same loopback port; `v1` requests stay unchanged. Policy commands: `SCHEMA`, `STATUS`, `OBSERVE`, `STEP <PlayerAction>`, `RESET {"seed", "preset"}`, `QUIT`. `STEP` and `RESET` reply `{"observation", "terminated", "info"}`; `info` holds `step_id`, `tick_before`, `tick_after`, `client_tick`, `game_time` and phase timings, and is diagnostic. `DEBUG_SCENE`, `DEBUG_FILL`, `DEBUG_BLOCK`, `DEBUG_ENTITY`, `DEBUG_PLAYER`, `DEBUG_NEARBY`, `DEBUG_KILL` and `DEBUG_REGISTRY` are privileged test instrumentation. In Python, `MinecraftClient` returns `PolicyObservation` and `StepInfo`; privileged data is reachable only through `client.privileged()` (`PrivilegedProbe`) and has no conversion into a policy observation.
+
+`PlayerAction` has nine buttons (`forward`, `back`, `left`, `right`, `jump`, `sneak`, `sprint`, `attack`, `use`), bounded `yaw_delta`/`pitch_delta` in degrees (`|delta| <= 45`), and `hotbar` (`-1` keep, `0..8` select). Every field is required and unknown fields are rejected on both sides. Buttons are held for exactly the granted client tick; a button press that starts on a step also registers one vanilla click, so `attack` held across steps behaves like a held mouse button (continued mining, no repeated melee). Camera deltas are applied to the local player at `START_CLIENT_TICK`, before movement is simulated and sent. The probe world disables toggle-crouch/sprint/attack/use so buttons mean "held this tick".
+
+`RESET` disarms the gate, disconnects the integrated world, deletes the previous `mcbot-episode-*` world, creates a fresh disposable world from `seed` and `preset` (`flat` or `normal`, survival, normal difficulty), and replies once the new world is frozen and the client is gated again. Game time restarts at 0. `terminated` is true when the player is dead or dying; respawn is not used, reset is the only continuation.
+
+### Results (macOS arm64, seed 12345, 4 passing runs)
+
+Visibility scene: a diamond block 5 blocks ahead in the open, a stone wall at `z+4` (x 1..7, height 4), an emerald block and a no-AI husk behind the wall, a gold block 5 blocks behind the player. Privileged `DEBUG_NEARBY` confirms all hidden objects exist within 12 blocks.
+
+| Check | Result (all runs) |
+| --- | --- |
+| Visible block in view | present |
+| Block behind an opaque wall | absent |
+| Block behind the player | absent |
+| Husk behind the wall | absent |
+| Wall removed, next step | emerald block and husk present |
+| Wall restored, next step | husk absent again |
+| Turn 180 degrees (four 45-degree steps) | gold block present, diamond block absent |
+| Turn back | diamond block present |
+| 3 s idle, `OBSERVE` twice | identical observations |
+| `yaw_delta=30` | server yaw 0 -> 30 on the same step |
+| `pitch_delta=20` | observation pitch equals post-step server pitch (20.0); ray field changed |
+| `forward` | 0.098 blocks on the same step; nearest diamond ray distance 4.500 -> 4.402 |
+| Combat (stone sword, no-AI husk 2 blocks ahead) | first `attack` step: health 20.0 -> 19.06, hurt time 9; attack held 3 more steps: no further damage; release then press: hits again 2 steps later |
+| Mining (held `attack` on dirt, empty hand) | block broken after 15 steps |
+| Death | `DEBUG_KILL`, next step reports `terminated` (run 4) |
+| Reset flat, flat, normal | 2.3-3.9 s flat, 4.5-6.9 s normal; each new world frozen and gated, game time 0 |
+
+Combat note: the stone sword's attack cooldown is not fully recharged in the scene (low 0.94 damage). The probe characterizes click-versus-hold timing, not damage values.
+
+Throughput (200 `STEP NOOP`, median of 3 runs, ms per step):
+
+| Phase | Median | Meaning |
+| --- | --- | --- |
+| `client_wait_ms` | 3-12 | request accepted until the next frame grants the client tick |
+| `client_tick_ms` | 1.6 | client tick incl. input, movement and packet send |
+| `tick_end_wait_ms` | 30-39 | client tick end until the server loop consumes the tick-end packet |
+| `server_step_ms` | 54-55 | step granted at `START_SERVER_TICK` until `END_SERVER_TICK` of the stepped tick |
+| `observation_ms` | 0.7-0.8 | 825-ray sensor plus JSON encoding |
+| `total_ms` | 99 | server-side total; Python round trip 99.7-99.9 |
+
+Interpretation: `stepGameIfPaused` called at `START_SERVER_TICK` only takes effect on the following server loop iteration, because `TickRateManager.tick()` already ran for the current one; the stepped tick then waits for the 50 ms `waitUntilNextTick` deadline. Together with waiting for the tick-end packet this puts roughly two server-loop periods in every step. The sensor is not the bottleneck. Removing the wall-clock pacing is the next throughput experiment and must preserve one request = one exact transition.
 
 ## 26.3 tick lifecycle (from Loom-generated sources)
 
@@ -102,7 +156,8 @@ The scripted player trajectory repeated to within 1e-15 blocks and physics was i
 
 ## Known limitations and open work
 
-- Throughput is ~10 steps/s: each step waits for a render frame and then up to two 50 ms server iterations, one for the tick-end packet and one for the gated tick. Faster stepping needs a different mechanism and must be re-verified.
-- Only `NOOP` and `FORWARD` actions exist. They are scaffolding for timing tests, not the agent action space.
-- The client learns about a server step through `ClientboundTickingStepPacket`, which is processed before a later client tick. Client-side views of non-player entities are therefore likely one step behind the server. This is inferred from source, not measured, and matters for observation synchronization.
-- Combat, reset, structured observations, factorized actions and a proper replay/determinism comparison are untested. Mob AI already differed slightly between same-seed runs. Render synchronization and framebuffer capture are deferred with RGB.
+- Throughput is ~10 steps/s for v1 and v2; see the phase breakdown above. Faster stepping needs a different mechanism and must be re-verified.
+- v1 `NOOP` and `FORWARD` remain as the proven timing probe; v2 `PlayerAction` is the factorized interface. GUI and inventory actions are not implemented.
+- The client learns about a server step through `ClientboundTickingStepPacket`, which is processed before a later client tick. Client-side views of non-player entities are therefore likely one step behind the server. The v2 observation is computed from server state, so this does not affect it; it matters only if RGB returns.
+- Visibility evidence covers one scripted scene with full opaque blocks, one mob type and daylight. Transparent blocks, partial shapes, fluids, small entities, lighting and entities between rays are not yet tested; see `docs/decisions/observation.md` for known v1 limitations.
+- No replay/determinism comparison exists yet. Mob AI already differed slightly between same-seed runs.

@@ -2,7 +2,7 @@
 
 Research and teaching project toward a language-free, randomly initialized reinforcement-learning agent with a learned recurrent world model (Dreamer-style) for Minecraft 26.3. Perception is simplified into a structured, visibility-limited observation of what the player can currently see; hidden world state, recipes, demonstrations, pretrained models and scripted Minecraft knowledge stay unavailable to the policy.
 
-The repository currently contains reproducible tooling, a completed tabular Q-learning baseline, and a Fabric mod whose lockstep tick gate is runtime-verified. It does **not** yet contain a neural network, a Minecraft agent, rewards or a finished `reset`/`step` environment.
+The repository currently contains reproducible tooling, a completed tabular Q-learning baseline, and a Fabric mod whose lockstep tick gate, structured visible-field observation, factorized actions and fresh-world reset are runtime-verified. It does **not** yet contain a neural network, a Minecraft agent or rewards.
 
 ## Setup and commands
 
@@ -15,6 +15,7 @@ On macOS or Linux (arm64/x86_64), install the bootstrap prerequisites: POSIX she
 .venv/bin/python -m minecraft_rl.train --episodes 1000 --seed 42
 ./scripts/gradle build
 .venv/bin/python scripts/minecraft-tick-gate-probe.py
+.venv/bin/python scripts/minecraft-observation-probe.py
 ```
 
 Bootstrap downloads SHA-256-verified uv 0.12.19, Temurin 25.0.4.1+1 and Lefthook 2.1.14 into ignored `.tools/`, installs uv-managed CPython 3.12.11 in `.tools/uv-python`, syncs the locked dev environment to `.venv/`, and installs Git hooks when inside a Git checkout. It does not install any global Python package, JDK or Gradle. Re-run bootstrap after dependency changes and commit the updated `uv.lock`. Use `./.tools/uv lock` to update the lock deliberately. `./scripts/check` runs Ruff format check, Ruff lint and pytest; the same quick checks run from the Lefthook pre-commit hook. Training, Fabric builds and Minecraft runtime probes are explicit, not commit hooks. Java/Fabric changes should additionally pass `./scripts/gradle build`.
@@ -26,7 +27,9 @@ The GridWorld run prints the learned Q-table and a greedy policy map and writes 
 ## Layout and boundaries
 
 - `src/minecraft_rl/gridworld.py`, `q_learning.py`, `train.py`: Stage 1 tabular baseline.
-- `src/minecraft_rl/tick_control.py`: Python client for the Minecraft lockstep protocol.
+- `src/minecraft_rl/tick_control.py`: Python client for the validated v1 lockstep probe protocol.
+- `src/minecraft_rl/minecraft_interface.py`: versioned policy observation schema (`PolicyObservation`) and factorized `PlayerAction`.
+- `src/minecraft_rl/minecraft_client.py`: v2 client (`reset`, `step`, `observe`) and the separate test-only `PrivilegedProbe`.
 - `tests/`: deterministic checks for the current behaviors.
 - `minecraft/fabric-mod/`: Fabric environment-integration layer: lockstep tick gate, observer mode and test-only probe instrumentation.
 - `scripts/`: bootstrap, fast checks, pinned-JDK Gradle entrypoint and the Minecraft runtime probe.

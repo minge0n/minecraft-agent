@@ -8,6 +8,7 @@
   ],
   "client": [
     "DeltaTrackerTimerMixin",
+    "KeyMappingAccessor",
     "KeyboardHandlerMixin",
     "MinecraftMixin",
     "MouseHandlerMixin"

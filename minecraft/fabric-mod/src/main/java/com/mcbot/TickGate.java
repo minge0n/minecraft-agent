@@ -3,14 +3,16 @@ package com.mcbot;
 import java.util.Optional;
 
 final class TickGate {
-    sealed interface Response permits Status, Step, Rejected {}
+    sealed interface Response permits Status, StepOutcome {}
+
+    sealed interface StepOutcome extends Response permits Step, Rejected {}
 
     record Status(long gameTime, int serverTick, boolean frozen, boolean paused, boolean clientGated, long clientTicks)
             implements Response {}
 
-    record Step(long stepId, long gameTimeBefore, long gameTimeAfter, long clientTick) implements Response {}
+    record Step(long stepId, long gameTimeBefore, long gameTimeAfter, long clientTick) implements StepOutcome {}
 
-    record Rejected(String reason) implements Response {}
+    record Rejected(String reason) implements StepOutcome {}
 
     private enum Phase { IDLE, AWAITING_CLIENT_TICK, AWAITING_SERVER_TICK }
 
@@ -50,7 +52,7 @@ final class TickGate {
         return true;
     }
 
-    Optional<Response> observeTickEnd(long gameTime, long clientTicks) {
+    Optional<StepOutcome> observeTickEnd(long gameTime, long clientTicks) {
         if (phase != Phase.AWAITING_SERVER_TICK || gameTime == pendingGameTimeBefore) {
             return Optional.empty();
         }

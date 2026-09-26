@@ -1,5 +1,7 @@
 package com.mcbot;
 
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -10,9 +12,12 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Consumer;
+import java.util.function.Function;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.client.Minecraft;
@@ -31,10 +36,15 @@ import org.slf4j.LoggerFactory;
 
 final class TickControl {
     private static final Logger LOGGER = LoggerFactory.getLogger(McBotMod.MOD_ID);
+    private static final long REQUEST_TIMEOUT_SECONDS = 5;
+    private static final long RESET_TIMEOUT_MILLIS = 180_000;
+
+    private record PendingStep(CompletableFuture<String> reply, Function<TickGate.StepOutcome, String> finish) {}
 
     private final TickGate gate = new TickGate();
     private volatile IntegratedServer server;
-    private CompletableFuture<String> pendingStepReply;
+    private PendingStep pendingStep;
+    private long serverStepGrantedNanos;
     private int armorStandId = -1;
     private int huskId = -1;
 
@@ -48,29 +58,31 @@ final class TickControl {
         });
         ServerLifecycleEvents.SERVER_STOPPING.register(stopping -> {
             server = null;
-            if (pendingStepReply != null) {
+            if (pendingStep != null) {
                 gate.cancelPendingStep();
-                pendingStepReply.complete("v1 ERROR server_stopping");
-                pendingStepReply = null;
+                pendingStep.reply().complete(pendingStep.finish().apply(new TickGate.Rejected("server_stopping")));
+                pendingStep = null;
             }
         });
         ServerTickEvents.START_SERVER_TICK.register(ticked -> {
-            if (ticked != server || pendingStepReply == null) {
+            if (ticked != server || pendingStep == null) {
                 return;
             }
             long clientTicks = Lockstep.clientTicks();
             long clientTickEndsSent = Lockstep.clientTickEndsSent();
             if (gate.clientTickDelivered(clientTicks, clientTickEndsSent, Lockstep.clientTickEndsProcessed.get())) {
+                serverStepGrantedNanos = System.nanoTime();
                 ticked.tickRateManager().stepGameIfPaused(1);
             }
         });
         ServerTickEvents.END_SERVER_TICK.register(ticked -> {
-            if (ticked != server || pendingStepReply == null) {
+            if (ticked != server || pendingStep == null) {
                 return;
             }
-            gate.observeTickEnd(ticked.overworld().getGameTime(), Lockstep.clientTicks()).ifPresent(result -> {
-                pendingStepReply.complete(TickGate.encode(result));
-                pendingStepReply = null;
+            gate.observeTickEnd(ticked.overworld().getGameTime(), Lockstep.clientTicks()).ifPresent(outcome -> {
+                PendingStep finished = pendingStep;
+                pendingStep = null;
+                finished.reply().complete(finished.finish().apply(outcome));
             });
         });
 
@@ -86,8 +98,9 @@ final class TickControl {
                 try (Socket socket = listener.accept();
                      BufferedReader input = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
                      BufferedWriter output = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8))) {
+                    socket.setTcpNoDelay(true);
                     for (String request = input.readLine(); request != null; request = input.readLine()) {
-                        output.write(respond(request));
+                        output.write(request.startsWith("v2 ") ? respondV2(request.substring(3)) : respond(request));
                         output.write('\n');
                         output.flush();
                     }
@@ -102,80 +115,244 @@ final class TickControl {
 
     private String respond(String request) {
         if (request.equals("v1 QUIT")) {
-            Minecraft minecraft = Minecraft.getInstance();
-            minecraft.execute(minecraft::stop);
+            quit();
             return "v1 QUIT";
         }
+        return onServerThread("v1", reply -> handle(request, reply));
+    }
 
+    private String respondV2(String request) {
+        int split = request.indexOf(' ');
+        String command = split < 0 ? request : request.substring(0, split);
+        JsonObject payload;
+        try {
+            payload = split < 0 ? new JsonObject() : JsonParser.parseString(request.substring(split + 1)).getAsJsonObject();
+        } catch (RuntimeException e) {
+            return "v2 ERROR malformed_json";
+        }
+        return switch (command) {
+            case "QUIT" -> {
+                quit();
+                yield "v2 QUIT {}";
+            }
+            case "RESET" -> reset(payload);
+            default -> onServerThread("v2", reply -> handleV2(command, payload, reply));
+        };
+    }
+
+    private String onServerThread(String version, Consumer<CompletableFuture<String>> handler) {
         IntegratedServer current = server;
         if (current == null) {
-            return "v1 ERROR no_integrated_server";
+            return version + " ERROR no_integrated_server";
         }
         CompletableFuture<String> reply = new CompletableFuture<>();
-        current.execute(() -> handle(current, request, reply));
+        current.execute(() -> {
+            if (reply.isDone()) {
+                return;
+            }
+            try {
+                handler.accept(reply);
+            } catch (RuntimeException e) {
+                LOGGER.warn("tick control request failed", e);
+                reply.complete(version + " ERROR " + errorReason(e));
+            }
+        });
         try {
-            return reply.get(5, TimeUnit.SECONDS);
+            return reply.get(REQUEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         } catch (TimeoutException e) {
             current.execute(() -> cancelStep(current, reply));
-            return "v1 ERROR timeout";
+            return version + " ERROR timeout";
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return "v1 ERROR interrupted";
+            return version + " ERROR interrupted";
         } catch (Exception e) {
-            return "v1 ERROR " + e.getClass().getSimpleName();
+            return version + " ERROR " + e.getClass().getSimpleName();
         }
     }
 
-    private void handle(IntegratedServer current, String request, CompletableFuture<String> reply) {
-        if (reply.isDone()) {
-            return;
+    private static String errorReason(RuntimeException e) {
+        if (e instanceof IllegalArgumentException || e instanceof IllegalStateException) {
+            return e.getMessage();
         }
+        return e.getClass().getSimpleName();
+    }
+
+    private void quit() {
+        Minecraft minecraft = Minecraft.getInstance();
+        minecraft.execute(minecraft::stop);
+    }
+
+    private void handle(String request, CompletableFuture<String> reply) {
+        IntegratedServer current = server;
         long gameTime = current.overworld().getGameTime();
-        boolean frozen = current.tickRateManager().isFrozen();
         switch (request) {
-            case "v1 STATUS" -> reply.complete(TickGate.encode(new TickGate.Status(
-                    gameTime, current.getTickCount(), frozen, current.isPaused(),
-                    Lockstep.clientGated, Lockstep.clientTicks())));
-            case "v1 STEP NOOP" -> requestStep(current, gameTime, frozen, Lockstep.ClientAction.NOOP, reply);
-            case "v1 STEP FORWARD" -> requestStep(current, gameTime, frozen, Lockstep.ClientAction.FORWARD, reply);
+            case "v1 STATUS" -> reply.complete(TickGate.encode(status(current)));
+            case "v1 STEP NOOP" -> requestStep(current, PlayerAction.NOOP, reply, TickGate::encode);
+            case "v1 STEP FORWARD" -> requestStep(current, PlayerAction.FORWARD, reply, TickGate::encode);
             case "v1 DEBUG_SPAWN" -> reply.complete(spawnProbeEntities(current));
             case "v1 DEBUG_PROBE" -> reply.complete(probeEntities(current));
-            case "v1 DEBUG_PLAYER" -> reply.complete(probePlayer(current));
+            case "v1 DEBUG_PLAYER" -> reply.complete(probePlayer(current, gameTime));
             default -> reply.complete("v1 ERROR unknown_request");
         }
     }
 
+    private void handleV2(String command, JsonObject payload, CompletableFuture<String> reply) {
+        IntegratedServer current = server;
+        switch (command) {
+            case "SCHEMA" -> reply.complete(v2("SCHEMA", VisibleFieldSensor.schema()));
+            case "STATUS" -> reply.complete(v2("STATUS", statusJson(status(current))));
+            case "OBSERVE" -> reply.complete(v2("OBSERVE", observationReply(firstPlayer(current))));
+            case "STEP" -> {
+                long acceptedNanos = System.nanoTime();
+                PlayerAction action = PlayerAction.fromJson(payload);
+                requestStep(current, action, reply, outcome -> finishV2Step(current, outcome, acceptedNanos));
+            }
+            default -> {
+                if (!command.startsWith("DEBUG_")) {
+                    throw new IllegalArgumentException("unknown_request");
+                }
+                reply.complete(v2(command, DebugScene.handle(
+                        command, current.overworld().getGameTime(), firstPlayer(current), payload)));
+            }
+        }
+    }
+
+    private String finishV2Step(IntegratedServer current, TickGate.StepOutcome outcome, long acceptedNanos) {
+        if (outcome instanceof TickGate.Rejected rejected) {
+            return "v2 ERROR " + rejected.reason();
+        }
+        TickGate.Step step = (TickGate.Step) outcome;
+        long serverTickEndedNanos = System.nanoTime();
+        ServerPlayer player = firstPlayer(current);
+        JsonObject reply = observationReply(player);
+        long observedNanos = System.nanoTime();
+
+        JsonObject timing = new JsonObject();
+        timing.addProperty("client_wait_ms", millis(acceptedNanos, Lockstep.clientTickStartedNanos()));
+        timing.addProperty("client_tick_ms", millis(Lockstep.clientTickStartedNanos(), Lockstep.clientTickEndedNanos()));
+        timing.addProperty("tick_end_wait_ms", millis(Lockstep.clientTickEndedNanos(), serverStepGrantedNanos));
+        timing.addProperty("server_step_ms", millis(serverStepGrantedNanos, serverTickEndedNanos));
+        timing.addProperty("observation_ms", millis(serverTickEndedNanos, observedNanos));
+        timing.addProperty("total_ms", millis(acceptedNanos, observedNanos));
+
+        JsonObject info = reply.getAsJsonObject("info");
+        info.addProperty("step_id", step.stepId());
+        info.addProperty("tick_before", step.gameTimeBefore());
+        info.addProperty("tick_after", step.gameTimeAfter());
+        info.addProperty("client_tick", step.clientTick());
+        info.add("timing", timing);
+        return v2("STEP", reply);
+    }
+
+    private static JsonObject observationReply(ServerPlayer player) {
+        JsonObject reply = new JsonObject();
+        reply.add("observation", VisibleFieldSensor.observe(player));
+        reply.addProperty("terminated", player.isDeadOrDying());
+        JsonObject info = new JsonObject();
+        info.addProperty("game_time", player.level().getGameTime());
+        reply.add("info", info);
+        return reply;
+    }
+
+    private String reset(JsonObject payload) {
+        long seed;
+        WorldRequest.Preset preset;
+        try {
+            seed = payload.get("seed").getAsLong();
+            preset = WorldRequest.Preset.valueOf(payload.get("preset").getAsString().toUpperCase(Locale.ROOT));
+        } catch (RuntimeException e) {
+            return "v2 ERROR invalid_reset";
+        }
+
+        long started = System.nanoTime();
+        IntegratedServer previous = server;
+        long armedBefore = Lockstep.armCount();
+        McBotClient.requestFreshWorld(new WorldRequest(seed, preset));
+        long deadline = System.currentTimeMillis() + RESET_TIMEOUT_MILLIS;
+        while (System.currentTimeMillis() < deadline) {
+            IntegratedServer current = server;
+            if (current != null && current != previous && Lockstep.armCount() > armedBefore) {
+                return onServerThread("v2", reply -> {
+                    JsonObject result = observationReply(firstPlayer(current));
+                    JsonObject info = result.getAsJsonObject("info");
+                    info.addProperty("seed", seed);
+                    info.addProperty("preset", preset.name().toLowerCase(Locale.ROOT));
+                    info.addProperty("level_id", McBotClient.currentLevelId());
+                    info.addProperty("reset_ms", millis(started, System.nanoTime()));
+                    reply.complete(v2("RESET", result));
+                });
+            }
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return "v2 ERROR interrupted";
+            }
+        }
+        return "v2 ERROR reset_timeout";
+    }
+
+    private static String v2(String command, JsonObject payload) {
+        return "v2 " + command + " " + payload;
+    }
+
+    private static double millis(long fromNanos, long toNanos) {
+        return (toNanos - fromNanos) / 1.0e6;
+    }
+
+    private static TickGate.Status status(IntegratedServer current) {
+        return new TickGate.Status(
+                current.overworld().getGameTime(), current.getTickCount(), current.tickRateManager().isFrozen(),
+                current.isPaused(), Lockstep.clientGated, Lockstep.clientTicks());
+    }
+
+    private static JsonObject statusJson(TickGate.Status status) {
+        JsonObject json = new JsonObject();
+        json.addProperty("game_time", status.gameTime());
+        json.addProperty("server_tick", status.serverTick());
+        json.addProperty("frozen", status.frozen());
+        json.addProperty("paused", status.paused());
+        json.addProperty("client_gated", status.clientGated());
+        json.addProperty("client_ticks", status.clientTicks());
+        return json;
+    }
+
     private void requestStep(
             IntegratedServer current,
-            long gameTime,
-            boolean frozen,
-            Lockstep.ClientAction action,
-            CompletableFuture<String> reply) {
-        var rejected = gate.requestStep(gameTime, Lockstep.clientTicks(), frozen, current.isPaused(), Lockstep.clientGated);
+            PlayerAction action,
+            CompletableFuture<String> reply,
+            Function<TickGate.StepOutcome, String> finish) {
+        var rejected = gate.requestStep(
+                current.overworld().getGameTime(), Lockstep.clientTicks(), current.tickRateManager().isFrozen(),
+                current.isPaused(), Lockstep.clientGated);
         if (rejected.isPresent()) {
-            reply.complete(TickGate.encode(rejected.get()));
+            reply.complete(finish.apply(rejected.get()));
             return;
         }
-        pendingStepReply = reply;
+        pendingStep = new PendingStep(reply, finish);
         Lockstep.grantClientTick(action);
     }
 
     private void cancelStep(IntegratedServer current, CompletableFuture<String> reply) {
-        if (pendingStepReply != reply) {
+        if (pendingStep == null || pendingStep.reply() != reply) {
             return;
         }
-        pendingStepReply = null;
+        pendingStep = null;
         gate.cancelPendingStep();
         Lockstep.revokeClientTick();
         current.tickRateManager().stopStepping();
     }
 
-    private String spawnProbeEntities(IntegratedServer current) {
+    private static ServerPlayer firstPlayer(IntegratedServer current) {
         List<ServerPlayer> players = current.getPlayerList().getPlayers();
         if (players.isEmpty()) {
-            return "v1 ERROR no_player";
+            throw new IllegalStateException("no_player");
         }
-        ServerPlayer player = players.getFirst();
+        return players.getFirst();
+    }
+
+    private String spawnProbeEntities(IntegratedServer current) {
+        ServerPlayer player = firstPlayer(current);
         ServerLevel level = player.level();
         BlockPos ground = level.getHeightmapPos(Heightmap.Types.MOTION_BLOCKING, player.blockPosition());
         Entity armorStand = EntityTypes.ARMOR_STAND.create(level, EntitySpawnReason.COMMAND);
@@ -196,11 +373,7 @@ final class TickControl {
     }
 
     private String probeEntities(IntegratedServer current) {
-        List<ServerPlayer> players = current.getPlayerList().getPlayers();
-        if (players.isEmpty()) {
-            return "v1 ERROR no_player";
-        }
-        ServerPlayer player = players.getFirst();
+        ServerPlayer player = firstPlayer(current);
         Entity armorStand = player.level().getEntity(armorStandId);
         Entity husk = player.level().getEntity(huskId);
         if (armorStand == null || husk == null) {
@@ -210,15 +383,11 @@ final class TickControl {
                 + " " + husk.getX() + " " + husk.getZ() + " " + husk.distanceTo(player);
     }
 
-    private String probePlayer(IntegratedServer current) {
-        List<ServerPlayer> players = current.getPlayerList().getPlayers();
-        if (players.isEmpty()) {
-            return "v1 ERROR no_player";
-        }
-        ServerPlayer player = players.getFirst();
+    private String probePlayer(IntegratedServer current, long gameTime) {
+        ServerPlayer player = firstPlayer(current);
         int playTime = player.getStats().getValue(Stats.CUSTOM.get(Stats.PLAY_TIME));
         Lockstep.ClientPlayerSnapshot client = Lockstep.clientPlayer();
-        return "v1 DEBUG_PLAYER " + current.overworld().getGameTime()
+        return "v1 DEBUG_PLAYER " + gameTime
                 + " " + player.getX() + " " + player.getZ() + " " + player.tickCount + " " + playTime
                 + " " + client.clientTick() + " " + client.x() + " " + client.z() + " " + client.tickCount();
     }
