@@ -16,7 +16,7 @@
     ]
   },
   "mixins": [
-    "mcbot.client.mixins.json"
+    "mcbot.mixins.json"
   ],
   "depends": {
     "fabricloader": ">=${loader}",

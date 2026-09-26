@@ -7,12 +7,17 @@ class TickControlError(RuntimeError):
     pass
 
 
+ACTIONS = ("NOOP", "FORWARD")
+
+
 @dataclass(frozen=True)
 class Status:
     game_time: int
     server_tick: int
     frozen: bool
     paused: bool
+    client_gated: bool
+    client_ticks: int
 
 
 @dataclass(frozen=True)
@@ -20,6 +25,7 @@ class Step:
     step_id: int
     tick_before: int
     tick_after: int
+    client_tick: int
 
 
 @dataclass(frozen=True)
@@ -33,6 +39,21 @@ class ProbeSnapshot:
     husk_player_distance: float
 
 
+@dataclass(frozen=True)
+class PlayerSnapshot:
+    """Privileged test-only server and client player state; not a policy input."""
+
+    game_time: int
+    server_x: float
+    server_z: float
+    server_tick_count: int
+    server_play_time: int
+    client_tick: int
+    client_x: float
+    client_z: float
+    client_tick_count: int
+
+
 def encode_request(command: str) -> bytes:
     return f"v1 {command}\n".encode()
 
@@ -43,7 +64,7 @@ def parse_reply(command: str, line: str) -> list[str]:
     fields = line.split()
     if fields[:2] == ["v1", "ERROR"]:
         raise TickControlError(f"{command} rejected: {' '.join(fields[2:])}")
-    if fields[:2] != ["v1", command]:
+    if fields[:2] != ["v1", command.split()[0]]:
         raise TickControlError(f"unexpected reply to {command}: {line.strip()!r}")
     return fields[2:]
 
@@ -78,14 +99,23 @@ class TickControlClient:
         return parse_reply(command, self.reader.readline())
 
     def status(self) -> Status:
-        game_time, server_tick, frozen, paused = self.request("STATUS")
+        game_time, server_tick, frozen, paused, gated, client_ticks = self.request(
+            "STATUS"
+        )
         return Status(
-            int(game_time), int(server_tick), _parse_bool(frozen), _parse_bool(paused)
+            int(game_time),
+            int(server_tick),
+            _parse_bool(frozen),
+            _parse_bool(paused),
+            _parse_bool(gated),
+            int(client_ticks),
         )
 
-    def step(self) -> Step:
-        step_id, tick_before, tick_after = self.request("STEP")
-        return Step(int(step_id), int(tick_before), int(tick_after))
+    def step(self, action: str = "NOOP") -> Step:
+        if action not in ACTIONS:
+            raise ValueError(f"unknown action {action!r}")
+        step_id, tick_before, tick_after, client_tick = self.request(f"STEP {action}")
+        return Step(int(step_id), int(tick_before), int(tick_after), int(client_tick))
 
     def quit(self) -> None:
         self.request("QUIT")
@@ -101,4 +131,22 @@ class TickControlClient:
             float(husk_x),
             float(husk_z),
             float(distance),
+        )
+
+    def debug_player(self) -> PlayerSnapshot:
+        fields = self.request("DEBUG_PLAYER")
+        (game_time, server_x, server_z, server_ticks, play_time, client_tick) = fields[
+            :6
+        ]
+        client_x, client_z, client_ticks = fields[6:]
+        return PlayerSnapshot(
+            int(game_time),
+            float(server_x),
+            float(server_z),
+            int(server_ticks),
+            int(play_time),
+            int(client_tick),
+            float(client_x),
+            float(client_z),
+            int(client_ticks),
         )

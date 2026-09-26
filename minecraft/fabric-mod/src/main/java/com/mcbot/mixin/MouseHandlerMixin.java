@@ -11,7 +11,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public abstract class MouseHandlerMixin {
     @Inject(method = {"grabMouse", "onButton", "onScroll"}, at = @At("HEAD"), cancellable = true)
     private void mcbot$ignoreMouseInObserverMode(CallbackInfo callback) {
-        if (McBotClient.observerMode) {
+        if (McBotClient.observerMode && !McBotClient.humanControl) {
             callback.cancel();
         }
     }

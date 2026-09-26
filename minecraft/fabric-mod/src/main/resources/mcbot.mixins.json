@@ -2,7 +2,12 @@
   "required": true,
   "package": "com.mcbot.mixin",
   "compatibilityLevel": "JAVA_25",
+  "mixins": [
+    "ServerGamePacketListenerImplMixin",
+    "TickRateManagerMixin"
+  ],
   "client": [
+    "DeltaTrackerTimerMixin",
     "KeyboardHandlerMixin",
     "MinecraftMixin",
     "MouseHandlerMixin"

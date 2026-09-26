@@ -20,6 +20,7 @@ import net.minecraft.client.server.IntegratedServer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.stats.Stats;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntitySpawnReason;
 import net.minecraft.world.entity.EntityTypes;
@@ -53,11 +54,21 @@ final class TickControl {
                 pendingStepReply = null;
             }
         });
+        ServerTickEvents.START_SERVER_TICK.register(ticked -> {
+            if (ticked != server || pendingStepReply == null) {
+                return;
+            }
+            long clientTicks = Lockstep.clientTicks();
+            long clientTickEndsSent = Lockstep.clientTickEndsSent();
+            if (gate.clientTickDelivered(clientTicks, clientTickEndsSent, Lockstep.clientTickEndsProcessed.get())) {
+                ticked.tickRateManager().stepGameIfPaused(1);
+            }
+        });
         ServerTickEvents.END_SERVER_TICK.register(ticked -> {
             if (ticked != server || pendingStepReply == null) {
                 return;
             }
-            gate.observeTickEnd(ticked.overworld().getGameTime()).ifPresent(result -> {
+            gate.observeTickEnd(ticked.overworld().getGameTime(), Lockstep.clientTicks()).ifPresent(result -> {
                 pendingStepReply.complete(TickGate.encode(result));
                 pendingStepReply = null;
             });
@@ -122,21 +133,31 @@ final class TickControl {
         long gameTime = current.overworld().getGameTime();
         boolean frozen = current.tickRateManager().isFrozen();
         switch (request) {
-            case "v1 STATUS" -> reply.complete(TickGate.encode(
-                    new TickGate.Status(gameTime, current.getTickCount(), frozen, current.isPaused())));
-            case "v1 STEP" -> {
-                var rejected = gate.requestStep(gameTime, frozen, current.isPaused());
-                if (rejected.isPresent()) {
-                    reply.complete(TickGate.encode(rejected.get()));
-                    return;
-                }
-                pendingStepReply = reply;
-                current.tickRateManager().stepGameIfPaused(1);
-            }
+            case "v1 STATUS" -> reply.complete(TickGate.encode(new TickGate.Status(
+                    gameTime, current.getTickCount(), frozen, current.isPaused(),
+                    Lockstep.clientGated, Lockstep.clientTicks())));
+            case "v1 STEP NOOP" -> requestStep(current, gameTime, frozen, Lockstep.ClientAction.NOOP, reply);
+            case "v1 STEP FORWARD" -> requestStep(current, gameTime, frozen, Lockstep.ClientAction.FORWARD, reply);
             case "v1 DEBUG_SPAWN" -> reply.complete(spawnProbeEntities(current));
             case "v1 DEBUG_PROBE" -> reply.complete(probeEntities(current));
+            case "v1 DEBUG_PLAYER" -> reply.complete(probePlayer(current));
             default -> reply.complete("v1 ERROR unknown_request");
         }
+    }
+
+    private void requestStep(
+            IntegratedServer current,
+            long gameTime,
+            boolean frozen,
+            Lockstep.ClientAction action,
+            CompletableFuture<String> reply) {
+        var rejected = gate.requestStep(gameTime, Lockstep.clientTicks(), frozen, current.isPaused(), Lockstep.clientGated);
+        if (rejected.isPresent()) {
+            reply.complete(TickGate.encode(rejected.get()));
+            return;
+        }
+        pendingStepReply = reply;
+        Lockstep.grantClientTick(action);
     }
 
     private void cancelStep(IntegratedServer current, CompletableFuture<String> reply) {
@@ -145,6 +166,7 @@ final class TickControl {
         }
         pendingStepReply = null;
         gate.cancelPendingStep();
+        Lockstep.revokeClientTick();
         current.tickRateManager().stopStepping();
     }
 
@@ -186,5 +208,18 @@ final class TickControl {
         }
         return "v1 DEBUG_PROBE " + current.overworld().getGameTime() + " " + armorStand.getY()
                 + " " + husk.getX() + " " + husk.getZ() + " " + husk.distanceTo(player);
+    }
+
+    private String probePlayer(IntegratedServer current) {
+        List<ServerPlayer> players = current.getPlayerList().getPlayers();
+        if (players.isEmpty()) {
+            return "v1 ERROR no_player";
+        }
+        ServerPlayer player = players.getFirst();
+        int playTime = player.getStats().getValue(Stats.CUSTOM.get(Stats.PLAY_TIME));
+        Lockstep.ClientPlayerSnapshot client = Lockstep.clientPlayer();
+        return "v1 DEBUG_PLAYER " + current.overworld().getGameTime()
+                + " " + player.getX() + " " + player.getZ() + " " + player.tickCount + " " + playTime
+                + " " + client.clientTick() + " " + client.x() + " " + client.z() + " " + client.tickCount();
     }
 }
