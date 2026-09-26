@@ -8,7 +8,9 @@
 .venv/bin/python scripts/minecraft-tick-gate-probe.py
 ```
 
-The script launches the Loom `runClient` configuration through `./scripts/gradle` (project-local JDK 25, `.runtime/` game data), waits for the tick-control port, runs every check, asks the client to quit, and writes `runs/minecraft-tick-gate/result.json` plus the full game log. No mouse or keyboard input is needed: when `MCBOT_TICK_PORT` is set, the client entrypoint disables pause-on-lost-focus, creates a disposable flat survival world named `mcbot-tick-probe-<millis>` from `MCBOT_WORLD_SEED` (default 12345), and the integrated server freezes world ticking as soon as it starts. The Loom dev launch uses an offline development profile (`Player###`); no Mojang login or authentication bypass is involved, and online services such as Realms fail to authorize as expected. It is a manual/explicit integration test, not a Lefthook hook.
+The script launches the Loom `runClient` configuration through `./scripts/gradle` (project-local JDK 25, `.runtime/` game data), waits until the world is frozen and unpaused, runs every check, asks the client to quit, and writes `runs/minecraft-tick-gate/result.json` plus `result.minecraft.log`. No mouse or keyboard input is needed: when `MCBOT_TICK_PORT` is set, the client entrypoint disables pause-on-lost-focus, creates a disposable flat survival world named `mcbot-tick-probe-<millis>` from `MCBOT_WORLD_SEED` (default 12345), and the integrated server freezes world ticking as soon as it starts. The probe also enables `MCBOT_TICK_TRACE` and fails unless the log shows `Server thread` tick callbacks. The Loom dev launch uses an offline development profile (`Player###`); no Mojang login or authentication bypass is involved, and online services such as Realms fail to authorize as expected. It is a manual/explicit integration test, not a Lefthook hook.
+
+The Python protocol client lives in `src/minecraft_rl/tick_control.py`; `tests/test_tick_control.py` covers request encoding, reply parsing, error and EOF handling over a socket pair, so it runs in the normal fast checks.
 
 ## 26.3 tick lifecycle (from Loom-generated sources)
 
@@ -30,7 +32,9 @@ Four clocks are therefore distinct: wall-clock frames, client ticks (`Minecraft.
 - `TickGate` holds the step state machine and wire encoding; JUnit tests cover step completion, monotonic IDs, rejection when paused/unfrozen/concurrent, over-advance detection, cancellation and encoding.
 - Privileged probe state (armor stand height, husk position/distance) exists only for the integration test and is not a policy observation.
 
-## Runtime result (macOS arm64, seed 12345, one run)
+## Runtime results (macOS arm64, seed 12345)
+
+First run (earlier checkpoint, 20 entity steps):
 
 | Check | Result |
 | --- | --- |
@@ -38,15 +42,21 @@ Four clocks are therefore distinct: wall-clock frames, client ticks (`Minecraft.
 | Idle 5 s without STEP | world time 40 → 40 (server loop 47 → 147) |
 | One STEP | world time 40 → 41 |
 | 100 STEPs | exactly 100 world ticks, each reply `N → N+1`; no drift after the last step |
-| Armor stand (physics) idle 5 s | y unchanged at −50.0 |
-| Armor stand while stepping | fell 10 blocks over 20 steps, landed at −60.0 |
-| Husk (hostile AI) idle 5 s | position unchanged |
-| Husk while stepping | started moving toward the player (distance 6.0 → 5.947 by step 20) |
-| Throughput | ~20 steps/s (5.0 s for 100 steps) |
+| Armor stand (physics) idle 5 s / while stepping | unchanged / fell 10 blocks |
+| Husk (hostile AI) idle 5 s / while stepping | unchanged / began moving toward the player |
+
+Repeated runs with the current probe (60 entity steps, each probe snapshot required to match the stepped tick, husk must approach ≥ 1 block):
+
+| Run | Passed | Ticks for 100 STEPs | Steps/s | Armor stand fall | Husk approach | Server-thread trace |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | yes | 100 | 19.99 | 10.0 | 4.52 | yes |
+| 2 | yes | 100 | 20.01 | 10.0 | 4.30 | yes |
+| 3 | yes | 100 | 19.98 | 10.0 | 4.52 | yes |
+
+Each run created a fresh world with the same seed. Physics was identical across runs, but the husk's approach differed (4.30 vs 4.52 blocks): mob AI is not bit-for-bit reproducible across launches. This is an early replay/determinism observation, not a finished determinism study.
 
 ## Known limitations and open work
 
 - **Players are exempt from the freeze** (`TickRateManager.isEntityFrozen` excludes `Player`), and client ticks keep running. Player movement, input and client prediction are not gated; action application ordering is unproven.
-- Throughput is capped by the server's 50 ms tick deadline, because a step still waits for the next scheduled server tick. Faster stepping needs a different mechanism (for example controlled sprinting) and must be re-verified.
-- Only one run on one machine. The husk moved late and slowly; a longer mob trajectory and repeated runs are needed before relying on AI timing. Combat, reset, replay determinism, render synchronization and framebuffer capture are untested.
-- The Python controller in `scripts/` has no unit tests yet; the Java state machine does.
+- Throughput is ~20 steps/s, capped by the server's 50 ms tick deadline, because a step still waits for the next scheduled server tick. Faster stepping needs a different mechanism (for example controlled sprinting) and must be re-verified.
+- Only three runs on one machine. Combat, reset, a proper replay/determinism comparison, render synchronization and framebuffer capture are untested.

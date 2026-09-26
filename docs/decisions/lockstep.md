@@ -19,5 +19,5 @@ For the first verified experiment, prefer loopback TCP with one connection and o
 ## Investigation and validation ledger
 
 - Transport for the spike: loopback TCP, one connection, one in-flight request, line protocol `v1 STATUS|STEP|QUIT` (plus test-only `DEBUG_*`). Chosen as the smallest portable option; not yet the final environment protocol.
-- Proven (one automated run, see `docs/minecraft-spike.md`): with vanilla `ServerTickRateManager` freeze/step, world logical time and non-player entities stay still for 5 s of wall time and advance exactly one tick per STEP (1 and 100 steps verified), including falling-entity physics and hostile-mob AI.
+- Proven (automated, repeated three times, see `docs/minecraft-spike.md`): with vanilla `ServerTickRateManager` freeze/step, world logical time and non-player entities stay still for 5 s of wall time and advance exactly one tick per STEP (1 and 100 steps verified), including falling-entity physics and hostile-mob AI. Mob AI trajectories differed slightly between same-seed runs.
 - Not proven: player/client-tick gating (players are exempt from freeze), action ordering, render/capture synchronization, reset, replay determinism, throughput above ~20 steps/s. Until those are shown, `env.step()` is not a full lockstep contract.
