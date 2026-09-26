@@ -1,6 +1,26 @@
 # Minecraft 26.3 lockstep engineering spike
 
-**Scope:** No agent training, neural network, reward, reset or RGB transport. This spike asks whether an external controller can pause Minecraft's logical simulation and advance it by exactly one tick per request, with a player action applied on the intended tick. Stage 1.5 is **incomplete**: world, entity, server-player and client ticks are gated and runtime-verified; render/capture synchronization, reset, replay determinism and combat are not.
+**Scope:** No agent training, neural network or reward. This spike asks whether an external controller can pause Minecraft's logical simulation, advance it by exactly one tick per request with a player action applied on that tick, and return a structured visible-field observation of the result. Stage 1.5 is **incomplete**.
+
+## Stage 1.5 completion gate
+
+Revised by the observation architecture update (`docs/decisions/observation.md`): structured-observation synchronization replaces RGB framebuffer freshness, which is deferred together with RGB.
+
+| Requirement | Status |
+| --- | --- |
+| Exact world/client/player one-tick stepping | proven (v1 probe, 3 runs) |
+| No wall-clock simulation progress while idle | proven (v1 probe) |
+| Physics and hostile-mob progression only on steps | proven (v1 probe) |
+| Same-step action application | proven for `FORWARD`; factorized actions open |
+| Basic combat timing | open |
+| Structured visible observation | open |
+| Observation/action tick alignment | open |
+| Visibility and occlusion boundary, hidden-information audit | open |
+| Episode reset semantics for experiments | open |
+| Replay/determinism characterization | partial: scripted player trajectory repeated; mob AI diverged between same-seed runs |
+| Protocol and schema correctness | partial: v1 unit-tested; v2 open |
+| Measured throughput with per-phase breakdown | partial: ~10 steps/s total only |
+| RGB framebuffer synchronization | deferred, not required |
 
 ## Automated runtime probe
 
@@ -85,4 +105,4 @@ The scripted player trajectory repeated to within 1e-15 blocks and physics was i
 - Throughput is ~10 steps/s: each step waits for a render frame and then up to two 50 ms server iterations, one for the tick-end packet and one for the gated tick. Faster stepping needs a different mechanism and must be re-verified.
 - Only `NOOP` and `FORWARD` actions exist. They are scaffolding for timing tests, not the agent action space.
 - The client learns about a server step through `ClientboundTickingStepPacket`, which is processed before a later client tick. Client-side views of non-player entities are therefore likely one step behind the server. This is inferred from source, not measured, and matters for observation synchronization.
-- Combat, reset, a proper replay/determinism comparison, render synchronization and framebuffer capture are untested. Mob AI already differed slightly between same-seed runs.
+- Combat, reset, structured observations, factorized actions and a proper replay/determinism comparison are untested. Mob AI already differed slightly between same-seed runs. Render synchronization and framebuffer capture are deferred with RGB.

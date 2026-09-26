@@ -1,0 +1,56 @@
+# Learning roadmap: Dreamer first
+
+Status: **decided direction; nothing beyond Stage 1 is implemented.** Supersedes the earlier "Q-learning, then DQN" path. DQN may appear later as an optional baseline but is not on the critical path.
+
+```text
+Stage 1   tabular Q-learning baseline (done, docs/stage1.md)
+Stage 1.5 Minecraft lockstep + structured observation contract (in progress)
+Stage 2A  neural-network sanity check
+Stage 2B  recurrent model sanity check
+Stage 2C  learned dynamics in a toy environment
+Stage 2D  imagination and compounding-error measurement
+Stage 2E  actor-critic trained in imagination
+Stage 2F  integrated Dreamer-style toy agent
+Later     Dreamer on the structured Minecraft observation
+```
+
+Stage 2A starts only after the Stage 1.5 gate in `docs/minecraft-spike.md` is validated. Minecraft training starts only after Stage 2F works. Running neural code is not a reason to start long Minecraft training.
+
+## Target architecture
+
+```text
+structured current observation -> observation encoder -> recurrent latent state (RSSM)
+    learned world model: next latent, reward, continuation
+    imagined trajectories -> actor + critic -> factorized Minecraft action
+```
+
+The world model is learned from real transitions only; no hard-coded Minecraft physics, recipes or strategy. The loop alternates: collect real experience, improve the world model, imagine trajectories, improve actor and critic, collect again. It must not memorize and replay successful trajectories. Knowledge lives only in learned parameters, embeddings, recurrent state and dynamics.
+
+## Implementation policy
+
+PyTorch, random initialization, no high-level RL or Dreamer package hiding the algorithm. The DreamerV3 paper and code are technical references and comparison targets. Code should make explicit: observation encoder, replay sequences, RSSM with deterministic recurrent state and stochastic latent state, observation, reward and continuation prediction, KL regularization, imagined rollout, actor, critic and return/value targets. Implement incrementally in small validated commits. Each new component is explained to the developer in Korean (problem, inputs/outputs and tensor shapes, parameters, loss, gradients, Minecraft relevance).
+
+## Stages
+
+- **2A neural sanity check:** add PyTorch; a tiny network learns a deterministic supervised mapping. Verifies the local ML environment, gradients, checkpoint save/load, CPU/GPU device selection, and inspectable tensor and optimizer behavior. Not DQN.
+- **2B recurrent model:** a small recurrent model on a toy sequence task, proving that an earlier observation changes a later prediction.
+- **2C learned dynamics:** in a tiny environment, learn `history + action -> next latent/observation, reward`. Tests and plots show prediction error improving.
+- **2D imagination:** roll the learned model forward without the real environment, compare imagined and real rollouts from the same starting points at horizons 1, 5, 10, 20, and measure compounding error. A falling training loss is not proof of a correct model.
+- **2E actor-critic in imagination:** train actor and critic on imagined trajectories, evaluate only in the real toy environment, and show improvement above random.
+- **2F integrated toy agent:** one understandable Dreamer-style loop combining the pieces.
+
+### Toy environment
+
+A small T-maze cue-memory task: a cue is visible at the start, disappears, and the correct turn at a later junction requires remembering it. It exercises recurrent state, partial observability, world-model learning, actor-critic learning and imagination cheaply. An equally small alternative is acceptable only with a clear reason.
+
+## Model-error evaluation (first-class)
+
+For real starting points, compare real and imagined rollouts at increasing horizons and track observation, reward and continuation prediction error, plus task-relevant state error where measurable. Flag policies with high imagined return but poor real return. Respond to model exploitation by improving data coverage, uncertainty handling, model design or imagination horizon, never by hard-coding task solutions.
+
+## Minecraft integration (later)
+
+The encoder learns categorical block, entity and item embeddings from scratch, without pretrained or text semantics. The environment never keeps supplying objects that are no longer visible; the recurrent state must retain them if useful.
+
+## Reward direction
+
+Extrinsic reward comes from advancements as a scalar only; the policy never sees advancement names, descriptions or recipe-bearing metadata. One-time rewards are deduplicated per episode. Start with a simple baseline and measure it. The later `reward_i = base_reward_i * mastery_multiplier_i` experiment makes the reward non-stationary and must be tested, not assumed beneficial. No handcrafted skill hierarchy or planner; if hierarchy becomes necessary, prefer learned options or latent goals justified experimentally.

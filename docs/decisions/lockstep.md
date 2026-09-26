@@ -2,7 +2,15 @@
 
 ## Decision: target contract, not an implementation claim
 
-An eventual Minecraft environment step submits exactly one player action, advances exactly one logical simulation tick, synchronizes the result, captures a post-step observation, and waits again. Time spent in Python inference must not advance simulation time. A reply must include `step_id`, `tick_before`, and `tick_after` in a diagnostic field, with privileged state available only through an explicitly separate debug/test interface. A successful server-tick probe alone does not prove client rendering or observation freshness.
+An eventual Minecraft environment step submits exactly one factorized player action, advances exactly one logical simulation tick, synchronizes the result, builds the post-step observation, and waits indefinitely for the next action:
+
+```text
+observation_t -> factorized action_t -> exactly one logical tick -> observation_t+1 -> wait
+```
+
+Time spent in Python inference must not advance simulation time. A reply must include `step_id`, `tick_before`, and `tick_after` in a diagnostic field, with privileged state available only through an explicitly separate debug/test interface.
+
+**Changed (observation architecture update):** the post-step observation is now the structured visible field of `docs/decisions/observation.md`, built on the server thread from post-step state. RGB framebuffer freshness was previously a Stage 1.5 requirement; it is now deferred with RGB itself. If RGB returns, a server-tick proof alone still does not prove client rendering or capture freshness.
 
 The target Python interface is `obs, info = env.reset(seed=...)` and `obs, reward, terminated, truncated, info = env.step(action)`. It is a target rather than a deployed contract until integrated-server and client-side synchronization are verified. Do not put test-only coordinates, mob health, seed internals, or other privileged information into policy observations.
 
@@ -20,4 +28,5 @@ For the first verified experiment, prefer loopback TCP with one connection and o
 
 - Transport for the spike: loopback TCP, one connection, one in-flight request, line protocol `v1 STATUS|STEP <action>|QUIT` (plus test-only `DEBUG_*`). Chosen as the smallest portable option; not yet the final environment protocol.
 - Proven (automated, full gate passed three times, see `docs/minecraft-spike.md`): with vanilla `ServerTickRateManager` freeze/step plus mixins gating client ticks (`DeltaTracker.Timer.advanceGameTime`) and server player ticks (`tickPlayer`, `isEntityFrozen`), one STEP advances world time, server player, client and local player by exactly one tick each. Nothing advances during 5 s of wall-clock idle. A `FORWARD` action moves the server player on the same step it is submitted. Physics and hostile-mob AI progress only on steps. Mob AI trajectories differed slightly between same-seed runs.
-- Not proven: render/capture synchronization (client views of non-player entities are likely one step behind), reset, replay determinism, combat, throughput above ~10 steps/s. Until those are shown, `env.step()` is not a full lockstep contract.
+- Not proven: structured-observation alignment, factorized actions, reset, replay determinism, combat, throughput above ~10 steps/s. Until those are shown, `env.step()` is not a full lockstep contract. Render/capture synchronization is deferred with RGB (client views of non-player entities are likely one step behind the server, inferred from source).
+- Protocol versioning: `v1` stays as validated. Structured observations and factorized actions use a new `v2` request family alongside it, so the proven `v1` probe keeps working.
