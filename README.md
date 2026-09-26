@@ -40,7 +40,7 @@ Temurin is acquired from the [Adoptium Temurin 25 release](https://github.com/ad
 
 ## Git checkpoint
 
-The canonical remote is `https://github.com/minge0n/minecraft-agent.git`, branch `main`. A coherent validated unit is checked, diff-reviewed, committed and pushed; `main` is never force-pushed. Stage 1.5 is **not** complete merely because Fabric compiles: the [spike validation ledger](docs/minecraft-spike.md) lists the unproven runtime properties and the opt-in tick callback trace. Keep secrets, game files, worlds, JDK/Python runtimes and model artifacts out of Git.
+The canonical remote is `https://github.com/minge0n/minecraft-agent.git`, branch `main`. A coherent validated unit is checked, diff-reviewed, committed and pushed; `main` is never force-pushed. Stage 1.5 is **not** complete merely because Fabric compiles or one layer is stepped: the [spike validation ledger](docs/minecraft-spike.md) lists what the automated world-tick probe (`.venv/bin/python scripts/minecraft-tick-gate-probe.py`) proves and what remains unproven. Keep secrets, game files, worlds, JDK/Python runtimes and model artifacts out of Git.
 
 ## Next milestones
 

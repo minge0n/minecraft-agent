@@ -10,9 +10,11 @@ public class McBotMod implements ModInitializer {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
+    private long observedServerTickCallbacks;
+
     @Override
     public void onInitialize() {
-        LOGGER.info("mcbot initialized; no environment bridge is active yet");
+        LOGGER.info("mcbot initialized; no policy bridge is active");
         if (!"1".equals(System.getenv("MCBOT_TICK_TRACE"))) {
             return;
         }
@@ -22,6 +24,4 @@ public class McBotMod implements ModInitializer {
         ServerTickEvents.END_SERVER_TICK.register(server ->
                 LOGGER.info("server tick end observed_callback_count={}", ++observedServerTickCallbacks));
     }
-
-    private long observedServerTickCallbacks;
 }

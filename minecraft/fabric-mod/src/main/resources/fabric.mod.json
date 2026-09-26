@@ -3,13 +3,16 @@
   "id": "mcbot",
   "version": "${version}",
   "name": "MC Bot Bridge",
-  "description": "Environment-integration layer that will expose Minecraft to the RL training process. No bridge protocol is implemented yet.",
+  "description": "Environment-integration layer for the RL project. Contains an opt-in experimental world tick gate for lockstep validation; no policy bridge.",
   "authors": [],
   "license": "MIT",
   "environment": "*",
   "entrypoints": {
     "main": [
       "com.mcbot.McBotMod"
+    ],
+    "client": [
+      "com.mcbot.McBotClient"
     ]
   },
   "depends": {

@@ -18,4 +18,6 @@ For the first verified experiment, prefer loopback TCP with one connection and o
 
 ## Investigation and validation ledger
 
-Record observed tick lifecycle, the chosen control point and its safety constraints, the exact scope of any prototype, commands, snapshots, replay differences and throughput here as measurements become available. Until an end-to-end proof exists, never report that `env.step()` provides one Minecraft tick.
+- Transport for the spike: loopback TCP, one connection, one in-flight request, line protocol `v1 STATUS|STEP|QUIT` (plus test-only `DEBUG_*`). Chosen as the smallest portable option; not yet the final environment protocol.
+- Proven (one automated run, see `docs/minecraft-spike.md`): with vanilla `ServerTickRateManager` freeze/step, world logical time and non-player entities stay still for 5 s of wall time and advance exactly one tick per STEP (1 and 100 steps verified), including falling-entity physics and hostile-mob AI.
+- Not proven: player/client-tick gating (players are exempt from freeze), action ordering, render/capture synchronization, reset, replay determinism, throughput above ~20 steps/s. Until those are shown, `env.step()` is not a full lockstep contract.
