@@ -11,6 +11,7 @@ import net.minecraft.client.Options;
 import net.minecraft.client.gui.screens.AccessibilityOnboardingScreen;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.TitleScreen;
+import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.client.tutorial.TutorialSteps;
 import net.minecraft.core.HolderLookup;
@@ -20,6 +21,8 @@ import net.minecraft.resources.ResourceKey;
 import net.minecraft.util.Mth;
 import net.minecraft.world.Difficulty;
 import net.minecraft.world.level.GameType;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.LevelSettings;
 import net.minecraft.world.level.WorldDataConfiguration;
 import net.minecraft.world.level.levelgen.WorldDimensions;
@@ -27,6 +30,7 @@ import net.minecraft.world.level.levelgen.WorldOptions;
 import net.minecraft.world.level.levelgen.presets.WorldPreset;
 import net.minecraft.world.level.levelgen.presets.WorldPresets;
 import net.minecraft.world.level.storage.LevelStorageSource;
+import net.minecraft.world.phys.AABB;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -69,6 +73,7 @@ public class McBotClient implements ClientModInitializer {
         Minecraft minecraft = Minecraft.getInstance();
         minecraft.execute(() -> {
             Lockstep.disarm();
+            Lockstep.setTraceRegion(null);
             KeyMapping.releaseAll();
             scriptedAttackHeld = false;
             String previousLevelId = currentLevelId;
@@ -153,10 +158,12 @@ public class McBotClient implements ClientModInitializer {
         boolean sentTickEnd = minecraft.level != null && minecraft.getConnection() != null && !minecraft.isPaused();
         LocalPlayer player = minecraft.player;
         if (player == null) {
-            Lockstep.recordClientTick(sentTickEnd, Double.NaN, Double.NaN, Double.NaN, Float.NaN, Float.NaN, -1);
+            Lockstep.recordClientTick(sentTickEnd, Lockstep.ClientPlayerSnapshot.ABSENT);
         } else {
-            Lockstep.recordClientTick(sentTickEnd, player.getX(), player.getY(), player.getZ(),
-                    player.getYRot(), player.getXRot(), player.tickCount);
+            var velocity = player.getDeltaMovement();
+            Lockstep.recordClientTick(sentTickEnd, new Lockstep.ClientPlayerSnapshot(
+                    0, player.getX(), player.getY(), player.getZ(), player.getYRot(), player.getXRot(), player.tickCount,
+                    velocity.x, velocity.y, velocity.z, player.onGround(), clientView(minecraft)));
         }
 
         if (!Lockstep.clientGated && player != null && minecraft.getConnection() != null
@@ -165,6 +172,22 @@ public class McBotClient implements ClientModInitializer {
             Lockstep.arm();
             LOGGER.info("lockstep armed: client and player ticks now run only on STEP");
         }
+    }
+
+    private static Lockstep.ClientView clientView(Minecraft minecraft) {
+        RegionDigest region = Lockstep.traceRegion();
+        ClientLevel level = minecraft.level;
+        if (region == null || level == null) {
+            return Lockstep.ClientView.NONE;
+        }
+        AABB box = region.box();
+        int entities = 0;
+        for (Entity entity : level.entitiesForRendering()) {
+            if (!(entity instanceof Player) && box.contains(entity.position())) {
+                entities++;
+            }
+        }
+        return new Lockstep.ClientView(region.blocks(level), entities);
     }
 
     private void openPendingWorld(Minecraft minecraft) {

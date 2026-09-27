@@ -17,7 +17,7 @@ Revised by the observation architecture update (`docs/decisions/observation.md`)
 | Observation/action tick alignment | proven: post-step yaw/pitch and positions appear in the same step's observation |
 | Visibility and occlusion boundary, hidden-information audit | proven for the scripted scene (4 runs); see limitations |
 | Episode reset semantics for experiments | proven: fresh disposable world per reset, gated and frozen, `terminated` after death |
-| Replay/determinism characterization | partial: scripted player trajectory and combat/mining timing repeated; mob AI diverged between same-seed runs; no replay comparison yet |
+| Replay/determinism characterization | measured: player-driven transitions and policy observations bit-identical across runs and processes once world RNG consumers are removed; mob AI, drop scatter and random ticks diverge (`docs/replay-characterization.md`) |
 | Protocol and schema correctness | proven: v1 and v2 unit tests, strict schema parsing, JUnit for actions and ray geometry |
 | Measured throughput with per-phase breakdown | measured: ~10 steps/s, dominated by server-loop pacing; optimization open |
 | RGB framebuffer synchronization | deferred, not required |
@@ -45,7 +45,7 @@ Same launch and observer mode as the tick-gate probe, on port 47124. It builds d
 
 ### Protocol v2
 
-Newline-delimited `v2 <COMMAND> <json>` on the same loopback port; `v1` requests stay unchanged. Policy commands: `SCHEMA`, `STATUS`, `OBSERVE`, `STEP <PlayerAction>`, `RESET {"seed", "preset"}`, `QUIT`. `STEP` and `RESET` reply `{"observation", "terminated", "info"}`; `info` holds `step_id`, `tick_before`, `tick_after`, `client_tick`, `game_time` and phase timings, and is diagnostic. `DEBUG_SCENE`, `DEBUG_FILL`, `DEBUG_BLOCK`, `DEBUG_ENTITY`, `DEBUG_PLAYER`, `DEBUG_NEARBY`, `DEBUG_KILL` and `DEBUG_REGISTRY` are privileged test instrumentation. In Python, `MinecraftClient` returns `PolicyObservation` and `StepInfo`; privileged data is reachable only through `client.privileged()` (`PrivilegedProbe`) and has no conversion into a policy observation.
+Newline-delimited `v2 <COMMAND> <json>` on the same loopback port; `v1` requests stay unchanged. Policy commands: `SCHEMA`, `STATUS`, `OBSERVE`, `STEP <PlayerAction>`, `RESET {"seed", "preset"}`, `QUIT`. `STEP` and `RESET` reply `{"observation", "terminated", "info"}`; `info` holds `step_id`, `tick_before`, `tick_after`, `client_tick`, `game_time` and phase timings, and is diagnostic. `DEBUG_SCENE`, `DEBUG_FILL`, `DEBUG_BLOCK`, `DEBUG_ENTITY`, `DEBUG_PLAYER`, `DEBUG_NEARBY`, `DEBUG_KILL`, `DEBUG_TRACE` and `DEBUG_REGISTRY` are privileged test instrumentation. In Python, `MinecraftClient` returns `PolicyObservation` and `StepInfo`; privileged data is reachable only through `client.privileged()` (`PrivilegedProbe`) and has no conversion into a policy observation.
 
 `PlayerAction` has nine buttons (`forward`, `back`, `left`, `right`, `jump`, `sneak`, `sprint`, `attack`, `use`), bounded `yaw_delta`/`pitch_delta` in degrees (`|delta| <= 45`), and `hotbar` (`-1` keep, `0..8` select). Every field is required and unknown fields are rejected on both sides. Buttons are held for exactly the granted client tick; a button press that starts on a step also registers one vanilla click, so `attack` held across steps behaves like a held mouse button (continued mining, no repeated melee). Camera deltas are applied to the local player at `START_CLIENT_TICK`, before movement is simulated and sent. The probe world disables toggle-crouch/sprint/attack/use so buttons mean "held this tick".
 
@@ -158,9 +158,9 @@ The scripted player trajectory repeated to within 1e-15 blocks and physics was i
 
 - Throughput is ~10 steps/s for v1 and v2; see the phase breakdown above. Faster stepping needs a different mechanism and must be re-verified.
 - v1 `NOOP` and `FORWARD` remain as the proven timing probe; v2 `PlayerAction` is the factorized interface. GUI and inventory actions are not implemented.
-- The client learns about a server step through `ClientboundTickingStepPacket`, which is processed before a later client tick. Client-side views of non-player entities are therefore likely one step behind the server. The v2 observation is computed from server state, so this does not affect it; it matters only if RGB returns.
+- The client learns about a server step through `ClientboundTickingStepPacket`, which is processed before a later client tick. Measured: 74 of 98 server-side world changes reached the client copy one step later, 24 on the same step (`docs/replay-characterization.md`). The v2 observation is computed from server state, so this does not affect it; it matters for recording.
 - Visibility evidence covers one scripted scene with full opaque blocks, one mob type and daylight. Transparent blocks, partial shapes, fluids, small entities, lighting and entities between rays are not yet tested; see `docs/decisions/observation.md` for known v1 limitations.
-- No replay/determinism comparison exists yet. Mob AI already differed slightly between same-seed runs.
+- Replay characterization covers one flat scene and 243 steps; see `docs/replay-characterization.md`.
 - Both runtime probes are non-recording infrastructure tests under `docs/decisions/recording.md`; no recorder exists yet.
 - Each probe launch currently gets a random development username (`PlayerNNN`, from the 26.3 `--username` default); deterministic `AgentNNNN` identities are decided in `docs/decisions/parallel-workers.md` but not wired.
 - The shared client options still use vanilla defaults (VSync on, 120 FPS cap, render distance 16, fancy graphics); low-cost render settings and unpaced stepping are next (`docs/decisions/simulation-throughput.md`).

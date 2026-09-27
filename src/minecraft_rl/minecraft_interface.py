@@ -1,3 +1,5 @@
+import hashlib
+import json
 import math
 from dataclasses import asdict, dataclass
 from typing import Any, Self
@@ -141,6 +143,11 @@ class PolicyObservation:
             for ray_kind, type_id in zip(self.ray_kind, self.ray_type, strict=True)
             if ray_kind == kind
         )
+
+    def digest(self) -> str:
+        """Stable SHA-256 of every field, for exact replay comparison."""
+        encoded = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode()).hexdigest()
 
 
 def _integers(values: list[Any], length: int, name: str) -> tuple[int, ...]:

@@ -1,10 +1,7 @@
 import argparse
 import json
 import math
-import os
-import signal
 import statistics
-import subprocess
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -16,27 +13,10 @@ from minecraft_rl.minecraft_interface import (
     PlayerAction,
     PolicyObservation,
 )
+from minecraft_rl.minecraft_launch import launched_client
 
 NOOP = PlayerAction()
 CENTER_TOLERANCE_DEGREES = 1e-3
-
-
-def wait_for_world(port: int, deadline: float) -> MinecraftClient:
-    while time.monotonic() < deadline:
-        try:
-            client = MinecraftClient.connect(port)
-        except OSError:
-            time.sleep(1)
-            continue
-        try:
-            status = client.status()
-            if status.frozen and status.client_gated and not status.paused:
-                return client
-        except (OSError, RuntimeError, ValueError, KeyError):
-            pass
-        client.close()
-        time.sleep(1)
-    raise TimeoutError("Minecraft did not reach a frozen, gated, unpaused world")
 
 
 def check(condition: bool, message: str) -> None:
@@ -348,38 +328,17 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    root = Path(__file__).resolve().parent.parent
     args.output.parent.mkdir(parents=True, exist_ok=True)
     log_path = args.output.with_suffix(".minecraft.log")
-    environment = os.environ | {
-        "MCBOT_TICK_PORT": str(args.port),
-        "MCBOT_WORLD_SEED": str(args.seed),
-    }
     result: dict[str, object] = {"seed": args.seed, "minecraft_log": str(log_path)}
-    with log_path.open("w", encoding="utf-8") as log:
-        game = subprocess.Popen(
-            [str(root / "scripts" / "gradle"), "runClient"],
-            cwd=root,
-            env=environment,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        try:
-            with wait_for_world(
-                args.port, time.monotonic() + args.startup_timeout
-            ) as client:
-                result |= run_probes(client, args.wait, args.seed, args.steps)
-                client.quit()
-            result["passed"] = True
-        except Exception as error:
-            result |= {"passed": False, "error": f"{type(error).__name__}: {error}"}
-        finally:
-            try:
-                game.wait(timeout=60)
-            except subprocess.TimeoutExpired:
-                os.killpg(game.pid, signal.SIGTERM)
-                game.wait(timeout=30)
+    try:
+        with launched_client(
+            args.port, args.seed, log_path, args.startup_timeout
+        ) as client:
+            result |= run_probes(client, args.wait, args.seed, args.steps)
+        result["passed"] = True
+    except Exception as error:
+        result |= {"passed": False, "error": f"{type(error).__name__}: {error}"}
 
     args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     summary = {key: value for key, value in result.items() if key != "schema"}

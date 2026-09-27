@@ -23,7 +23,7 @@ Stage 2A starts only after the Stage 1.5 gate in `docs/minecraft-spike.md` is va
 2 structured current-visible observation proven (scripted scene)
 3 factorized actions                    proven
 4 reset / episode semantics             proven (fresh world, death termination)
-5 determinism characterization          open
+5 determinism characterization          measured (docs/replay-characterization.md)
 6 single-instance throughput            open (~10 steps/s, docs/decisions/simulation-throughput.md)
 7 accelerated mode validated vs paced   open
 8 multi-instance workers                later (docs/decisions/parallel-workers.md)

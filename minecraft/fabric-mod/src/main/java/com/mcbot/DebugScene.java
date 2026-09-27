@@ -15,12 +15,14 @@ import net.minecraft.world.entity.EntitySpawnReason;
 import net.minecraft.world.entity.EntityTypes;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.gamerules.GameRules;
 import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
@@ -32,15 +34,16 @@ final class DebugScene {
     private static final int MAX_FILL_BLOCKS = 4096;
     private static final int MAX_NEARBY_RADIUS = 32;
     private static final int COMBAT_WEAPON_SLOT = 1;
+    private static final int REPLAY_BLOCK_SLOT = 2;
+    private static final long MAX_TRACE_BLOCKS = 65_536;
 
     private DebugScene() {}
 
     static JsonObject handle(String command, long gameTime, ServerPlayer player, JsonObject payload) {
         return switch (command) {
-            case "DEBUG_SCENE" -> scene(
-                    player,
-                    payload.get("name").getAsString(),
-                    payload.has("ai") && payload.get("ai").getAsBoolean());
+            case "DEBUG_SCENE" -> scene(player, payload);
+            case "DEBUG_TRACE" -> trace(
+                    gameTime, player, blockPos(payload.getAsJsonArray("from")), blockPos(payload.getAsJsonArray("to")));
             case "DEBUG_FILL" -> fill(player.level(), payload);
             case "DEBUG_BLOCK" -> block(player.level(), blockPos(payload.getAsJsonArray("pos")));
             case "DEBUG_ENTITY" -> entity(player.level(), payload.get("id").getAsInt());
@@ -52,9 +55,14 @@ final class DebugScene {
         };
     }
 
-    private static JsonObject scene(ServerPlayer player, String name, boolean ai) {
+    private static JsonObject scene(ServerPlayer player, JsonObject payload) {
+        String name = payload.get("name").getAsString();
+        boolean ai = flag(payload, "ai");
+        JsonArray at = payload.has("at") ? payload.getAsJsonArray("at") : null;
         ServerLevel level = player.level();
-        BlockPos origin = prepareArena(player);
+        BlockPos origin = prepareArena(player, at == null
+                ? player.blockPosition()
+                : new BlockPos(at.get(0).getAsInt(), player.blockPosition().getY(), at.get(1).getAsInt()));
         JsonObject scene = new JsonObject();
         scene.addProperty("name", name);
         scene.add("origin", position(origin));
@@ -74,14 +82,20 @@ final class DebugScene {
                 level.setBlock(target, Blocks.DIRT.defaultBlockState(), Block.UPDATE_ALL);
                 scene.add("target_block", position(target));
             }
+            case "replay" -> buildReplay(player, level, origin, scene, ai, flag(payload, "controlled"));
             default -> throw new IllegalArgumentException("unknown_scene");
         }
         return scene;
     }
 
-    private static BlockPos prepareArena(ServerPlayer player) {
+    private static boolean flag(JsonObject payload, String name) {
+        return payload.has(name) && payload.get(name).getAsBoolean();
+    }
+
+    private static BlockPos prepareArena(ServerPlayer player, BlockPos column) {
+        Lockstep.setTraceRegion(null);
         ServerLevel level = player.level();
-        BlockPos origin = level.getHeightmapPos(Heightmap.Types.MOTION_BLOCKING, player.blockPosition());
+        BlockPos origin = level.getHeightmapPos(Heightmap.Types.MOTION_BLOCKING, column);
         BlockPos low = origin.offset(-ARENA_RADIUS, 0, -ARENA_RADIUS);
         BlockPos high = origin.offset(ARENA_RADIUS, ARENA_HEIGHT, ARENA_RADIUS);
         for (BlockPos pos : BlockPos.betweenClosed(low, high)) {
@@ -123,6 +137,65 @@ final class DebugScene {
         scene.add("wall_from", position(wallFrom));
         scene.add("wall_to", position(wallTo));
         scene.addProperty("hidden_entity", husk.getId());
+    }
+
+    // Deterministic replay scene, relative to the player standing at the origin facing
+    // +z: a no-AI husk to hit, a floating dirt block to mine, a stone step, a sand block
+    // whose glass support can be removed, and a fenced pen. With `ai`, the pen holds an
+    // AI pig whose wandering exercises mob randomness. Natural mob spawning is disabled
+    // so the entity set stays scripted. `controlled` additionally disables the two
+    // world-RNG consumers the script triggers (random block ticks and block drops); it
+    // exists only to attribute replay divergence and is never a training setting.
+    private static void buildReplay(
+            ServerPlayer player, ServerLevel level, BlockPos origin, JsonObject scene, boolean ai,
+            boolean controlled) {
+        BlockPos dirt = origin.offset(0, 1, 2);
+        BlockPos step = origin.offset(0, 0, 10);
+        BlockPos sand = origin.offset(-3, 3, 1);
+        BlockPos sandSupport = origin.offset(-3, 2, 1);
+        level.setBlock(dirt, Blocks.DIRT.defaultBlockState(), Block.UPDATE_ALL);
+        level.setBlock(step, Blocks.STONE.defaultBlockState(), Block.UPDATE_ALL);
+        level.setBlock(sandSupport, Blocks.GLASS.defaultBlockState(), Block.UPDATE_ALL);
+        level.setBlock(sand, Blocks.SAND.defaultBlockState(), Block.UPDATE_ALL);
+        for (BlockPos pos : BlockPos.betweenClosed(origin.offset(-8, 0, 4), origin.offset(-3, 0, 9))) {
+            boolean edge = pos.getX() == origin.getX() - 8 || pos.getX() == origin.getX() - 3
+                    || pos.getZ() == origin.getZ() + 4 || pos.getZ() == origin.getZ() + 9;
+            if (edge) {
+                level.setBlock(pos, Blocks.OAK_FENCE.defaultBlockState(), Block.UPDATE_ALL);
+            }
+        }
+        Mob husk = spawnHusk(level, origin, 2.5, 2.5, false);
+        if (ai) {
+            Mob pig = EntityTypes.PIG.create(level, EntitySpawnReason.COMMAND);
+            if (pig == null) {
+                throw new IllegalStateException("spawn_failed");
+            }
+            pig.snapTo(origin.getX() - 5.5, origin.getY(), origin.getZ() + 6.5, 180.0F, 0.0F);
+            pig.setPersistenceRequired();
+            pig.setSilent(true);
+            level.addFreshEntity(pig);
+            scene.addProperty("pig", pig.getId());
+        }
+        level.getGameRules().set(GameRules.SPAWN_MOBS, false, level.getServer());
+        if (controlled) {
+            level.getGameRules().set(GameRules.RANDOM_TICK_SPEED, 0, level.getServer());
+            level.getGameRules().set(GameRules.BLOCK_DROPS, false, level.getServer());
+        }
+        player.getInventory().setItem(COMBAT_WEAPON_SLOT, new ItemStack(Items.STONE_SWORD));
+        player.getInventory().setItem(REPLAY_BLOCK_SLOT, new ItemStack(Items.COBBLESTONE, 8));
+        BlockPos arenaFrom = origin.offset(-ARENA_RADIUS, -1, -ARENA_RADIUS);
+        BlockPos arenaTo = origin.offset(ARENA_RADIUS, ARENA_HEIGHT, ARENA_RADIUS);
+
+        scene.add("dirt_block", position(dirt));
+        scene.add("sand_block", position(sand));
+        scene.add("sand_support", position(sandSupport));
+        scene.add("arena_from", position(arenaFrom));
+        scene.add("arena_to", position(arenaTo));
+        scene.addProperty("controlled", controlled);
+        Lockstep.setTraceRegion(new RegionDigest(arenaFrom.immutable(), arenaTo.immutable()));
+        scene.addProperty("husk", husk.getId());
+        scene.addProperty("weapon_slot", COMBAT_WEAPON_SLOT);
+        scene.addProperty("block_slot", REPLAY_BLOCK_SLOT);
     }
 
     private static Mob spawnHusk(ServerLevel level, BlockPos origin, double dx, double dz, boolean ai) {
@@ -187,6 +260,11 @@ final class DebugScene {
         reply.addProperty("x", entity.getX());
         reply.addProperty("y", entity.getY());
         reply.addProperty("z", entity.getZ());
+        reply.addProperty("yaw", entity.getYRot());
+        Vec3 velocity = entity.getDeltaMovement();
+        reply.addProperty("vx", velocity.x);
+        reply.addProperty("vy", velocity.y);
+        reply.addProperty("vz", velocity.z);
         if (entity instanceof LivingEntity living) {
             reply.addProperty("health", living.getHealth());
             reply.addProperty("hurt_time", living.hurtTime);
@@ -207,6 +285,15 @@ final class DebugScene {
         server.addProperty("food", player.getFoodData().getFoodLevel());
         server.addProperty("tick_count", player.tickCount);
         server.addProperty("selected_slot", player.getInventory().getSelectedSlot());
+        Vec3 velocity = player.getDeltaMovement();
+        server.addProperty("vx", velocity.x);
+        server.addProperty("vy", velocity.y);
+        server.addProperty("vz", velocity.z);
+        server.addProperty("on_ground", player.onGround());
+        server.addProperty("fall_distance", player.fallDistance);
+        server.addProperty("saturation", player.getFoodData().getSaturationLevel());
+        server.addProperty("attack_strength", player.getAttackStrengthScale(0.0F));
+        server.add("inventory", inventory(player.getInventory()));
 
         Lockstep.ClientPlayerSnapshot snapshot = Lockstep.clientPlayer();
         JsonObject client = new JsonObject();
@@ -217,11 +304,55 @@ final class DebugScene {
         client.addProperty("yaw", snapshot.yaw());
         client.addProperty("pitch", snapshot.pitch());
         client.addProperty("tick_count", snapshot.tickCount());
+        client.addProperty("vx", snapshot.vx());
+        client.addProperty("vy", snapshot.vy());
+        client.addProperty("vz", snapshot.vz());
+        client.addProperty("on_ground", snapshot.onGround());
+        client.addProperty("view_block_crc32", Long.toHexString(snapshot.view().blockCrc32()));
+        client.addProperty("view_entity_count", snapshot.view().entityCount());
 
         JsonObject reply = new JsonObject();
         reply.addProperty("game_time", gameTime);
         reply.add("server", server);
         reply.add("client", client);
+        return reply;
+    }
+
+    private static JsonArray inventory(Inventory inventory) {
+        JsonArray slots = new JsonArray();
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            ItemStack stack = inventory.getItem(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            JsonObject entry = new JsonObject();
+            entry.addProperty("slot", slot);
+            entry.addProperty("item", BuiltInRegistries.ITEM.getKey(stack.getItem()).toString());
+            entry.addProperty("count", stack.getCount());
+            slots.add(entry);
+        }
+        return slots;
+    }
+
+    // One atomic privileged snapshot per replay step: player (server and client view),
+    // every non-player entity in the region, and a fingerprint of the region's blocks
+    // computed the same way as the client view.
+    private static JsonObject trace(long gameTime, ServerPlayer player, BlockPos from, BlockPos to) {
+        RegionDigest region = new RegionDigest(from, to);
+        if (region.volume() > MAX_TRACE_BLOCKS) {
+            throw new IllegalArgumentException("trace_too_large");
+        }
+        ServerLevel level = player.level();
+        JsonArray entities = new JsonArray();
+        for (Entity entity : level.getEntities(player, region.box(), entity -> !(entity instanceof Player))) {
+            entities.add(describeEntity(entity));
+        }
+        JsonObject reply = player(gameTime, player);
+        reply.add("entities", entities);
+        reply.addProperty("block_crc32", Long.toHexString(region.blocks(level)));
+        reply.addProperty("entity_count", entities.size());
+        reply.addProperty("raining", level.isRaining());
+        reply.addProperty("thundering", level.isThundering());
         return reply;
     }
 

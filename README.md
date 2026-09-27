@@ -16,6 +16,7 @@ On macOS or Linux (arm64/x86_64), install the bootstrap prerequisites: POSIX she
 ./scripts/gradle build
 .venv/bin/python scripts/minecraft-tick-gate-probe.py
 .venv/bin/python scripts/minecraft-observation-probe.py
+.venv/bin/python scripts/minecraft-replay-probe.py
 ```
 
 Bootstrap downloads SHA-256-verified uv 0.12.19, Temurin 25.0.4.1+1 and Lefthook 2.1.14 into ignored `.tools/`, installs uv-managed CPython 3.12.11 in `.tools/uv-python`, syncs the locked dev environment to `.venv/`, and installs Git hooks when inside a Git checkout. It does not install any global Python package, JDK or Gradle. Re-run bootstrap after dependency changes and commit the updated `uv.lock`. Use `./.tools/uv lock` to update the lock deliberately. `./scripts/check` runs Ruff format check, Ruff lint and pytest; the same quick checks run from the Lefthook pre-commit hook. Training, Fabric builds and Minecraft runtime probes are explicit, not commit hooks. Java/Fabric changes should additionally pass `./scripts/gradle build`.
@@ -44,6 +45,7 @@ Design documents:
 - [Simulation throughput decision](docs/decisions/simulation-throughput.md): unpaced lockstep that keeps one step = one tick; profiling and equivalence tests.
 - [Recording decision](docs/decisions/recording.md): mandatory low-cost session video, separate from policy input.
 - [Parallel workers decision](docs/decisions/parallel-workers.md): isolated workers and deterministic offline development identities.
+- [Replay characterization](docs/replay-characterization.md): what reproduces under identical inputs and what diverges.
 
 Privileged Fabric instrumentation stays outside policy inputs, in separate protocol commands and Python types.
 

@@ -5,7 +5,21 @@ import java.util.concurrent.atomic.AtomicReference;
 
 public final class Lockstep {
     public record ClientPlayerSnapshot(
-            long clientTick, double x, double y, double z, float yaw, float pitch, int tickCount) {}
+            long clientTick, double x, double y, double z, float yaw, float pitch, int tickCount,
+            double vx, double vy, double vz, boolean onGround, ClientView view) {
+        static final ClientPlayerSnapshot ABSENT = new ClientPlayerSnapshot(
+                0, Double.NaN, Double.NaN, Double.NaN, Float.NaN, Float.NaN, -1, Double.NaN, Double.NaN, Double.NaN, false,
+                ClientView.NONE);
+
+        ClientPlayerSnapshot at(long tick) {
+            return new ClientPlayerSnapshot(tick, x, y, z, yaw, pitch, tickCount, vx, vy, vz, onGround, view);
+        }
+    }
+
+    // The client's own copy of the traced region at the end of a client tick; privileged diagnostics only.
+    public record ClientView(long blockCrc32, int entityCount) {
+        static final ClientView NONE = new ClientView(0, 0);
+    }
 
     public static volatile boolean playersGated;
     public static volatile boolean clientGated;
@@ -18,8 +32,8 @@ public final class Lockstep {
     private static volatile long clientTicks;
     private static volatile long clientTickStartedNanos;
     private static volatile long clientTickEndedNanos;
-    private static volatile ClientPlayerSnapshot clientPlayer =
-            new ClientPlayerSnapshot(0, Double.NaN, Double.NaN, Double.NaN, Float.NaN, Float.NaN, -1);
+    private static volatile ClientPlayerSnapshot clientPlayer = ClientPlayerSnapshot.ABSENT;
+    private static volatile RegionDigest traceRegion;
 
     private Lockstep() {}
 
@@ -67,8 +81,7 @@ public final class Lockstep {
         return currentClientAction;
     }
 
-    static void recordClientTick(
-            boolean sentTickEnd, double x, double y, double z, float yaw, float pitch, int playerTickCount) {
+    static void recordClientTick(boolean sentTickEnd, ClientPlayerSnapshot player) {
         if (sentTickEnd) {
             clientTickEndsSent++;
         }
@@ -76,7 +89,7 @@ public final class Lockstep {
             clientTickEndedNanos = System.nanoTime();
         }
         long tick = clientTicks + 1;
-        clientPlayer = new ClientPlayerSnapshot(tick, x, y, z, yaw, pitch, playerTickCount);
+        clientPlayer = player.at(tick);
         currentClientAction = null;
         clientTicks = tick;
     }
@@ -99,5 +112,13 @@ public final class Lockstep {
 
     static ClientPlayerSnapshot clientPlayer() {
         return clientPlayer;
+    }
+
+    static RegionDigest traceRegion() {
+        return traceRegion;
+    }
+
+    static void setTraceRegion(RegionDigest region) {
+        traceRegion = region;
     }
 }

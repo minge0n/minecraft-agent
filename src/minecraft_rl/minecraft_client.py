@@ -181,8 +181,20 @@ class PrivilegedProbe:
     def __init__(self, client: MinecraftClient) -> None:
         self.client = client
 
-    def scene(self, name: str, ai: bool = False) -> dict[str, Any]:
-        return self.client.request("DEBUG_SCENE", {"name": name, "ai": ai})
+    def scene(
+        self,
+        name: str,
+        ai: bool = False,
+        at: tuple[int, int] | None = None,
+        controlled: bool = False,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"name": name, "ai": ai, "controlled": controlled}
+        if at is not None:
+            payload["at"] = list(at)
+        return self.client.request("DEBUG_SCENE", payload)
+
+    def trace(self, start: list[int], end: list[int]) -> dict[str, Any]:
+        return self.client.request("DEBUG_TRACE", {"from": start, "to": end})
 
     def fill(self, start: list[int], end: list[int], block: str) -> dict[str, Any]:
         return self.client.request(
