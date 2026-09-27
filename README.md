@@ -41,6 +41,9 @@ Design documents:
 - [Lockstep decision](docs/decisions/lockstep.md): one action, one logical tick, post-step observation; transport comparison.
 - [Learning roadmap](docs/roadmap.md): Q-learning baseline, then Stage 2A-2F toward a toy Dreamer agent, then Minecraft. DQN is optional, not required.
 - [Minecraft spike ledger](docs/minecraft-spike.md): Stage 1.5 completion gate, evidence and open work.
+- [Simulation throughput decision](docs/decisions/simulation-throughput.md): unpaced lockstep that keeps one step = one tick; profiling and equivalence tests.
+- [Recording decision](docs/decisions/recording.md): mandatory low-cost session video, separate from policy input.
+- [Parallel workers decision](docs/decisions/parallel-workers.md): isolated workers and deterministic offline development identities.
 
 Privileged Fabric instrumentation stays outside policy inputs, in separate protocol commands and Python types.
 

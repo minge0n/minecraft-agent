@@ -14,7 +14,23 @@ Stage 2F  integrated Dreamer-style toy agent
 Later     Dreamer on the structured Minecraft observation
 ```
 
-Stage 2A starts only after the Stage 1.5 gate in `docs/minecraft-spike.md` is validated. Minecraft training starts only after Stage 2F works. Running neural code is not a reason to start long Minecraft training.
+Stage 2A starts only after the Stage 1.5 gate in `docs/minecraft-spike.md` is validated. Minecraft training starts only after Stage 2F works and the Minecraft environment track below reaches its step 8 for the scale being trained. Running neural code is not a reason to start long Minecraft training.
+
+## Minecraft environment track
+
+```text
+1 one-tick lockstep                     proven
+2 structured current-visible observation proven (scripted scene)
+3 factorized actions                    proven
+4 reset / episode semantics             proven (fresh world, death termination)
+5 determinism characterization          open
+6 single-instance throughput            open (~10 steps/s, docs/decisions/simulation-throughput.md)
+7 accelerated mode validated vs paced   open
+8 multi-instance workers                later (docs/decisions/parallel-workers.md)
+9 connect to Dreamer training           after Stage 2F
+```
+
+Correctness precedes throughput. Session recording (`docs/decisions/recording.md`) is required for every meaningful session from the first training, evaluation or recorded debug run; its cost is benchmarked together with steps 6-8.
 
 ## Target architecture
 

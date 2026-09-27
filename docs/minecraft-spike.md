@@ -161,3 +161,6 @@ The scripted player trajectory repeated to within 1e-15 blocks and physics was i
 - The client learns about a server step through `ClientboundTickingStepPacket`, which is processed before a later client tick. Client-side views of non-player entities are therefore likely one step behind the server. The v2 observation is computed from server state, so this does not affect it; it matters only if RGB returns.
 - Visibility evidence covers one scripted scene with full opaque blocks, one mob type and daylight. Transparent blocks, partial shapes, fluids, small entities, lighting and entities between rays are not yet tested; see `docs/decisions/observation.md` for known v1 limitations.
 - No replay/determinism comparison exists yet. Mob AI already differed slightly between same-seed runs.
+- Both runtime probes are non-recording infrastructure tests under `docs/decisions/recording.md`; no recorder exists yet.
+- Each probe launch currently gets a random development username (`PlayerNNN`, from the 26.3 `--username` default); deterministic `AgentNNNN` identities are decided in `docs/decisions/parallel-workers.md` but not wired.
+- The shared client options still use vanilla defaults (VSync on, 120 FPS cap, render distance 16, fancy graphics); low-cost render settings and unpaced stepping are next (`docs/decisions/simulation-throughput.md`).
