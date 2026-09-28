@@ -25,6 +25,6 @@ public abstract class ServerGamePacketListenerImplMixin {
 
     @Inject(method = "handleClientTickEnd", at = @At("TAIL"))
     private void mcbot$countClientTickEnd(ServerboundClientTickEndPacket packet, CallbackInfo callback) {
-        Lockstep.clientTickEndsProcessed.incrementAndGet();
+        Lockstep.onClientTickEndProcessed();
     }
 }

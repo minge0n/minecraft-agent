@@ -81,7 +81,7 @@ public class McBotClient implements ClientModInitializer {
                 minecraft.disconnectFromWorld(Component.literal("mcbot episode reset"));
             }
             deleteEpisodeWorld(minecraft, previousLevelId);
-            Lockstep.resetClientTickEnds();
+            Lockstep.resetConnectionCounters();
             pendingWorld = request;
         });
     }
@@ -207,6 +207,7 @@ public class McBotClient implements ClientModInitializer {
         options.toggleSprint().set(false);
         options.toggleAttack().set(false);
         options.toggleUse().set(false);
+        EnvironmentSettings.apply(minecraft);
         String levelId = LEVEL_ID_PREFIX + System.currentTimeMillis();
         currentLevelId = levelId;
         LevelSettings settings = new LevelSettings(

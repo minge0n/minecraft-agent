@@ -103,6 +103,7 @@ def trace_record(
             "tick_after": info.tick_after,
             "client_tick": info.client_tick,
             "game_time": info.game_time,
+            "pacing": info.pacing,
             "timing": asdict(info.timing),
         },
         "policy": {

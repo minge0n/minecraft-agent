@@ -281,27 +281,62 @@ def run_reset(probe: Probe, seed: int) -> dict:
     return {"terminated_after_death": True, "resets": results}
 
 
+THROUGHPUT_CONFIGS = {
+    "paced": ("paced", True),
+    "unpaced_render": ("unpaced", True),
+    "unpaced_no_render": ("unpaced", False),
+    "paced_again": ("paced", True),
+}
+
+
 def run_throughput(probe: Probe, steps: int) -> dict:
     probe.privileged.scene("visibility")
     probe.settle()
+    return {
+        label: measure_throughput(probe.client, steps, mode, render)
+        for label, (mode, render) in THROUGHPUT_CONFIGS.items()
+    }
+
+
+def measure_throughput(
+    client: MinecraftClient, steps: int, mode: str, render_frames: bool
+) -> dict:
+    previous = client.status_json()["pacing"]
+    client.set_pacing(mode, render_frames=render_frames)
+    tick_before = client.status().game_time
     started = time.perf_counter()
-    samples = [probe.client.step(NOOP).info.timing for _ in range(steps)]
+    samples = [client.step(NOOP).info.timing for _ in range(steps)]
     elapsed = time.perf_counter() - started
+    ticks = client.status().game_time - tick_before
+    client.set_pacing(previous["mode"], render_frames=previous["render_frames"])
+    check(ticks == steps, f"{steps} steps advanced {ticks} ticks")
     phases = {}
-    for name in asdict(samples[0]):
+    for name in [*asdict(samples[0]), "ipc_ms"]:
         values = [getattr(sample, name) for sample in samples]
         phases[name] = {
             "median": statistics.median(values),
             "p95": sorted(values)[int(0.95 * (len(values) - 1))],
         }
-    return {"steps": steps, "steps_per_second": steps / elapsed, "phases_ms": phases}
+    return {
+        "pacing": mode,
+        "render_frames": render_frames,
+        "steps": steps,
+        "simulated_ticks": ticks,
+        "wall_seconds": elapsed,
+        "steps_per_second": steps / elapsed,
+        "ticks_per_second": ticks / elapsed,
+        "phases_ms": phases,
+    }
 
 
 def run_probes(
-    client: MinecraftClient, wait_seconds: float, seed: int, steps: int
+    client: MinecraftClient, wait_seconds: float, seed: int, steps: int, pacing: str
 ) -> dict:
+    client.set_pacing(pacing)
     probe = Probe(client)
     return {
+        "pacing": pacing,
+        "client_status": client.status_json(),
         "schema": asdict(client.schema()),
         "visibility": run_visibility(probe, wait_seconds),
         "same_step_sync": run_same_step_sync(probe),
@@ -320,6 +355,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--wait", type=float, default=3.0)
+    parser.add_argument("--pacing", choices=("paced", "unpaced"), default="paced")
     parser.add_argument("--startup-timeout", type=float, default=240.0)
     parser.add_argument(
         "--output",
@@ -335,7 +371,7 @@ def main() -> None:
         with launched_client(
             args.port, args.seed, log_path, args.startup_timeout
         ) as client:
-            result |= run_probes(client, args.wait, args.seed, args.steps)
+            result |= run_probes(client, args.wait, args.seed, args.steps, args.pacing)
         result["passed"] = True
     except Exception as error:
         result |= {"passed": False, "error": f"{type(error).__name__}: {error}"}

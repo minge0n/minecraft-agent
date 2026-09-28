@@ -12,6 +12,7 @@ from minecraft_rl.minecraft_interface import (
 from minecraft_rl.tick_control import Status
 
 WORLD_PRESETS = ("flat", "normal")
+PACING_MODES = ("paced", "unpaced")
 
 
 class ProtocolError(RuntimeError):
@@ -42,15 +43,28 @@ def parse_reply(command: str, line: str) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class StepTiming:
-    """Wall-clock phases of one step in milliseconds; diagnostic only."""
+    """Wall-clock phases of one step in milliseconds; diagnostic only.
 
+    Consecutive phases partition the server-side step: dispatch, client_wait,
+    client_tick, tick_end_sync, server_wait, server_tick, observation, encode.
+    `ipc_ms` is the Python round trip minus the server total (socket transfer,
+    JSON parsing and schema validation in Python).
+    """
+
+    dispatch_ms: float
     client_wait_ms: float
     client_tick_ms: float
-    tick_end_wait_ms: float
-    server_step_ms: float
+    tick_end_sync_ms: float
+    server_wait_ms: float
+    server_tick_ms: float
     observation_ms: float
-    total_ms: float
+    encode_ms: float
+    server_total_ms: float
     round_trip_ms: float
+
+    @property
+    def ipc_ms(self) -> float:
+        return self.round_trip_ms - self.server_total_ms
 
 
 @dataclass(frozen=True)
@@ -62,6 +76,7 @@ class StepInfo:
     tick_after: int
     client_tick: int
     game_time: int
+    pacing: str
     timing: StepTiming
 
 
@@ -117,7 +132,7 @@ class MinecraftClient:
         return self._schema
 
     def status(self) -> Status:
-        reply = self.request("STATUS")
+        reply = self.status_json()
         return Status(
             reply["game_time"],
             reply["server_tick"],
@@ -126,6 +141,10 @@ class MinecraftClient:
             reply["client_gated"],
             reply["client_ticks"],
         )
+
+    def status_json(self) -> dict[str, Any]:
+        """Full diagnostic status, including pacing and client render settings."""
+        return self.request("STATUS")
 
     def observe(self) -> PolicyObservation:
         schema = self.schema()
@@ -148,9 +167,16 @@ class MinecraftClient:
                 tick_after=info["tick_after"],
                 client_tick=info["client_tick"],
                 game_time=info["game_time"],
+                pacing=info["pacing"],
                 timing=StepTiming(**info["timing"], round_trip_ms=round_trip_ms),
             ),
         )
+
+    def set_pacing(self, mode: str, render_frames: bool = True) -> dict[str, Any]:
+        """Select paced or unpaced lockstep; never changes what a step does."""
+        if mode not in PACING_MODES:
+            raise ValueError(f"unknown pacing mode {mode!r}")
+        return self.request("PACING", {"mode": mode, "render_frames": render_frames})
 
     def reset(
         self, seed: int, preset: str = "flat"

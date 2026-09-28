@@ -13,12 +13,15 @@ from minecraft_rl.minecraft_interface import PlayerAction, PolicyObservation
 from test_minecraft_interface import SCHEMA_JSON, observation_json
 
 TIMING = {
+    "dispatch_ms": 0.1,
     "client_wait_ms": 1.0,
     "client_tick_ms": 2.0,
-    "tick_end_wait_ms": 3.0,
-    "server_step_ms": 4.0,
+    "tick_end_sync_ms": 3.0,
+    "server_wait_ms": 0.5,
+    "server_tick_ms": 4.0,
     "observation_ms": 5.0,
-    "total_ms": 15.0,
+    "encode_ms": 0.4,
+    "server_total_ms": 16.0,
 }
 
 
@@ -72,6 +75,7 @@ def test_step_separates_policy_observation_from_diagnostics(connected) -> None:
                     "tick_before": 40,
                     "tick_after": 41,
                     "client_tick": 90,
+                    "pacing": "unpaced",
                     "timing": TIMING,
                 },
             },
@@ -81,7 +85,11 @@ def test_step_separates_policy_observation_from_diagnostics(connected) -> None:
 
     assert isinstance(result.observation, PolicyObservation)
     assert (result.info.tick_before, result.info.tick_after) == (40, 41)
-    assert result.info.timing.server_step_ms == 4.0
+    assert result.info.timing.server_tick_ms == 4.0
+    assert result.info.pacing == "unpaced"
+    assert result.info.timing.ipc_ms == pytest.approx(
+        result.info.timing.round_trip_ms - 16.0
+    )
     assert result.info.timing.round_trip_ms >= 0.0
     schema_line, step_line = received_lines(server)
     assert schema_line == "v2 SCHEMA"
@@ -102,6 +110,17 @@ def test_reset_rejects_unknown_preset_before_sending(connected) -> None:
     client, _ = connected
     with pytest.raises(ValueError, match="preset"):
         client.reset(1, "amplified")
+
+
+def test_pacing_rejects_unknown_mode_and_sends_valid_ones(connected) -> None:
+    client, server = connected
+    with pytest.raises(ValueError, match="pacing"):
+        client.set_pacing("sprint")
+    server.sendall(reply("PACING", {"mode": "unpaced", "render_frames": False}))
+    assert client.set_pacing("unpaced", render_frames=False)["mode"] == "unpaced"
+    assert received_lines(server) == [
+        'v2 PACING {"mode":"unpaced","render_frames":false}'
+    ]
 
 
 def test_privileged_probe_uses_debug_commands(connected) -> None:

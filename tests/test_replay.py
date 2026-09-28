@@ -17,7 +17,7 @@ from minecraft_rl.replay import (
 )
 from test_minecraft_interface import SCHEMA_JSON, observation_json
 
-TIMING = StepTiming(1.0, 1.0, 1.0, 1.0, 1.0, 5.0, 6.0)
+TIMING = StepTiming(0.1, 1.0, 1.0, 1.0, 0.5, 1.0, 1.0, 0.4, 5.0, 6.0)
 
 
 def record(step: int, x: float = 0.5, pig_x: float = 3.5, ray: float = 32.0) -> dict:
@@ -31,7 +31,9 @@ def record(step: int, x: float = 0.5, pig_x: float = 3.5, ray: float = 32.0) -> 
     result = StepResult(
         observation=observation,
         terminated=False,
-        info=StepInfo(100 + step, step, step + 1, 900 + step, step + 1, TIMING),
+        info=StepInfo(
+            100 + step, step, step + 1, 900 + step, step + 1, "paced", TIMING
+        ),
     )
     trace = {
         "server": {"x": x, "y": 64.0, "z": 0.5, "yaw": 0.0},
@@ -82,7 +84,7 @@ def test_identical_traces_compare_identical_despite_process_counters() -> None:
         traced["info"]["step_id"] += 1000
         traced["info"]["client_tick"] += 50
         traced["privileged"]["client_player"]["tick"] += 50
-        traced["info"]["timing"]["total_ms"] = 99.0
+        traced["info"]["timing"]["server_total_ms"] = 99.0
     comparison = compare_traces(reference, other)
     assert comparison["identical"]
     assert comparison["first_difference_step"] is None

@@ -39,6 +39,13 @@ final class DebugScene {
 
     private DebugScene() {}
 
+    static boolean mutatesWorld(String command) {
+        return switch (command) {
+            case "DEBUG_SCENE", "DEBUG_FILL", "DEBUG_KILL" -> true;
+            default -> false;
+        };
+    }
+
     static JsonObject handle(String command, long gameTime, ServerPlayer player, JsonObject payload) {
         return switch (command) {
             case "DEBUG_SCENE" -> scene(player, payload);

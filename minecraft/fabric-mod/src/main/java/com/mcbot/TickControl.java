@@ -23,6 +23,8 @@ import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.server.IntegratedServer;
 import net.minecraft.core.BlockPos;
+import net.minecraft.network.protocol.common.ClientboundPingPacket;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.stats.Stats;
@@ -43,52 +45,95 @@ final class TickControl {
 
     private final TickGate gate = new TickGate();
     private volatile IntegratedServer server;
+    private volatile long requestReceivedNanos;
     private PendingStep pendingStep;
     private long serverStepGrantedNanos;
+    private int serverMarker;
+    private long markerNotBeforeServerTick;
     private int armorStandId = -1;
     private int huskId = -1;
 
     void start(int port) {
+        Lockstep.onBeforeTickRateUpdate(this::grantIfReady);
+        Lockstep.pacing = Pacing.fromEnvironment();
+        Lockstep.renderFrames = !"off".equals(System.getenv("MCBOT_RENDER"));
+        LOGGER.info("lockstep pacing {}, render frames {}", Lockstep.pacing, Lockstep.renderFrames);
         ServerLifecycleEvents.SERVER_STARTED.register(started -> {
             if (started instanceof IntegratedServer integrated) {
                 integrated.tickRateManager().setFrozen(true);
+                Lockstep.setServerThread(integrated.getRunningThread());
+                // Each world has a new server whose tick count restarts at zero.
+                markerNotBeforeServerTick = 0;
                 server = integrated;
                 LOGGER.info("experimental integrated-server world tick freeze enabled");
             }
         });
         ServerLifecycleEvents.SERVER_STOPPING.register(stopping -> {
             server = null;
+            Lockstep.setServerStepGranted(false);
             if (pendingStep != null) {
                 gate.cancelPendingStep();
                 pendingStep.reply().complete(pendingStep.finish().apply(new TickGate.Rejected("server_stopping")));
                 pendingStep = null;
             }
         });
-        ServerTickEvents.START_SERVER_TICK.register(ticked -> {
-            if (ticked != server || pendingStep == null) {
-                return;
-            }
-            long clientTicks = Lockstep.clientTicks();
-            long clientTickEndsSent = Lockstep.clientTickEndsSent();
-            if (gate.clientTickDelivered(clientTicks, clientTickEndsSent, Lockstep.clientTickEndsProcessed.get())) {
-                serverStepGrantedNanos = System.nanoTime();
-                ticked.tickRateManager().stepGameIfPaused(1);
-            }
-        });
         ServerTickEvents.END_SERVER_TICK.register(ticked -> {
-            if (ticked != server || pendingStep == null) {
+            if (ticked != server) {
                 return;
             }
-            gate.observeTickEnd(ticked.overworld().getGameTime(), Lockstep.clientTicks()).ifPresent(outcome -> {
-                PendingStep finished = pendingStep;
-                pendingStep = null;
-                finished.reply().complete(finished.finish().apply(outcome));
-            });
+            if (pendingStep != null && Lockstep.serverStepGranted()) {
+                gate.observeTickEnd(ticked.overworld().getGameTime(), Lockstep.clientTicks()).ifPresent(outcome -> {
+                    Lockstep.setServerStepGranted(false);
+                    requestServerMarker(ticked.getTickCount());
+                    PendingStep finished = pendingStep;
+                    pendingStep = null;
+                    finished.reply().complete(finished.finish().apply(outcome));
+                });
+            }
+            sendRequestedServerMarker(ticked);
         });
 
         Thread listener = new Thread(() -> serve(port), "mcbot-tick-control");
         listener.setDaemon(true);
         listener.start();
+    }
+
+    // Called from the server loop just before the tick-rate manager decides whether this
+    // iteration runs game elements. A step whose client tick and tick-end packet have
+    // both arrived is granted here, so the stepped tick is this very iteration.
+    private void grantIfReady(MinecraftServer ticked) {
+        IntegratedServer current = server;
+        if (ticked != current || pendingStep == null) {
+            return;
+        }
+        if (gate.clientTickDelivered(
+                Lockstep.clientTicks(), Lockstep.clientTickEndsSent(), Lockstep.clientTickEndsProcessed())) {
+            serverStepGrantedNanos = System.nanoTime();
+            Lockstep.setServerStepGranted(true);
+            current.tickRateManager().stepGameIfPaused(1);
+        }
+    }
+
+    // Ordering barrier. The client may start its next granted tick only after this
+    // marker is queued on its side. A marker is sent at the end of a server iteration,
+    // after that iteration broadcast its block, entity and chunk changes. A step's own
+    // changes are broadcast in the stepped iteration, so its marker goes out at once. A
+    // privileged edit runs as a server task, possibly inside an iteration after that
+    // iteration's broadcast, so its marker waits for the end of the next iteration.
+    private void requestServerMarker(long notBeforeServerTick) {
+        serverMarker++;
+        markerNotBeforeServerTick = Math.max(markerNotBeforeServerTick, notBeforeServerTick);
+        Lockstep.requireServerMarker(serverMarker);
+    }
+
+    private void sendRequestedServerMarker(MinecraftServer ticked) {
+        if (!Lockstep.serverMarkerPending() || ticked.getTickCount() < markerNotBeforeServerTick) {
+            return;
+        }
+        for (ServerPlayer player : ticked.getPlayerList().getPlayers()) {
+            player.connection.send(new ClientboundPingPacket(serverMarker));
+        }
+        Lockstep.serverMarkerSent();
     }
 
     private void serve(int port) {
@@ -100,6 +145,7 @@ final class TickControl {
                      BufferedWriter output = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8))) {
                     socket.setTcpNoDelay(true);
                     for (String request = input.readLine(); request != null; request = input.readLine()) {
+                        requestReceivedNanos = System.nanoTime();
                         output.write(request.startsWith("v2 ") ? respondV2(request.substring(3)) : respond(request));
                         output.write('\n');
                         output.flush();
@@ -201,47 +247,83 @@ final class TickControl {
         switch (command) {
             case "SCHEMA" -> reply.complete(v2("SCHEMA", VisibleFieldSensor.schema()));
             case "STATUS" -> reply.complete(v2("STATUS", statusJson(status(current))));
+            case "PACING" -> {
+                Lockstep.pacing = Pacing.valueOf(payload.get("mode").getAsString().toUpperCase(Locale.ROOT));
+                if (payload.has("render_frames")) {
+                    Lockstep.renderFrames = payload.get("render_frames").getAsBoolean();
+                }
+                reply.complete(v2("PACING", pacingJson()));
+            }
             case "OBSERVE" -> reply.complete(v2("OBSERVE", observationReply(firstPlayer(current))));
             case "STEP" -> {
+                long receivedNanos = requestReceivedNanos;
                 long acceptedNanos = System.nanoTime();
                 PlayerAction action = PlayerAction.fromJson(payload);
-                requestStep(current, action, reply, outcome -> finishV2Step(current, outcome, acceptedNanos));
+                requestStep(current, action, reply, outcome -> finishV2Step(current, outcome, receivedNanos, acceptedNanos));
             }
             default -> {
                 if (!command.startsWith("DEBUG_")) {
                     throw new IllegalArgumentException("unknown_request");
                 }
-                reply.complete(v2(command, DebugScene.handle(
-                        command, current.overworld().getGameTime(), firstPlayer(current), payload)));
+                JsonObject result = DebugScene.handle(
+                        command, current.overworld().getGameTime(), firstPlayer(current), payload);
+                if (DebugScene.mutatesWorld(command)) {
+                    // The edit reaches the client before its next granted tick.
+                    requestServerMarker(current.getTickCount() + 1L);
+                }
+                reply.complete(v2(command, result));
             }
         }
     }
 
-    private String finishV2Step(IntegratedServer current, TickGate.StepOutcome outcome, long acceptedNanos) {
+    // Timing phases in milliseconds, in order; each ends where the next begins.
+    // dispatch: request read on the listener thread -> handled on the server thread.
+    // client_wait: -> the client tick starts (next frame, ordering barrier).
+    // client_tick: the granted client tick itself.
+    // tick_end_sync: client tick end -> its tick-end packet is handled on the server.
+    // server_wait: -> the step is granted in the server loop (wall-clock pacing).
+    // server_tick: the granted logical server tick.
+    // observation / encode: sensor construction and reply serialization.
+    private String finishV2Step(
+            IntegratedServer current, TickGate.StepOutcome outcome, long receivedNanos, long acceptedNanos) {
         if (outcome instanceof TickGate.Rejected rejected) {
             return "v2 ERROR " + rejected.reason();
         }
         TickGate.Step step = (TickGate.Step) outcome;
         long serverTickEndedNanos = System.nanoTime();
         ServerPlayer player = firstPlayer(current);
-        JsonObject reply = observationReply(player);
+        JsonObject observation = VisibleFieldSensor.observe(player);
         long observedNanos = System.nanoTime();
+        String encodedObservation = observation.toString();
+        long encodedNanos = System.nanoTime();
 
+        long clientTickStarted = Lockstep.clientTickStartedNanos();
+        long clientTickEnded = Lockstep.clientTickEndedNanos();
+        // The tick-end packet may be handled before the render thread records the end of
+        // the client tick; sync then counts as zero and waiting starts at the tick end.
+        long tickEndProcessed = Math.max(Lockstep.clientTickEndProcessedNanos(), clientTickEnded);
         JsonObject timing = new JsonObject();
-        timing.addProperty("client_wait_ms", millis(acceptedNanos, Lockstep.clientTickStartedNanos()));
-        timing.addProperty("client_tick_ms", millis(Lockstep.clientTickStartedNanos(), Lockstep.clientTickEndedNanos()));
-        timing.addProperty("tick_end_wait_ms", millis(Lockstep.clientTickEndedNanos(), serverStepGrantedNanos));
-        timing.addProperty("server_step_ms", millis(serverStepGrantedNanos, serverTickEndedNanos));
+        timing.addProperty("dispatch_ms", millis(receivedNanos, acceptedNanos));
+        timing.addProperty("client_wait_ms", millis(acceptedNanos, clientTickStarted));
+        timing.addProperty("client_tick_ms", millis(clientTickStarted, clientTickEnded));
+        timing.addProperty("tick_end_sync_ms", millis(clientTickEnded, tickEndProcessed));
+        timing.addProperty("server_wait_ms", millis(tickEndProcessed, serverStepGrantedNanos));
+        timing.addProperty("server_tick_ms", millis(serverStepGrantedNanos, serverTickEndedNanos));
         timing.addProperty("observation_ms", millis(serverTickEndedNanos, observedNanos));
-        timing.addProperty("total_ms", millis(acceptedNanos, observedNanos));
+        timing.addProperty("encode_ms", millis(observedNanos, encodedNanos));
+        timing.addProperty("server_total_ms", millis(receivedNanos, encodedNanos));
 
-        JsonObject info = reply.getAsJsonObject("info");
+        JsonObject info = new JsonObject();
+        info.addProperty("game_time", player.level().getGameTime());
         info.addProperty("step_id", step.stepId());
         info.addProperty("tick_before", step.gameTimeBefore());
         info.addProperty("tick_after", step.gameTimeAfter());
         info.addProperty("client_tick", step.clientTick());
+        info.addProperty("pacing", Lockstep.pacing.name().toLowerCase(Locale.ROOT));
         info.add("timing", timing);
-        return v2("STEP", reply);
+        return "v2 STEP {\"observation\":" + encodedObservation
+                + ",\"terminated\":" + player.isDeadOrDying()
+                + ",\"info\":" + info + "}";
     }
 
     private static JsonObject observationReply(ServerPlayer player) {
@@ -314,7 +396,17 @@ final class TickControl {
         json.addProperty("paused", status.paused());
         json.addProperty("client_gated", status.clientGated());
         json.addProperty("client_ticks", status.clientTicks());
+        json.add("pacing", pacingJson());
+        json.add("client_settings", EnvironmentSettings.describe(Minecraft.getInstance()));
         return json;
+    }
+
+    private static JsonObject pacingJson() {
+        JsonObject pacing = new JsonObject();
+        pacing.addProperty("mode", Lockstep.pacing.name().toLowerCase(Locale.ROOT));
+        pacing.addProperty("render_frames", Lockstep.renderFrames);
+        pacing.addProperty("barrier_blocked_frames", Lockstep.barrierBlockedFrames());
+        return pacing;
     }
 
     private void requestStep(
@@ -340,6 +432,7 @@ final class TickControl {
         pendingStep = null;
         gate.cancelPendingStep();
         Lockstep.revokeClientTick();
+        Lockstep.setServerStepGranted(false);
         current.tickRateManager().stopStepping();
     }
 

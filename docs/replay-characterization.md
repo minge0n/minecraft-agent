@@ -59,6 +59,8 @@ Interpretation:
 
 Across all 12 runs, 98 server-side changes to the region fingerprint (blocks or entity count) were checked against the client copy. 74 reached the client copy one step later and 24 on the same step; none were missing. This confirms the earlier source-based inference: the client's copy of non-player world state is usually one step behind the server. The policy observation is unaffected because it is built on the server from post-step state. This matters for recording (`docs/decisions/recording.md`): a rendered frame after step N typically shows non-player world state from step N-1.
 
+These counts predate the server-to-client ordering barrier added with accelerated stepping. With the barrier, 3 of 5 block changes per controlled run reach the client copy on the same step and 2 one step later, identically in paced and unpaced mode (`docs/decisions/simulation-throughput.md`).
+
 ## Consequences
 
 - Equivalence tests between paced and accelerated modes use the `controlled` scene and require exact equality of every compared field except player `tick_count`. They also compare `natural` runs by the same distributional summary, to show acceleration adds no divergence beyond this baseline.

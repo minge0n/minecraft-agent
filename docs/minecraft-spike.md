@@ -156,11 +156,12 @@ The scripted player trajectory repeated to within 1e-15 blocks and physics was i
 
 ## Known limitations and open work
 
-- Throughput is ~10 steps/s for v1 and v2; see the phase breakdown above. Faster stepping needs a different mechanism and must be re-verified.
+- Accelerated (unpaced) stepping is implemented and validated against paced stepping: paced ~20, unpaced ~84-99 with rendering, ~154 without rendering steps/s. Results, mechanism and equivalence evidence are in `docs/decisions/simulation-throughput.md`. The tables above predate it.
 - v1 `NOOP` and `FORWARD` remain as the proven timing probe; v2 `PlayerAction` is the factorized interface. GUI and inventory actions are not implemented.
-- The client learns about a server step through `ClientboundTickingStepPacket`, which is processed before a later client tick. Measured: 74 of 98 server-side world changes reached the client copy one step later, 24 on the same step (`docs/replay-characterization.md`). The v2 observation is computed from server state, so this does not affect it; it matters for recording.
+- The client's copy of non-player world state can lag the server by one step (`docs/replay-characterization.md`). An ordering barrier now makes the lag identical in paced and unpaced modes (`docs/decisions/simulation-throughput.md`). The v2 observation is computed from server state, so this does not affect it; it matters for recording.
 - Visibility evidence covers one scripted scene with full opaque blocks, one mob type and daylight. Transparent blocks, partial shapes, fluids, small entities, lighting and entities between rays are not yet tested; see `docs/decisions/observation.md` for known v1 limitations.
 - Replay characterization covers one flat scene and 243 steps; see `docs/replay-characterization.md`.
 - Both runtime probes are non-recording infrastructure tests under `docs/decisions/recording.md`; no recorder exists yet.
 - Each probe launch currently gets a random development username (`PlayerNNN`, from the 26.3 `--username` default); deterministic `AgentNNNN` identities are decided in `docs/decisions/parallel-workers.md` but not wired.
-- The shared client options still use vanilla defaults (VSync on, 120 FPS cap, render distance 16, fancy graphics); low-cost render settings and unpaced stepping are next (`docs/decisions/simulation-throughput.md`).
+- Low-cost client settings (fast graphics, render distance 8, simulation distance 6, VSync off) are applied in observer mode and reported by `STATUS`.
+- Remaining Stage 1.5 gate items: session recording (`docs/decisions/recording.md`) and an isolated multi-worker smoke test (`docs/decisions/parallel-workers.md`).
