@@ -178,6 +178,36 @@ class MinecraftClient:
             raise ValueError(f"unknown pacing mode {mode!r}")
         return self.request("PACING", {"mode": mode, "render_frames": render_frames})
 
+    def start_recording(
+        self,
+        episode: int,
+        port: int,
+        every_ticks: int,
+        width: int,
+        height: int,
+        queue_frames: int,
+    ) -> dict[str, Any]:
+        """Stream rendered frames of the coming steps to a recorder on `port`.
+
+        Recording never changes what a step does or returns; see
+        docs/decisions/recording.md.
+        """
+        return self.request(
+            "RECORD_START",
+            {
+                "episode": episode,
+                "port": port,
+                "every_ticks": every_ticks,
+                "width": width,
+                "height": height,
+                "queue_frames": queue_frames,
+            },
+        )
+
+    def stop_recording(self) -> dict[str, Any]:
+        """End the episode recording and return the mod-side capture counters."""
+        return self.request("RECORD_STOP")
+
     def reset(
         self, seed: int, preset: str = "flat"
     ) -> tuple[PolicyObservation, ResetInfo]:

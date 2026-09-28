@@ -18,6 +18,7 @@ On macOS or Linux (arm64/x86_64), install the bootstrap prerequisites: POSIX she
 .venv/bin/python scripts/minecraft-observation-probe.py
 .venv/bin/python scripts/minecraft-replay-probe.py
 .venv/bin/python scripts/minecraft-equivalence-probe.py
+.venv/bin/python scripts/minecraft-recording-probe.py
 ```
 
 Bootstrap downloads SHA-256-verified uv 0.12.19, Temurin 25.0.4.1+1 and Lefthook 2.1.14 into ignored `.tools/`, installs uv-managed CPython 3.12.11 in `.tools/uv-python`, syncs the locked dev environment to `.venv/`, and installs Git hooks when inside a Git checkout. It does not install any global Python package, JDK or Gradle. Re-run bootstrap after dependency changes and commit the updated `uv.lock`. Use `./.tools/uv lock` to update the lock deliberately. `./scripts/check` runs Ruff format check, Ruff lint and pytest; the same quick checks run from the Lefthook pre-commit hook. Training, Fabric builds and Minecraft runtime probes are explicit, not commit hooks. Java/Fabric changes should additionally pass `./scripts/gradle build`.

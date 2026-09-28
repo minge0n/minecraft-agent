@@ -1,6 +1,7 @@
 package com.mcbot.mixin;
 
 import com.llamalad7.mixinextras.injector.ModifyExpressionValue;
+import com.mcbot.FrameRecorder;
 import com.mcbot.Lockstep;
 import com.mcbot.McBotClient;
 import net.minecraft.client.FramerateLimiter;
@@ -54,5 +55,14 @@ public abstract class MinecraftMixin {
             Lockstep.waitForFrameOrClientTick(SKIPPED_FRAME_WAIT_FPS);
             callback.cancel();
         }
+    }
+
+    // Session recording: the frame is fully drawn and its commands are not yet
+    // submitted, so the capture copy joins this frame's command stream.
+    @Inject(
+            method = "renderFrame",
+            at = @At(value = "INVOKE", target = "Lcom/mojang/renderpearl/api/commands/CommandEncoder;submit()V"))
+    private void mcbot$captureRecordingFrame(boolean advanceGameTime, CallbackInfo callback) {
+        FrameRecorder.onFrameRendered((Minecraft) (Object) this);
     }
 }

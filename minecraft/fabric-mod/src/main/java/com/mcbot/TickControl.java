@@ -181,9 +181,36 @@ final class TickControl {
                 quit();
                 yield "v2 QUIT {}";
             }
-            case "RESET" -> reset(payload);
+            case "RESET" -> FrameRecorder.active() ? "v2 ERROR recording_active" : reset(payload);
+            // Recording commands wait for the render thread, never for the server thread.
+            case "RECORD_START" -> recordStart(payload);
+            case "RECORD_STOP" -> recordStop();
             default -> onServerThread("v2", reply -> handleV2(command, payload, reply));
         };
+    }
+
+    private static String recordStart(JsonObject payload) {
+        try {
+            return v2("RECORD_START", FrameRecorder.start(RecordingSettings.fromJson(payload)));
+        } catch (IllegalArgumentException | IllegalStateException e) {
+            return "v2 ERROR " + e.getMessage();
+        } catch (IOException e) {
+            return "v2 ERROR recorder_unreachable";
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "v2 ERROR interrupted";
+        }
+    }
+
+    private static String recordStop() {
+        try {
+            return v2("RECORD_STOP", FrameRecorder.stop());
+        } catch (IllegalStateException e) {
+            return "v2 ERROR " + e.getMessage();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "v2 ERROR interrupted";
+        }
     }
 
     private String onServerThread(String version, Consumer<CompletableFuture<String>> handler) {
@@ -248,10 +275,12 @@ final class TickControl {
             case "SCHEMA" -> reply.complete(v2("SCHEMA", VisibleFieldSensor.schema()));
             case "STATUS" -> reply.complete(v2("STATUS", statusJson(status(current))));
             case "PACING" -> {
-                Lockstep.pacing = Pacing.valueOf(payload.get("mode").getAsString().toUpperCase(Locale.ROOT));
-                if (payload.has("render_frames")) {
-                    Lockstep.renderFrames = payload.get("render_frames").getAsBoolean();
+                boolean renderFrames = !payload.has("render_frames") || payload.get("render_frames").getAsBoolean();
+                if (!renderFrames && FrameRecorder.active()) {
+                    throw new IllegalStateException("recording_requires_rendering");
                 }
+                Lockstep.pacing = Pacing.valueOf(payload.get("mode").getAsString().toUpperCase(Locale.ROOT));
+                Lockstep.renderFrames = renderFrames;
                 reply.complete(v2("PACING", pacingJson()));
             }
             case "OBSERVE" -> reply.complete(v2("OBSERVE", observationReply(firstPlayer(current))));
@@ -398,6 +427,7 @@ final class TickControl {
         json.addProperty("client_ticks", status.clientTicks());
         json.add("pacing", pacingJson());
         json.add("client_settings", EnvironmentSettings.describe(Minecraft.getInstance()));
+        json.add("recording", FrameRecorder.status());
         return json;
     }
 

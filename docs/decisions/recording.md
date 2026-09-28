@@ -1,6 +1,6 @@
 # Mandatory session recording
 
-Status: **decided requirement; not implemented.** The existing probes (`scripts/minecraft-tick-gate-probe.py`, `scripts/minecraft-observation-probe.py`) are non-recording infrastructure tests until the recorder exists. Refines the RGB deferral: rendered frames are required for humans and remain excluded from the policy.
+Status: **implemented and runtime-validated on 26.3 (macOS arm64) for a single worker.** See Implementation and Results. Recording is opt-in per invocation today: `scripts/minecraft-recording-probe.py` records; the other probes remain non-recording infrastructure tests. Refines the RGB deferral: rendered frames are required for humans and remain excluded from the policy.
 
 ## Principle
 
@@ -32,6 +32,8 @@ Simulation distance is configured independently and recorded; video cost never r
 The raw video is the agent's first-person camera and an honest view of what Minecraft rendered. It answers what the agent looked at, which actions led to a failure, whether it looped, noticed an entity, fell, and what preceded an advancement or death. Privileged debug visualizations are not drawn into it. A separate annotated debug recording (environment step, logical tick, action, reward, return, advancement event, sensor output, world-model diagnostics) may be added later.
 
 Open question: frames are rendered between client ticks with interpolation, and client views of non-player entities are likely one step behind the server (inferred from source). The tick that a captured frame represents must be defined and measured before claiming frame/tick alignment.
+
+Definition (implemented): a captured frame belongs to the client tick it was captured after. It is the first frame drawn after that client tick completed, and `frames.jsonl` records its client tick, world game time and `partial_tick` (interpolation fraction, 0-1). With lockstep the next tick does not start until the next STEP, so interpolation between two ticks shows only already-simulated states. Non-player world state in the frame can lag the server by one step (`docs/decisions/simulation-throughput.md`, client world copy).
 
 ## Simulation time and video time
 
@@ -70,3 +72,35 @@ It must remain possible to watch one or more running workers without changing po
 ## Benchmarks
 
 Once accelerated stepping exists, measure one environment in four configurations: simulation only; plus rendering; plus capture; plus encoding. Repeat representative cases with several concurrent workers to identify whether simulation, rendering, capture, encoding, disk I/O or the Dreamer learner dominates.
+
+## Implementation
+
+- **Encoder decision.** PyAV 18.1.0 (locked in `uv.lock`) with the macOS VideoToolbox H.264 hardware encoder `h264_videotoolbox`, MP4 container, NV12, 600 kbit/s, 20 playback FPS. Alternatives: `libx264` (GPL build inside PyAV's wheel), `libvpx-vp9` (BSD, slower, WebM). Chosen by the developer for speed on the current host. Consequence: Linux hosts need a different encoder; not implemented. PyAV's PyPI wheels bundle an FFmpeg build that includes GPL components (libx264, libx265); the project uses them locally and does not redistribute binaries.
+- **Capture (mod, render thread).** `FrameRecorder` hooks `Minecraft.renderFrame` just before the frame's command submit. Every client tick is considered once, in the first frame drawn after it; every `every_ticks`-th tick from the start of the episode is due. A due frame is downscaled on the GPU with the vanilla `TRACY_BLIT` screen-quad pipeline into an RGBA texture and copied into one of four readback buffers. The copy completes asynchronously through a GPU fence and is read in a later frame. The render thread never waits for the GPU or the network.
+- **Bounded queue and sender.** Read-back frames go into a bounded queue (`queue_frames`); a daemon thread streams them to the recorder over loopback TCP (`FrameStream`, versioned binary format). A frame that finds no free readback buffer, finds the queue full, or arrives after a failure is dropped and counted (`dropped_gpu_busy`, `dropped_queue_full`, `dropped_after_failure`, `missed_unrendered`). Recording never blocks or delays a STEP.
+- **Recorder (Python).** `minecraft_rl.recording.Recorder` listens on a loopback port and encodes one episode per connection on a background thread. It writes `video.mp4`, `frames.jsonl` (video frame -> client tick, game time, partial tick) and `metrics.json` (session context, capture counters, encoding summary, `recording_status`). A stream that ends without END, an encoder error or a capture failure marks the episode `failed`; nothing is discarded.
+- **Protocol.** v2 `RECORD_START {episode, port, every_ticks, width, height, queue_frames}` returns once the episode's first tick has been considered; v2 `RECORD_STOP` returns the capture counters after every readback has finished and END has been sent. `RESET` and `PACING` with `render_frames=false` are rejected while recording. `STATUS` reports the recorder state. Recording requires rendered frames, so it is incompatible with no-render stepping.
+- **Layout.** `runs/<run>/metadata.json` and `runs/<run>/workers/env-NNNN/episodes/NNNNNN/{video.mp4,frames.jsonl,metrics.json}`.
+
+## Results (macOS arm64, seed 12345, unpaced, window framebuffer 1708x960)
+
+`scripts/minecraft-recording-probe.py`, runs `runs/minecraft-recording/{r1,r2-640x360-e1,r3-320x180-e2,final}`. All passed.
+
+- **No effect on steps.** A recorded controlled replay (243 steps) matched an unrecorded one exactly: zero differing policy observations and no unexplained privileged fields, one world tick and one client tick per STEP.
+- **Completeness.** Every due frame was written (244 of 244 in the replay, 401 of 401 in each benchmark episode), with strictly increasing, consecutive client ticks and no drops. GPU readback latency was 13-15 ms on average and at most 44 ms. The queue high-water mark was 1-4 frames.
+- **Failure isolation.** With the recorder connection closed at start, the mod reported `recording_status=failed` (`Broken pipe`), counted 200 dropped frames, and all 200 steps still advanced exactly one tick.
+- **Cost (400 unpaced steps, 426x240, every tick; run `final`):**
+
+| Configuration | Steps/s | Median step ms | p95 step ms |
+| --- | --- | --- | --- |
+| simulation only (no rendering) | 141.0 | 6.73 | 9.04 |
+| + rendering | 62.8 | 16.20 | 22.92 |
+| + capture (frames discarded) | 62.1 | 16.47 | 26.78 |
+| + encoding | 62.4 | 16.26 | 25.63 |
+
+Rendering costs roughly half of unpaced throughput; capture and encoding add little on top (1.7-2.1 ms encoder time per frame on a separate thread). At 640x360 every tick throughput was about 63 steps/s; at 320x180 every 2nd tick about 58-62 steps/s. The step-rate differences between these settings are within run-to-run variation.
+
+- **Storage.** 426x240 every tick: about 1.2 MB per 400-tick episode, about 264 MB per simulated hour. 640x360: about 269 MB per simulated hour at the same bit rate. 320x180 every 2nd tick: about 133 MB per simulated hour.
+- **Default.** 426x240, every tick, 600 kbit/s: the frames stay legible for navigation, combat and camera motion, and cost no more than lower resolutions on this host. Revisit when multiple workers compete for the GPU and encoder.
+
+Not yet covered: multiple concurrent workers, long episodes, Linux encoders, and an explicit retention policy (none exists; nothing is deleted automatically).

@@ -7,7 +7,7 @@ name = "minecraft-rl-lab"
 version = "0.1.0"
 description = "Inspectable reinforcement learning experiments toward a Minecraft agent"
 requires-python = "==3.12.*"
-dependencies = []
+dependencies = ["av==18.1.0"]
 
 [project.optional-dependencies]
 dev = ["pytest==8.4.2", "ruff==0.13.2"]

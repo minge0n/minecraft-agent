@@ -156,12 +156,12 @@ The scripted player trajectory repeated to within 1e-15 blocks and physics was i
 
 ## Known limitations and open work
 
-- Accelerated (unpaced) stepping is implemented and validated against paced stepping: paced ~20, unpaced ~84-99 with rendering, ~154 without rendering steps/s. Results, mechanism and equivalence evidence are in `docs/decisions/simulation-throughput.md`. The tables above predate it.
+- Accelerated (unpaced) stepping is implemented and validated against paced stepping: paced ~20, unpaced ~58-99 with rendering and ~140-154 without rendering steps/s, varying between sessions. Results, mechanism and equivalence evidence are in `docs/decisions/simulation-throughput.md`. The tables above predate it.
 - v1 `NOOP` and `FORWARD` remain as the proven timing probe; v2 `PlayerAction` is the factorized interface. GUI and inventory actions are not implemented.
 - The client's copy of non-player world state can lag the server by one step (`docs/replay-characterization.md`). An ordering barrier now makes the lag identical in paced and unpaced modes (`docs/decisions/simulation-throughput.md`). The v2 observation is computed from server state, so this does not affect it; it matters for recording.
 - Visibility evidence covers one scripted scene with full opaque blocks, one mob type and daylight. Transparent blocks, partial shapes, fluids, small entities, lighting and entities between rays are not yet tested; see `docs/decisions/observation.md` for known v1 limitations.
 - Replay characterization covers one flat scene and 243 steps; see `docs/replay-characterization.md`.
-- Both runtime probes are non-recording infrastructure tests under `docs/decisions/recording.md`; no recorder exists yet.
+- Both runtime probes are non-recording infrastructure tests under `docs/decisions/recording.md`; `scripts/minecraft-recording-probe.py` records and validates session recording for one worker.
 - Each probe launch currently gets a random development username (`PlayerNNN`, from the 26.3 `--username` default); deterministic `AgentNNNN` identities are decided in `docs/decisions/parallel-workers.md` but not wired.
 - Low-cost client settings (fast graphics, render distance 8, simulation distance 6, VSync off) are applied in observer mode and reported by `STATUS`.
-- Remaining Stage 1.5 gate items: session recording (`docs/decisions/recording.md`) and an isolated multi-worker smoke test (`docs/decisions/parallel-workers.md`).
+- Remaining Stage 1.5 gate item: an isolated multi-worker smoke test (`docs/decisions/parallel-workers.md`). Session recording is implemented and validated for one worker (`docs/decisions/recording.md`).

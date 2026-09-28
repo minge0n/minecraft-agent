@@ -1,6 +1,6 @@
 # Accelerated lockstep simulation
 
-Status: **implemented and runtime-validated on 26.3 (macOS arm64).** Paced ~20 steps/s, unpaced with rendering ~84-99 steps/s, unpaced without rendering ~154 steps/s; paced and unpaced traces are equivalent in the controlled scene (see Results). Extends `docs/decisions/lockstep.md` without changing its one-action, one-tick contract. Work order: `docs/roadmap.md` (Minecraft environment track).
+Status: **implemented and runtime-validated on 26.3 (macOS arm64).** Paced ~20 steps/s; unpaced with rendering ~58-99 steps/s and unpaced without rendering ~140-154 steps/s, varying between sessions on the same host (see Results). Paced and unpaced traces are equivalent in the controlled scene. Extends `docs/decisions/lockstep.md` without changing its one-action, one-tick contract. Work order: `docs/roadmap.md` (Minecraft environment track).
 
 ## Invariant
 
@@ -64,6 +64,8 @@ In paced mode the step waits for the 50 ms server deadline (`tick_end_sync_ms`).
 - Throughput in this probe: paced 20.4, unpaced (rendering) 98.5 steps/s.
 
 These results come from one host, one flat scene and one action script. Transparent blocks, fluids, lighting, natural terrain, many entities and longer episodes are not yet covered.
+
+Run-to-run variation: later sessions on the same host measured unpaced with rendering at 57-68 steps/s and without rendering at 140-145 steps/s (`runs/minecraft-observation/after-recording.json`, `runs/minecraft-equivalence/e5/`). An A/B build with and without the recording frame hook gave 59.6 and 57.5 steps/s, so the spread is host variation, not a code regression. Paced stayed at 20 steps/s and every correctness check passed in all sessions. Throughput comparisons should therefore be made within one session.
 
 ## Profiling requirement
 
