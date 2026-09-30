@@ -1,11 +1,11 @@
 # Learning roadmap: Dreamer first
 
-Status: **decided direction; Stage 1 and Stage 1.5 are done, nothing beyond them is implemented.** Supersedes the earlier "Q-learning, then DQN" path. DQN may appear later as an optional baseline but is not on the critical path.
+Status: **decided direction; Stage 1, Stage 1.5 and Stage 2A are done, nothing beyond them is implemented.** Supersedes the earlier "Q-learning, then DQN" path. DQN may appear later as an optional baseline but is not on the critical path.
 
 ```text
 Stage 1   tabular Q-learning baseline (done, docs/stage1.md)
 Stage 1.5 Minecraft lockstep + structured observation contract (done, docs/minecraft-spike.md)
-Stage 2A  neural-network sanity check
+Stage 2A  neural-network sanity check (done, docs/stage2a.md)
 Stage 2B  recurrent model sanity check
 Stage 2C  learned dynamics in a toy environment
 Stage 2D  imagination and compounding-error measurement
