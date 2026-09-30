@@ -7,15 +7,21 @@ policy input.
 
 import math
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import Any
 
-from minecraft_rl.minecraft_client import StepResult
+from minecraft_rl.minecraft_client import MinecraftClient, StepResult
 from minecraft_rl.minecraft_interface import PlayerAction
 
 NOOP = PlayerAction()
 REMOVE_SAND_SUPPORT = "remove_sand_support"
 CHECKPOINT_STEPS = (25, 50, 100, 150, 200, 250, 300)
+REPLAY_COLUMN = (8, 8)
+# Fields expected to differ between otherwise identical runs; see
+# docs/replay-characterization.md.
+RUN_OFFSET_FIELDS = frozenset(
+    {"privileged.server_player.tick_count", "privileged.client_player.tick_count"}
+)
 
 
 def _repeat(action: PlayerAction, count: int) -> list[PlayerAction]:
@@ -69,6 +75,51 @@ def scripted_actions() -> list[PlayerAction]:
 def scripted_events() -> dict[int, str]:
     """Privileged world edits applied before the given step, identically per run."""
     return {150: REMOVE_SAND_SUPPORT}
+
+
+@dataclass(frozen=True)
+class ReplayScene:
+    """A built `replay` debug scene and what its trace records refer to."""
+
+    scene: dict[str, Any]
+    roles: dict[int, str]
+    region: tuple[list[int], list[int]]
+
+
+def build_controlled_replay(client: MinecraftClient, seed: int) -> ReplayScene:
+    """Reset to a fresh flat world and build the controlled `replay` scene."""
+    client.set_pacing("paced")
+    client.reset(seed, "flat")
+    scene = client.privileged().scene("replay", at=REPLAY_COLUMN, controlled=True)
+    return ReplayScene(
+        scene, {scene["husk"]: "husk"}, (scene["arena_from"], scene["arena_to"])
+    )
+
+
+def play_replay(client: MinecraftClient, replay: ReplayScene) -> list[dict[str, Any]]:
+    """Play the fixed action script once and return one trace record per step.
+
+    Raises AssertionError if a step does not advance exactly one world tick and one
+    client tick.
+    """
+    privileged = client.privileged()
+    events = scripted_events()
+    support = replay.scene["sand_support"]
+    records = []
+    for step, action in enumerate(scripted_actions()):
+        if events.get(step) == REMOVE_SAND_SUPPORT:
+            privileged.fill(support, support, "minecraft:air")
+        result = client.step(action)
+        if result.info.tick_after != result.info.tick_before + 1:
+            raise AssertionError(f"step {step} did not advance exactly one tick")
+        trace = privileged.trace(*replay.region)
+        records.append(
+            trace_record(step, action, events.get(step), result, trace, replay.roles)
+        )
+    for previous, current in zip(records, records[1:], strict=False):
+        if current["info"]["client_tick"] != previous["info"]["client_tick"] + 1:
+            raise AssertionError(f"client ticks not consecutive at {current['step']}")
+    return records
 
 
 def trace_record(
@@ -273,6 +324,11 @@ def compare_traces(
             for role, series in sorted(entity_distance.items())
         },
     }
+
+
+def unexplained_fields(comparison: Mapping[str, Any]) -> list[str]:
+    """Fields of a `compare_traces` result that differ beyond the run offset."""
+    return sorted(set(comparison["first_divergence_by_field"]) - RUN_OFFSET_FIELDS)
 
 
 def client_view_alignment(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:

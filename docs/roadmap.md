@@ -1,10 +1,10 @@
 # Learning roadmap: Dreamer first
 
-Status: **decided direction; nothing beyond Stage 1 is implemented.** Supersedes the earlier "Q-learning, then DQN" path. DQN may appear later as an optional baseline but is not on the critical path.
+Status: **decided direction; Stage 1 and Stage 1.5 are done, nothing beyond them is implemented.** Supersedes the earlier "Q-learning, then DQN" path. DQN may appear later as an optional baseline but is not on the critical path.
 
 ```text
 Stage 1   tabular Q-learning baseline (done, docs/stage1.md)
-Stage 1.5 Minecraft lockstep + structured observation contract (in progress)
+Stage 1.5 Minecraft lockstep + structured observation contract (done, docs/minecraft-spike.md)
 Stage 2A  neural-network sanity check
 Stage 2B  recurrent model sanity check
 Stage 2C  learned dynamics in a toy environment
@@ -24,9 +24,9 @@ Stage 2A starts only after the Stage 1.5 gate in `docs/minecraft-spike.md` is va
 3 factorized actions                    proven
 4 reset / episode semantics             proven (fresh world, death termination)
 5 determinism characterization          measured (docs/replay-characterization.md)
-6 single-instance throughput            open (~10 steps/s, docs/decisions/simulation-throughput.md)
-7 accelerated mode validated vs paced   open
-8 multi-instance workers                later (docs/decisions/parallel-workers.md)
+6 single-instance throughput            measured (docs/decisions/simulation-throughput.md)
+7 accelerated mode validated vs paced   proven (controlled replay equivalence)
+8 multi-instance workers                isolation proven for 2 workers; scaling open (docs/decisions/parallel-workers.md)
 9 connect to Dreamer training           after Stage 2F
 ```
 

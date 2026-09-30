@@ -16,7 +16,6 @@ run directory with the layout from docs/decisions/recording.md.
 """
 
 import argparse
-import itertools
 import json
 import platform
 import socket
@@ -31,27 +30,20 @@ from minecraft_rl.minecraft_interface import PlayerAction
 from minecraft_rl.minecraft_launch import launched_client
 from minecraft_rl.recording import (
     EpisodeRecording,
-    Recorder,
-    episode_directory,
-    finalize_episode,
+    WorkerRecorder,
     git_commit,
     read_stream,
     storage_summary,
     write_json,
 )
 from minecraft_rl.replay import (
-    REMOVE_SAND_SUPPORT,
+    build_controlled_replay,
     compare_traces,
-    scripted_actions,
-    scripted_events,
-    trace_record,
+    play_replay,
+    unexplained_fields,
 )
 
 WORKER = "env-0000"
-SCENE_COLUMN = (8, 8)
-RUN_OFFSET_FIELDS = frozenset(
-    {"privileged.server_player.tick_count", "privileged.client_player.tick_count"}
-)
 BENCHMARK_STEPS = 400
 
 
@@ -60,93 +52,15 @@ def check(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-class Session:
-    """One client, one recorder and the episode counter of this worker."""
-
-    def __init__(
-        self,
-        client: MinecraftClient,
-        run: Path,
-        settings: dict[str, int],
-        context: dict[str, Any],
-    ):
-        self.client = client
-        self.run = run
-        self.settings = settings
-        self.context = context
-        self.recorder = Recorder()
-        self.episode = 0
-        self.recordings: list[EpisodeRecording] = []
-        self.capture_stats: list[dict[str, Any]] = []
-        self._started = ""
-        self._wall_started = 0.0
-
-    def start(self) -> Path:
-        directory = episode_directory(self.run, WORKER, self.episode)
-        self.recorder.next_episode(directory)
-        self._started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-        self._wall_started = time.perf_counter()
-        self.client.start_recording(self.episode, self.recorder.port, **self.settings)
-        return directory
-
-    def stop(self) -> tuple[dict[str, Any], EpisodeRecording]:
-        capture = self.client.stop_recording()
-        recording = self.recorder.finish_episode()
-        finalize_episode(
-            recording,
-            capture,
-            self.context
-            | {
-                "episode": self.episode,
-                "started": self._started,
-                "finished": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                "wall_seconds": time.perf_counter() - self._wall_started,
-            },
-        )
-        self.capture_stats.append(capture)
-        self.recordings.append(recording)
-        self.episode += 1
-        return capture, recording
-
-
 def replay(
-    client: MinecraftClient, seed: int, session: Session | None
+    client: MinecraftClient, seed: int, recorder: WorkerRecorder | None
 ) -> dict[str, Any]:
-    client.set_pacing("paced")
-    client.reset(seed, "flat")
-    privileged = client.privileged()
-    scene = privileged.scene("replay", at=SCENE_COLUMN, controlled=True)
-    roles = {scene["husk"]: "husk"}
-    region = (scene["arena_from"], scene["arena_to"])
+    scene = build_controlled_replay(client, seed)
     client.set_pacing("unpaced")
-    directory = session.start() if session else None
-    events = scripted_events()
-    records = []
-    started = time.perf_counter()
-    for step, action in enumerate(scripted_actions()):
-        if events.get(step) == REMOVE_SAND_SUPPORT:
-            privileged.fill(
-                scene["sand_support"], scene["sand_support"], "minecraft:air"
-            )
-        result = client.step(action)
-        check(result.info.tick_after == result.info.tick_before + 1, "skipped tick")
-        records.append(
-            trace_record(
-                step, action, events.get(step), result, privileged.trace(*region), roles
-            )
-        )
-    elapsed = time.perf_counter() - started
-    for previous, current in itertools.pairwise(records):
-        check(
-            current["info"]["client_tick"] == previous["info"]["client_tick"] + 1,
-            "client ticks not consecutive",
-        )
-    out: dict[str, Any] = {
-        "records": records,
-        "steps_per_second": len(records) / elapsed,
-    }
-    if session:
-        capture, recording = session.stop()
+    directory = recorder.start() if recorder else None
+    out: dict[str, Any] = {"records": play_replay(client, scene)}
+    if recorder:
+        capture, recording = recorder.stop()
         out |= {"capture": capture, "recording": recording, "directory": directory}
     client.set_pacing("paced")
     return out
@@ -197,9 +111,7 @@ def check_equivalence(
     reference: list[dict[str, Any]], recorded: list[dict[str, Any]]
 ) -> dict[str, Any]:
     comparison = compare_traces(reference, recorded)
-    unexplained = sorted(
-        set(comparison["first_divergence_by_field"]) - RUN_OFFSET_FIELDS
-    )
+    unexplained = unexplained_fields(comparison)
     check(not unexplained, f"recording changed the trace: {unexplained}")
     return {
         "steps": comparison["steps"],
@@ -210,13 +122,15 @@ def check_equivalence(
     }
 
 
-def run_failure(client: MinecraftClient, session: Session, seed: int) -> dict[str, Any]:
+def run_failure(
+    client: MinecraftClient, recorder: WorkerRecorder, seed: int
+) -> dict[str, Any]:
     """The recorder vanishes mid-episode; the simulation must keep stepping."""
     client.reset(seed, "flat")
     client.set_pacing("unpaced")
     listener = socket.create_server(("127.0.0.1", 0))
     port = listener.getsockname()[1]
-    client.start_recording(session.episode, port, **session.settings)
+    client.start_recording(recorder.episode, port, **recorder.settings)
     connection, _ = listener.accept()
     connection.close()
     listener.close()
@@ -226,7 +140,7 @@ def run_failure(client: MinecraftClient, session: Session, seed: int) -> dict[st
         check(result.info.tick_after == result.info.tick_before + 1, "skipped tick")
         steps += 1
     capture = client.stop_recording()
-    session.episode += 1
+    recorder.episode += 1
     client.set_pacing("paced")
     check(capture["status"] == "failed", f"lost recorder not reported: {capture}")
     return {"steps_after_failure": steps, "capture": capture}
@@ -237,7 +151,7 @@ def measure(
     seed: int,
     label: str,
     render_frames: bool,
-    session: Session,
+    recorder: WorkerRecorder,
     sink: str | None,
 ) -> dict[str, Any]:
     """Unpaced steps with no recording, capture into a discarding sink, or encoding."""
@@ -245,10 +159,10 @@ def measure(
     client.set_pacing("unpaced", render_frames=render_frames)
     discard: DiscardSink | None = None
     if sink == "encode":
-        session.start()
+        recorder.start()
     elif sink == "discard":
         discard = DiscardSink()
-        client.start_recording(session.episode, discard.port, **session.settings)
+        client.start_recording(recorder.episode, discard.port, **recorder.settings)
     step_ms = []
     started = time.perf_counter()
     for index in range(BENCHMARK_STEPS):
@@ -266,7 +180,7 @@ def measure(
         "p95_step_ms": statistics.quantiles(step_ms, n=20)[-1],
     }
     if sink == "encode":
-        capture, recording = session.stop()
+        capture, recording = recorder.stop()
         out |= {
             "capture": capture,
             "recording": recording.summary(),
@@ -276,7 +190,7 @@ def measure(
         }
     elif discard is not None:
         capture = client.stop_recording()
-        session.episode += 1
+        recorder.episode += 1
         out |= {"capture": capture, "frames_discarded": discard.finish()}
     client.set_pacing("paced")
     return out
@@ -337,7 +251,7 @@ def main() -> None:
         "recording_settings": settings,
         "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
-    session: Session | None = None
+    recorder: WorkerRecorder | None = None
     try:
         with launched_client(
             args.port,
@@ -346,12 +260,12 @@ def main() -> None:
             args.startup_timeout,
         ) as client:
             result["client_status"] = client.status_json()
-            session = Session(
+            recorder = WorkerRecorder(
                 client,
                 args.output,
+                WORKER,
                 settings,
                 {
-                    "worker": WORKER,
                     "run": str(args.output),
                     "mode": "debug",
                     "world_seed": args.seed,
@@ -361,16 +275,16 @@ def main() -> None:
                 },
             )
             unrecorded = replay(client, args.seed, None)
-            recorded = replay(client, args.seed, session)
+            recorded = replay(client, args.seed, recorder)
             result["equivalence"] = check_equivalence(
                 unrecorded["records"], recorded["records"]
             )
             result["recorded_replay"] = check_recording(
                 recorded["capture"], recorded["recording"], recorded["directory"]
             )
-            result["failure_isolation"] = run_failure(client, session, args.seed)
+            result["failure_isolation"] = run_failure(client, recorder, args.seed)
             result["benchmark"] = [
-                measure(client, args.seed, label, render, session, sink)
+                measure(client, args.seed, label, render, recorder, sink)
                 for label, render, sink in (
                     ("simulation_only", False, None),
                     ("rendering", True, None),
@@ -380,17 +294,17 @@ def main() -> None:
             ]
             simulated = sum(
                 capture["stop_client_tick"] - capture["start_client_tick"]
-                for capture in session.capture_stats
+                for capture in recorder.capture_stats
             )
-            result["storage"] = storage_summary(session.recordings, simulated)
+            result["storage"] = storage_summary(recorder.recordings, simulated)
         result["passed"] = True
     except Exception as error:
         result |= {"passed": False, "error": f"{type(error).__name__}: {error}"}
     finally:
-        if session is not None:
-            session.recorder.close()
+        if recorder is not None:
+            recorder.close()
             result["episodes"] = [
-                recording.summary() for recording in session.recordings
+                recording.summary() for recording in recorder.recordings
             ]
     result["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     write_json(args.output / "metadata.json", result)

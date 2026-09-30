@@ -15,10 +15,24 @@ base {
 // ./scripts/gradle creates, so runs never touch a personal Minecraft install.
 def runtimeMinecraftDir = layout.projectDirectory.dir('../../.runtime/minecraft')
 
+// `-Pmcbot.worker=NNNN` runs the client as isolated environment worker env-NNNN: its
+// own game directory (options, saves, logs, crash reports) and the deterministic
+// offline development identity AgentNNNN (docs/decisions/parallel-workers.md).
+def worker = providers.gradleProperty('mcbot.worker').orNull
+if (worker != null && !(worker ==~ /\d{4}/)) {
+    throw new GradleException("mcbot.worker must be four digits, got '${worker}'")
+}
+
 loom {
     runs {
         configureEach {
             runDirectory = runtimeMinecraftDir.dir(name)
+        }
+        if (worker != null) {
+            client {
+                runDirectory = layout.projectDirectory.dir("../../.runtime/workers/${worker}/client")
+                programArgs '--username', "Agent${worker}"
+            }
         }
     }
 }

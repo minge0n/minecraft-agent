@@ -28,17 +28,13 @@ from minecraft_rl.replay import (
     scripted_actions,
     scripted_events,
     trace_record,
+    unexplained_fields,
 )
 
 SCENE_COLUMN = (8, 8)
 MODES = {"natural": {"ai": True}, "controlled": {"controlled": True}}
 PACINGS = ("paced", "unpaced")
 IDLE_SECONDS = 2.0
-# Fields expected to differ between otherwise identical runs; see
-# docs/replay-characterization.md.
-RUN_OFFSET_FIELDS = frozenset(
-    {"privileged.server_player.tick_count", "privileged.client_player.tick_count"}
-)
 
 
 def check(condition: bool, message: str) -> None:
@@ -133,10 +129,6 @@ def milestones(records: list[dict[str, Any]]) -> dict[str, Any]:
         "final_player_position": positions[-1],
         "final_inventory": records[-1]["privileged"]["server_player"]["inventory"],
     }
-
-
-def unexplained_fields(comparison: dict[str, Any]) -> list[str]:
-    return sorted(set(comparison["first_divergence_by_field"]) - RUN_OFFSET_FIELDS)
 
 
 def main() -> None:

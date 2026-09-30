@@ -20,6 +20,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from minecraft_rl.minecraft_client import MinecraftClient
+
 MAGIC = 0x4D434652
 VERSION = 1
 START, FRAME, END = 0, 1, 2
@@ -335,6 +337,65 @@ def finalize_episode(
     }
     write_json(Path(recording.directory) / "metrics.json", metrics)
     return metrics
+
+
+class WorkerRecorder:
+    """Records the consecutive episodes of one worker into the run's layout.
+
+    Call `start()` just before an episode's first step and `stop()` after its last;
+    each stopped episode gets `metrics.json` with `context` plus episode timing.
+    """
+
+    def __init__(
+        self,
+        client: MinecraftClient,
+        run: Path,
+        worker: str,
+        settings: dict[str, int],
+        context: dict[str, Any],
+    ) -> None:
+        self.client = client
+        self.run = run
+        self.worker = worker
+        self.settings = settings
+        self.context = context
+        self.recorder = Recorder()
+        self.episode = 0
+        self.recordings: list[EpisodeRecording] = []
+        self.capture_stats: list[dict[str, Any]] = []
+        self._started = ""
+        self._wall_started = 0.0
+
+    def start(self) -> Path:
+        directory = episode_directory(self.run, self.worker, self.episode)
+        self.recorder.next_episode(directory)
+        self._started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        self._wall_started = time.perf_counter()
+        self.client.start_recording(self.episode, self.recorder.port, **self.settings)
+        return directory
+
+    def stop(self) -> tuple[dict[str, Any], EpisodeRecording]:
+        capture = self.client.stop_recording()
+        recording = self.recorder.finish_episode()
+        finalize_episode(
+            recording,
+            capture,
+            self.context
+            | {
+                "worker": self.worker,
+                "episode": self.episode,
+                "started": self._started,
+                "finished": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "wall_seconds": time.perf_counter() - self._wall_started,
+            },
+        )
+        self.capture_stats.append(capture)
+        self.recordings.append(recording)
+        self.episode += 1
+        return capture, recording
+
+    def close(self) -> None:
+        self.recorder.close()
 
 
 def git_commit() -> str | None:

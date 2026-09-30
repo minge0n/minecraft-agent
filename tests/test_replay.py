@@ -14,6 +14,7 @@ from minecraft_rl.replay import (
     scripted_actions,
     scripted_events,
     trace_record,
+    unexplained_fields,
 )
 from test_minecraft_interface import SCHEMA_JSON, observation_json
 
@@ -115,3 +116,15 @@ def test_client_view_alignment_detects_one_step_lag() -> None:
     assert alignment["blocks_matching_server_lag_0"] == 0
     assert alignment["blocks_matching_server_lag_1"] == 4
     assert alignment["entity_count_matching_server_lag_0"] == 5
+
+
+def test_unexplained_fields_ignore_the_run_offset():
+    comparison = {
+        "first_divergence_by_field": {
+            "privileged.server_player.tick_count": 0,
+            "privileged.client_player.tick_count": 0,
+            "policy.observation_sha256": 12,
+        }
+    }
+    assert unexplained_fields(comparison) == ["policy.observation_sha256"]
+    assert unexplained_fields({"first_divergence_by_field": {}}) == []

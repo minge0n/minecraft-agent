@@ -1,6 +1,6 @@
 # Minecraft 26.3 lockstep engineering spike
 
-**Scope:** No agent training, neural network or reward. This spike asks whether an external controller can pause Minecraft's logical simulation, advance it by exactly one tick per request with a player action applied on that tick, and return a structured visible-field observation of the result. Stage 1.5 is **incomplete**.
+**Scope:** No agent training, neural network or reward. This spike asks whether an external controller can pause Minecraft's logical simulation, advance it by exactly one tick per request with a player action applied on that tick, and return a structured visible-field observation of the result. Stage 1.5 is **complete**: every gate requirement below is validated, with the limitations listed at the end of this file.
 
 ## Stage 1.5 completion gate
 
@@ -19,7 +19,10 @@ Revised by the observation architecture update (`docs/decisions/observation.md`)
 | Episode reset semantics for experiments | proven: fresh disposable world per reset, gated and frozen, `terminated` after death |
 | Replay/determinism characterization | measured: player-driven transitions and policy observations bit-identical across runs and processes once world RNG consumers are removed; mob AI, drop scatter and random ticks diverge (`docs/replay-characterization.md`) |
 | Protocol and schema correctness | proven: v1 and v2 unit tests, strict schema parsing, JUnit for actions and ray geometry |
-| Measured throughput with per-phase breakdown | measured: ~10 steps/s, dominated by server-loop pacing; optimization open |
+| Measured throughput with per-phase breakdown | measured: paced ~20 steps/s; unpaced ~58-99 with rendering and ~140-154 without, per-phase breakdown in `docs/decisions/simulation-throughput.md` |
+| Accelerated stepping validated against paced | proven: 16 controlled paced/unpaced replay pairs with no unexplained differences; one tick per STEP and idle freeze in both modes (`docs/decisions/simulation-throughput.md`) |
+| Session recording | proven for one worker: recorded and unrecorded replays identical, every due frame written, recorder failure isolated, cost benchmarked (`docs/decisions/recording.md`) |
+| Isolated workers with deterministic identities | proven for two concurrent workers: separate game directories, `AgentNNNN` offline identities, ports, seeds and recordings; no cross-worker stepping or interference (`docs/decisions/parallel-workers.md`) |
 | RGB framebuffer synchronization | deferred, not required |
 
 ## Automated runtime probe
@@ -162,6 +165,6 @@ The scripted player trajectory repeated to within 1e-15 blocks and physics was i
 - Visibility evidence covers one scripted scene with full opaque blocks, one mob type and daylight. Transparent blocks, partial shapes, fluids, small entities, lighting and entities between rays are not yet tested; see `docs/decisions/observation.md` for known v1 limitations.
 - Replay characterization covers one flat scene and 243 steps; see `docs/replay-characterization.md`.
 - Both runtime probes are non-recording infrastructure tests under `docs/decisions/recording.md`; `scripts/minecraft-recording-probe.py` records and validates session recording for one worker.
-- Each probe launch currently gets a random development username (`PlayerNNN`, from the 26.3 `--username` default); deterministic `AgentNNNN` identities are decided in `docs/decisions/parallel-workers.md` but not wired.
+- Probes without `worker` get a random development username (`PlayerNNN`, the 26.3 `--username` default); workers launched with `-Pmcbot.worker=NNNN` use the deterministic `AgentNNNN` identity (`docs/decisions/parallel-workers.md`).
 - Low-cost client settings (fast graphics, render distance 8, simulation distance 6, VSync off) are applied in observer mode and reported by `STATUS`.
-- Remaining Stage 1.5 gate item: an isolated multi-worker smoke test (`docs/decisions/parallel-workers.md`). Session recording is implemented and validated for one worker (`docs/decisions/recording.md`).
+- Worker isolation is proven for two workers only; scaling, per-worker resource use, orchestration and restart handling are open (`docs/decisions/parallel-workers.md`). Recording uses the macOS `h264_videotoolbox` encoder; Linux needs another encoder.

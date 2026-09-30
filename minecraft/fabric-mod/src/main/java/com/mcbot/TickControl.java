@@ -428,7 +428,17 @@ final class TickControl {
         json.add("pacing", pacingJson());
         json.add("client_settings", EnvironmentSettings.describe(Minecraft.getInstance()));
         json.add("recording", FrameRecorder.status());
+        json.add("identity", identityJson(Minecraft.getInstance()));
         return json;
+    }
+
+    // Development identity and game directory of this client process; diagnostic only.
+    private static JsonObject identityJson(Minecraft minecraft) {
+        JsonObject identity = new JsonObject();
+        identity.addProperty("username", minecraft.getUser().getName());
+        identity.addProperty("uuid", minecraft.getUser().getProfileId().toString());
+        identity.addProperty("game_directory", minecraft.gameDirectory.getAbsoluteFile().toPath().normalize().toString());
+        return identity;
     }
 
     private static JsonObject pacingJson() {

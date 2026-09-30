@@ -35,6 +35,14 @@ def wait_for_world(port: int, deadline: float) -> MinecraftClient:
     raise TimeoutError("Minecraft did not reach a frozen, gated, unpaused world")
 
 
+def worker_game_directory(worker: int) -> Path:
+    return REPOSITORY_ROOT / ".runtime" / "workers" / f"{worker:04d}" / "client"
+
+
+def worker_username(worker: int) -> str:
+    return f"Agent{worker:04d}"
+
+
 @contextmanager
 def launched_client(
     port: int,
@@ -42,10 +50,14 @@ def launched_client(
     log_path: Path,
     startup_timeout: float,
     extra_environment: Mapping[str, str] | None = None,
+    worker: int | None = None,
 ) -> Iterator[MinecraftClient]:
     """Run `./scripts/gradle runClient` in observer mode and yield a connection.
 
-    On exit the client is asked to quit; a client that does not stop is killed.
+    With `worker`, the client runs as isolated worker env-NNNN: its own game directory
+    and the offline development identity AgentNNNN
+    (docs/decisions/parallel-workers.md). On exit the client is asked to quit; a
+    client that does not stop is killed.
     """
     environment = (
         os.environ
@@ -54,8 +66,11 @@ def launched_client(
     )
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8") as log:
+        command = [str(REPOSITORY_ROOT / "scripts" / "gradle"), "runClient"]
+        if worker is not None:
+            command.append(f"-Pmcbot.worker={worker:04d}")
         game = subprocess.Popen(
-            [str(REPOSITORY_ROOT / "scripts" / "gradle"), "runClient"],
+            command,
             cwd=REPOSITORY_ROOT,
             env=environment,
             stdout=log,
