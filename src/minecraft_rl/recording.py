@@ -398,26 +398,6 @@ class WorkerRecorder:
         self.recorder.close()
 
 
-def git_commit() -> str | None:
-    head = Path(__file__).resolve().parents[2] / ".git" / "HEAD"
-    try:
-        ref = head.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    if not ref.startswith("ref: "):
-        return ref
-    target = head.parent / ref.removeprefix("ref: ")
-    try:
-        return target.read_text(encoding="utf-8").strip()
-    except OSError:
-        packed = head.parent / "packed-refs"
-        name = ref.removeprefix("ref: ")
-        for line in packed.read_text(encoding="utf-8").splitlines():
-            if line.endswith(" " + name):
-                return line.split(" ", 1)[0]
-    return None
-
-
 def write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")

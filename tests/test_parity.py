@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from minecraft_rl.devices import select_device
 from minecraft_rl.parity import (
     CHECKPOINT_FORMAT,
     Config,
@@ -12,7 +13,6 @@ from minecraft_rl.parity import (
     parameter_changes,
     parity_dataset,
     save_checkpoint,
-    select_device,
     train,
 )
 

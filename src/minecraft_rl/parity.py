@@ -9,7 +9,6 @@ import argparse
 import itertools
 import json
 import platform
-import subprocess
 import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -19,6 +18,9 @@ from typing import Any
 import torch
 from torch import nn
 from torch.func import functional_call
+
+from minecraft_rl.devices import DEVICES, select_device
+from minecraft_rl.provenance import git_commit
 
 CLASSES = 2
 CHECKPOINT_FORMAT = "parity-mlp-v1"
@@ -57,22 +59,6 @@ class ParityMLP(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.output(torch.tanh(self.hidden(inputs)))
-
-
-def select_device(requested: str) -> torch.device:
-    if requested == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-    if requested == "cuda" and not torch.cuda.is_available():
-        raise ValueError("CUDA is not available on this host")
-    if requested == "mps" and not torch.backends.mps.is_available():
-        raise ValueError("MPS is not available on this host")
-    if requested not in ("cpu", "cuda", "mps"):
-        raise ValueError(f"unknown device {requested!r}")
-    return torch.device(requested)
 
 
 def build(config: Config, device: torch.device) -> tuple[ParityMLP, torch.optim.Adam]:
@@ -228,13 +214,10 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
 
     with torch.no_grad():
         probabilities = torch.softmax(model(inputs), dim=1)[:, 1]
-    git = subprocess.run(
-        ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=False
-    )
     result: dict[str, Any] = {
         "stage": "2a-neural-sanity-parity",
         "timestamp_utc": datetime.now(UTC).isoformat(),
-        "git_commit": git.stdout.strip() if git.returncode == 0 else None,
+        "git_commit": git_commit(),
         "config": asdict(config),
         "seed_torch": config.seed,
         "device": str(device),
@@ -284,7 +267,7 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
         },
         "duration_seconds": time.monotonic() - started,
     }
-    (output.parent).mkdir(parents=True, exist_ok=True)
+    output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     return result
 
@@ -295,9 +278,7 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=Config.steps)
     parser.add_argument("--hidden", type=int, default=Config.hidden)
     parser.add_argument("--learning-rate", type=float, default=Config.learning_rate)
-    parser.add_argument(
-        "--device", default="cpu", choices=("auto", "cpu", "mps", "cuda")
-    )
+    parser.add_argument("--device", default="cpu", choices=DEVICES)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.steps < 1:

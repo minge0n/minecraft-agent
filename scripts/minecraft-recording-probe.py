@@ -28,10 +28,10 @@ from typing import Any
 from minecraft_rl.minecraft_client import MinecraftClient
 from minecraft_rl.minecraft_interface import PlayerAction
 from minecraft_rl.minecraft_launch import launched_client
+from minecraft_rl.provenance import git_commit
 from minecraft_rl.recording import (
     EpisodeRecording,
     WorkerRecorder,
-    git_commit,
     read_stream,
     storage_summary,
     write_json,

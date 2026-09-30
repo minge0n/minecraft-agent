@@ -45,4 +45,4 @@ Seed 0 on MPS reached the same final loss as CPU to four significant digits (0.0
 
 ## Interpretation and limits
 
-This proves the toolchain and the training mechanics, nothing about sequence memory, dynamics or RL. The dataset is the whole input space, so there is no train/test split and 100% accuracy is memorization of a fixed mapping by design. Next is Stage 2B: a small recurrent model on a toy sequence task (`docs/roadmap.md`).
+This proves the toolchain and the training mechanics, nothing about sequence memory, dynamics or RL. The dataset is the whole input space, so there is no train/test split and 100% accuracy is memorization of a fixed mapping by design. Next is Stage 2B: a small recurrent model on a toy sequence task (`docs/stage2b.md`).

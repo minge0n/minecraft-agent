@@ -1,12 +1,12 @@
 import argparse
 import json
 import random
-import subprocess
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 
 from minecraft_rl.gridworld import Action, GridWorld
+from minecraft_rl.provenance import git_commit
 from minecraft_rl.q_learning import QTable
 
 
@@ -46,13 +46,10 @@ def run(episodes: int, seed: int, output: Path) -> dict[str, object]:
                 evaluation_successes += int(terminated)
                 break
 
-    git_commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=False
-    )
     result: dict[str, object] = {
         "stage": "tabular-gridworld",
         "timestamp_utc": datetime.now(UTC).isoformat(),
-        "git_commit": git_commit.stdout.strip() if git_commit.returncode == 0 else None,
+        "git_commit": git_commit(),
         "seed_python": seed,
         "config": {"episodes": episodes, "epsilon": 0.2, "evaluation_episodes": 100},
         "environment": {

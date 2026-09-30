@@ -36,7 +36,8 @@ from minecraft_rl.minecraft_launch import (
     worker_game_directory,
     worker_username,
 )
-from minecraft_rl.recording import WorkerRecorder, git_commit, write_json
+from minecraft_rl.provenance import git_commit
+from minecraft_rl.recording import WorkerRecorder, write_json
 from minecraft_rl.replay import (
     build_controlled_replay,
     compare_traces,

@@ -11,13 +11,13 @@ import argparse
 import itertools
 import json
 import platform
-import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
 from minecraft_rl.minecraft_client import MinecraftClient
-from minecraft_rl.minecraft_launch import REPOSITORY_ROOT, launched_client
+from minecraft_rl.minecraft_launch import launched_client
+from minecraft_rl.provenance import git_commit
 from minecraft_rl.replay import (
     REMOVE_SAND_SUPPORT,
     client_view_alignment,
@@ -59,24 +59,6 @@ def run_replay(client: MinecraftClient, seed: int, mode: str) -> dict[str, Any]:
         "wall_seconds": elapsed,
         "records": records,
     }
-
-
-def git_commit() -> str:
-    completed = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=REPOSITORY_ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    dirty = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=no"],
-        cwd=REPOSITORY_ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    return completed.stdout.strip() + ("-dirty" if dirty else "")
 
 
 def main() -> None:
