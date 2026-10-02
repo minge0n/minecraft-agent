@@ -51,8 +51,11 @@ import hashlib
 import sys
 
 path, expected = sys.argv[1:]
+sha256 = hashlib.sha256()
 with open(path, "rb") as file:
-    digest = hashlib.file_digest(file, "sha256").hexdigest()
+    for block in iter(lambda: file.read(1 << 20), b""):
+        sha256.update(block)
+digest = sha256.hexdigest()
 if digest != expected:
     raise SystemExit(f"SHA-256 mismatch: {path}: {digest}")
 PY
@@ -98,7 +101,7 @@ fi
 .tools/lefthook version | grep -q '2.1.14' || { echo 'Unexpected local Lefthook version.' >&2; exit 1; }
 
 export UV_PYTHON_INSTALL_DIR="$root/.tools/uv-python"
-.tools/uv python install 3.12.11 --install-dir "$UV_PYTHON_INSTALL_DIR"
+.tools/uv python install 3.12.11 --install-dir "$UV_PYTHON_INSTALL_DIR" --no-bin
 .tools/uv sync --locked --managed-python --python 3.12.11 --extra dev
 
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
