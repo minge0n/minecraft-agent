@@ -70,4 +70,4 @@ Seeds 0-9: every seed reaches 100% at all five delays including 40, the control 
 
 ## Limits
 
-One bit of memory, a single distractor token and a supervised target: this shows the mechanism, not a memory capacity or partial-observability result. No actions, no dynamics and no uncertainty are involved yet. Next is Stage 2C: learned dynamics in a tiny environment (`docs/roadmap.md`).
+One bit of memory, a single distractor token and a supervised target: this shows the mechanism, not a memory capacity or partial-observability result. No actions, no dynamics and no uncertainty are involved yet. Next is Stage 2C: learned dynamics in a tiny environment (`docs/roadmap.md`), done in `docs/stage2c.md`.

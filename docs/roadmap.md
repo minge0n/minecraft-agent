@@ -1,13 +1,13 @@
 # Learning roadmap: Dreamer first
 
-Status: **decided direction; Stage 1, Stage 1.5, Stage 2A and Stage 2B are done, nothing beyond them is implemented.** Supersedes the earlier "Q-learning, then DQN" path. DQN may appear later as an optional baseline but is not on the critical path.
+Status: **decided direction; Stage 1, Stage 1.5, Stage 2A, Stage 2B and Stage 2C are done, nothing beyond them is implemented.** Supersedes the earlier "Q-learning, then DQN" path. DQN may appear later as an optional baseline but is not on the critical path.
 
 ```text
 Stage 1   tabular Q-learning baseline (done, docs/stage1.md)
 Stage 1.5 Minecraft lockstep + structured observation contract (done, docs/minecraft-spike.md)
 Stage 2A  neural-network sanity check (done, docs/stage2a.md)
 Stage 2B  recurrent model sanity check (done, docs/stage2b.md)
-Stage 2C  learned dynamics in a toy environment
+Stage 2C  learned dynamics in a toy environment (done, docs/stage2c.md)
 Stage 2D  imagination and compounding-error measurement
 Stage 2E  actor-critic trained in imagination
 Stage 2F  integrated Dreamer-style toy agent
@@ -57,7 +57,7 @@ PyTorch, random initialization, no high-level RL or Dreamer package hiding the a
 
 ### Toy environment
 
-A small T-maze cue-memory task: a cue is visible at the start, disappears, and the correct turn at a later junction requires remembering it. It exercises recurrent state, partial observability, world-model learning, actor-critic learning and imagination cheaply. An equally small alternative is acceptable only with a clear reason.
+A small T-maze cue-memory task (`src/minecraft_rl/tmaze.py`, specified in `docs/stage2c.md`): a cue is visible at the start, disappears, and the correct turn at a later junction requires remembering it. It exercises recurrent state, partial observability, world-model learning, actor-critic learning and imagination cheaply. An equally small alternative is acceptable only with a clear reason.
 
 ## Model-error evaluation (first-class)
 
