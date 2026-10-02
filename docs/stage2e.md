@@ -76,4 +76,4 @@ Seeds 0-9 after 1,000 updates:
 
 ## Limits
 
-One round only: the world model never sees the policy's own data. The actor uses REINFORCE rather than dynamics gradients, and there is no return normalization, stochastic latent or KL term yet. Evaluation is in the same maze length as training. Next is Stage 2F: an integrated loop that alternates real data collection with the current policy, world-model training and actor-critic training in imagination (`docs/roadmap.md`).
+One round only: the world model never sees the policy's own data. The actor uses REINFORCE rather than dynamics gradients, and there is no return normalization, stochastic latent or KL term yet. Evaluation is in the same maze length as training. Next is Stage 2F: an integrated loop that alternates real data collection with the current policy, world-model training and actor-critic training in imagination (`docs/roadmap.md`), done in `docs/stage2f.md`.
