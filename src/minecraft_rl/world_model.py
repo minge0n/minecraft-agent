@@ -68,10 +68,15 @@ class Episodes:
 
 
 def collect_episodes(
-    config: Config, count: int, generator: torch.Generator
+    config: Config,
+    count: int,
+    generator: torch.Generator,
+    action_weights: tuple[float, ...] | None = None,
 ) -> Episodes:
-    """Run `count` episodes of a uniformly random policy with random cues."""
+    """Run `count` episodes with random cues and a random behavior policy: uniform,
+    or drawing actions with the given relative weights."""
     environment = TMaze(config.corridor_length, config.max_steps)
+    weights = None if action_weights is None else torch.tensor(action_weights)
     shape = (count, config.max_steps)
     observations = torch.zeros(shape, dtype=torch.long)
     actions = torch.zeros(shape, dtype=torch.long)
@@ -83,7 +88,11 @@ def collect_episodes(
     for episode in range(count):
         observation = environment.reset(Cue(int(cues[episode])))
         for t in range(config.max_steps):
-            action = Action(int(torch.randint(0, ACTIONS, (1,), generator=generator)))
+            if weights is None:
+                index = torch.randint(0, ACTIONS, (1,), generator=generator)
+            else:
+                index = torch.multinomial(weights, 1, generator=generator)
+            action = Action(int(index))
             next_observation, reward, terminated, truncated = environment.step(action)
             observations[episode, t] = observation
             actions[episode, t] = action
@@ -127,7 +136,14 @@ class WorldModel(nn.Module):
         self.reward_head = nn.Linear(hidden, 1)
         self.continue_head = nn.Linear(hidden, 1)
 
-    def states(self, observations: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    def recurrent(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        initial_state: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """States h_t (batch, time, H) after reading each (o_t, a_t), continuing from
+        `initial_state` (batch, H) or from zero. The control ignores the state."""
         inputs = torch.cat(
             [
                 nn.functional.one_hot(observations, OBSERVATIONS),
@@ -135,18 +151,21 @@ class WorldModel(nn.Module):
             ],
             dim=-1,
         ).float()
-        if self.memory:
-            states, _ = self.core(inputs)
-            return states
-        return torch.tanh(self.core(inputs))
+        if not self.memory:
+            return torch.tanh(self.core(inputs))
+        initial = None if initial_state is None else initial_state.unsqueeze(0)
+        states, _ = self.core(inputs, initial)
+        return states
 
-    def forward(self, observations: torch.Tensor, actions: torch.Tensor) -> Predictions:
-        states = self.states(observations, actions)
+    def predict(self, states: torch.Tensor) -> Predictions:
         return Predictions(
             self.observation_head(states),
             self.reward_head(states).squeeze(-1),
             self.continue_head(states).squeeze(-1),
         )
+
+    def forward(self, observations: torch.Tensor, actions: torch.Tensor) -> Predictions:
+        return self.predict(self.recurrent(observations, actions))
 
 
 def build(
@@ -273,6 +292,9 @@ def evaluate(
 def dataset_summary(episodes: Episodes) -> dict[str, Any]:
     lengths = episodes.mask.sum(1)
     terminated = ((episodes.continues == 0) & episodes.mask).any(1)
+    junction_steps = (
+        (episodes.observations == Observation.JUNCTION) & episodes.mask
+    ).sum(1)
     return {
         "episodes": int(episodes.mask.shape[0]),
         "transitions": int(lengths.sum()),
@@ -281,6 +303,8 @@ def dataset_summary(episodes: Episodes) -> dict[str, Any]:
         "cue_right_fraction": episodes.cues.float().mean().item(),
         "positive_rewards": int((episodes.rewards > 0).sum()),
         "negative_rewards": int((episodes.rewards < 0).sum()),
+        "mean_junction_steps": junction_steps.float().mean().item(),
+        "max_junction_steps": int(junction_steps.max()),
     }
 
 

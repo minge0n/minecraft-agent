@@ -89,4 +89,4 @@ Seeds 0-9: every seed ends with 100% held-out observation and continuation accur
 
 ## Limits
 
-One-step prediction with teacher forcing only: the model always reads real observations, so this does not yet measure compounding error in open-loop rollouts. The state is fully deterministic; there is no stochastic latent, no KL term and no uncertainty, which matters once the model must imagine without observations. The environment is deterministic and the data come from a random policy. Next is Stage 2D: imagination and compounding-error measurement on this T-maze (`docs/roadmap.md`).
+One-step prediction with teacher forcing only: the model always reads real observations, so this does not yet measure compounding error in open-loop rollouts. The state is fully deterministic; there is no stochastic latent, no KL term and no uncertainty, which matters once the model must imagine without observations. The environment is deterministic and the data come from a random policy. Next is Stage 2D: imagination and compounding-error measurement on this T-maze (`docs/roadmap.md`), done in `docs/stage2d.md`.

@@ -103,6 +103,15 @@ def test_collected_episodes_are_consistent_transitions():
             assert episodes.rewards[episode, length - 1] in (-1.0, 1.0)
 
 
+def test_weighted_behavior_policy_draws_only_allowed_actions():
+    episodes = collect_episodes(
+        FAST, 8, torch.Generator().manual_seed(0), action_weights=(1.0, 0.0, 0.0)
+    )
+    assert torch.all(episodes.actions[episodes.mask] == Action.FORWARD)
+    assert torch.all(episodes.mask.sum(1) == FAST.max_steps)
+    assert torch.all(episodes.continues[episodes.mask] == 1.0)
+
+
 def test_padding_does_not_contribute_to_the_loss():
     episodes = collect_episodes(FAST, 16, torch.Generator().manual_seed(0))
     model, _ = build(FAST, CPU)
