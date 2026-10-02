@@ -2,7 +2,7 @@
 
 Research and teaching project toward a language-free, randomly initialized reinforcement-learning agent with a learned recurrent world model (Dreamer-style) for Minecraft 26.3. Perception is simplified into a structured, visibility-limited observation of what the player can currently see; hidden world state, recipes, demonstrations, pretrained models and scripted Minecraft knowledge stay unavailable to the policy.
 
-The repository currently contains reproducible tooling, a completed tabular Q-learning baseline, Stage 2A (MLP) and Stage 2B (GRU memory) PyTorch sanity checks, a Stage 2C recurrent world model of a T-maze with Stage 2D open-loop imagination measurements, and a Fabric mod whose lockstep tick gate, structured visible-field observation, factorized actions, fresh-world reset, accelerated stepping, session recording and isolated workers are runtime-verified. It does **not** yet contain an actor-critic, a Minecraft agent or rewards.
+The repository currently contains reproducible tooling, a completed tabular Q-learning baseline, Stage 2A (MLP) and Stage 2B (GRU memory) PyTorch sanity checks, a Stage 2C recurrent world model of a T-maze with Stage 2D open-loop imagination measurements and a Stage 2E actor-critic trained in its imagination, and a Fabric mod whose lockstep tick gate, structured visible-field observation, factorized actions, fresh-world reset, accelerated stepping, session recording and isolated workers are runtime-verified. It does **not** yet contain the integrated Dreamer loop, a Minecraft agent or rewards.
 
 ## Setup and commands
 
@@ -17,6 +17,7 @@ On macOS or Linux (arm64/x86_64), install the bootstrap prerequisites: POSIX she
 .venv/bin/python -m minecraft_rl.cue_recall --seed 0 --device cpu
 .venv/bin/python -m minecraft_rl.world_model --seed 0 --device cpu
 .venv/bin/python -m minecraft_rl.imagination --seed 0 --device cpu
+.venv/bin/python -m minecraft_rl.actor_critic --seed 0 --device cpu
 ./scripts/gradle build
 .venv/bin/python scripts/minecraft-tick-gate-probe.py
 .venv/bin/python scripts/minecraft-observation-probe.py
@@ -30,7 +31,7 @@ Bootstrap downloads SHA-256-verified uv 0.12.19, Temurin 25.0.4.1+1 and Lefthook
 
 The Gradle wrapper is committed under `minecraft/fabric-mod/`. Always invoke it through `./scripts/gradle`: the script sets `JAVA_HOME` and `PATH` to the pinned local JDK and `GRADLE_USER_HOME` to `.runtime/gradle`. Loom's client and server run directories point to `.runtime/minecraft/client` and `.runtime/minecraft/server`; no personal Minecraft directory is read. Minecraft files are obtained through normal Loom development tooling. The runtime probe launches the development client unattended; see [the spike ledger](docs/minecraft-spike.md).
 
-The GridWorld run prints the learned Q-table and a greedy policy map and writes metrics into an ignored per-run `runs/gridworld-.../metrics.json`. See [Stage 1](docs/stage1.md) for the exact map, update and interpretation. The parity run trains a 114-parameter MLP and prints its gradient check, parameter updates, loss curve, predictions and checkpoint round trip; see [Stage 2A](docs/stage2a.md). The cue-recall run trains a GRU to remember a cue across distractor steps next to a no-memory control; see [Stage 2B](docs/stage2b.md). The world-model run collects random-policy T-maze episodes and trains a GRU to predict the next observation, reward and continuation next to a no-memory control, printing held-out error over training; see [Stage 2C](docs/stage2c.md). The imagination run rolls trained world models forward open loop and compares imagined with real trajectories at horizons 1-20, including under a shifted behavior policy; see [Stage 2D](docs/stage2d.md).
+The GridWorld run prints the learned Q-table and a greedy policy map and writes metrics into an ignored per-run `runs/gridworld-.../metrics.json`. See [Stage 1](docs/stage1.md) for the exact map, update and interpretation. The parity run trains a 114-parameter MLP and prints its gradient check, parameter updates, loss curve, predictions and checkpoint round trip; see [Stage 2A](docs/stage2a.md). The cue-recall run trains a GRU to remember a cue across distractor steps next to a no-memory control; see [Stage 2B](docs/stage2b.md). The world-model run collects random-policy T-maze episodes and trains a GRU to predict the next observation, reward and continuation next to a no-memory control, printing held-out error over training; see [Stage 2C](docs/stage2c.md). The imagination run rolls trained world models forward open loop and compares imagined with real trajectories at horizons 1-20, including under a shifted behavior policy; see [Stage 2D](docs/stage2d.md). The actor-critic run trains a policy only on trajectories imagined by a frozen world model and evaluates it in the real T-maze against a random policy and a no-memory control; see [Stage 2E](docs/stage2e.md).
 
 ## Layout and boundaries
 
@@ -39,6 +40,7 @@ The GridWorld run prints the learned Q-table and a greedy policy map and writes 
 - `src/minecraft_rl/cue_recall.py`: Stage 2B recurrent memory check.
 - `src/minecraft_rl/tmaze.py`, `world_model.py`: T-maze toy environment for Stages 2C-2F and the Stage 2C learned dynamics model.
 - `src/minecraft_rl/imagination.py`: Stage 2D open-loop rollouts and compounding-error metrics.
+- `src/minecraft_rl/actor_critic.py`: Stage 2E actor and critic trained in imagination.
 - `src/minecraft_rl/devices.py`, `provenance.py`: device selection and run commit metadata shared by experiments.
 - `src/minecraft_rl/tick_control.py`: Python client for the validated v1 lockstep probe protocol.
 - `src/minecraft_rl/minecraft_interface.py`: versioned policy observation schema (`PolicyObservation`) and factorized `PlayerAction`.
