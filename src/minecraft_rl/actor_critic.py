@@ -24,7 +24,7 @@ from minecraft_rl import world_model
 from minecraft_rl.devices import DEVICES, select_device
 from minecraft_rl.provenance import git_commit
 from minecraft_rl.tmaze import Action, Cue, Observation, TMaze
-from minecraft_rl.world_model import ACTIONS, OBSERVATIONS, WorldModel
+from minecraft_rl.world_model import ACTIONS, OBSERVATIONS, DynamicsModel
 
 CHECKPOINT_FORMAT = "tmaze-actor-critic-v1"
 EVALUATION_SEED_OFFSET = 4_000_000
@@ -46,14 +46,6 @@ class Config:
 
 
 @dataclass(frozen=True)
-class StartStates:
-    """Model states before acting: h_{t-1} (n, H), zero for t = 0, and o_t (n,)."""
-
-    previous: torch.Tensor
-    observations: torch.Tensor
-
-
-@dataclass(frozen=True)
 class Imagined:
     """A rollout of horizon T from n start states: features of s_0 .. s_T
     (n, T + 1, F), actions a_0 .. a_{T-1} (n, T), predicted rewards and
@@ -66,17 +58,17 @@ class Imagined:
 
 
 class Agent(nn.Module):
-    """Actor pi(a | s) and critic v(s) on the policy state s_t.
+    """Actor pi(a | s) and critic v(s) on the world model's policy state s_t.
 
-    With `memory`, s_t = [h_{t-1}, onehot(o_t)]: the world model's summary of
-    everything before step t plus the current observation. Without it, s_t is
-    onehot(o_t) alone (the no-memory control).
+    With `memory` the agent sees the whole policy state: [h_{t-1}, onehot(o_t)]
+    for the GRU world model, [h_t, z_t] for the RSSM. Without it, only
+    onehot(o_t), the last entries of the GRU policy state (the no-memory control).
     """
 
     def __init__(self, state_size: int, hidden: int, memory: bool) -> None:
         super().__init__()
         self.memory = memory
-        inputs = state_size + OBSERVATIONS if memory else OBSERVATIONS
+        inputs = state_size if memory else OBSERVATIONS
         self.actor = nn.Sequential(
             nn.Linear(inputs, hidden), nn.Tanh(), nn.Linear(hidden, ACTIONS)
         )
@@ -84,70 +76,75 @@ class Agent(nn.Module):
             nn.Linear(inputs, hidden), nn.Tanh(), nn.Linear(hidden, 1)
         )
 
-    def features(
-        self, previous_states: torch.Tensor, observations: torch.Tensor
+    def features(self, states: torch.Tensor) -> torch.Tensor:
+        return states if self.memory else states[..., -OBSERVATIONS:]
+
+    def act(
+        self,
+        states: torch.Tensor,
+        generator: torch.Generator | None,
+        greedy: bool,
     ) -> torch.Tensor:
-        seen = nn.functional.one_hot(observations, OBSERVATIONS).float()
-        if not self.memory:
-            return seen
-        return torch.cat([previous_states, seen], dim=-1)
+        logits = self.actor(self.features(states))
+        if greedy:
+            return logits.argmax(-1)
+        probabilities = torch.softmax(logits, -1).cpu()
+        action = torch.multinomial(probabilities, 1, generator=generator)
+        return action.squeeze(-1).to(logits.device)
 
 
 def build(
     config: Config, device: torch.device, memory: bool = True
 ) -> tuple[Agent, torch.optim.Adam]:
+    if not memory and config.model.kind != "gru":
+        raise ValueError("the no-memory agent control needs the GRU world model")
     torch.manual_seed(config.model.seed)
-    agent = Agent(config.model.hidden, config.hidden, memory).to(device)
+    state_size = world_model.policy_state_size(config.model)
+    agent = Agent(state_size, config.hidden, memory).to(device)
     return agent, torch.optim.Adam(agent.parameters(), lr=config.learning_rate)
 
 
-def start_states(model: WorldModel, episodes: world_model.Episodes) -> StartStates:
-    """Every valid real step of the episodes as a start state."""
+def start_states(
+    model: DynamicsModel,
+    episodes: world_model.Episodes,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """The policy state of every valid real step of the episodes (n, F)."""
     with torch.no_grad():
-        states = model.recurrent(episodes.observations, episodes.actions)
-    previous = torch.cat([torch.zeros_like(states[:, :1]), states[:, :-1]], dim=1)
-    return StartStates(previous[episodes.mask], episodes.observations[episodes.mask])
+        states = model.policy_states(episodes, generator)
+    return states[episodes.mask]
 
 
 def imagine(
-    model: WorldModel,
+    model: DynamicsModel,
     agent: Agent,
-    starts: StartStates,
+    starts: torch.Tensor,
     horizon: int,
     generator: torch.Generator | None,
     greedy: bool = False,
 ) -> Imagined:
     """Roll the frozen world model forward with actions from the actor.
 
-    Each step samples a_t from pi(. | s_t) (or takes its argmax), advances
-    h_t = GRU(h_{t-1}, [o_t, a_t]) and feeds back the most likely predicted next
-    observation. Everything is computed without gradients; the losses re-evaluate
-    actor and critic on the returned features.
+    Each step samples a_t from pi(. | s_t) (or takes its argmax) and lets the
+    world model produce s_{t+1}, the reward and the continuation probability:
+    the GRU feeds back its most likely predicted observation, the RSSM samples
+    its prior latent. Everything is computed without gradients; the losses
+    re-evaluate actor and critic on the returned features.
     """
-    previous, observation = starts.previous, starts.observations
+    state = starts
     features, actions, rewards, continues = [], [], [], []
     with torch.no_grad():
         for _ in range(horizon):
-            state = agent.features(previous, observation)
-            logits = agent.actor(state)
-            if greedy:
-                action = logits.argmax(-1)
-            else:
-                probabilities = torch.softmax(logits, -1)
-                action = torch.multinomial(
-                    probabilities.cpu(), 1, generator=generator
-                ).squeeze(-1)
-                action = action.to(logits.device)
-            current = model.recurrent(
-                observation.unsqueeze(1), action.unsqueeze(1), previous
-            )[:, -1]
-            predictions = model.predict(current)
-            features.append(state)
+            action = agent.act(state, generator, greedy)
+            following, reward, continuation = model.imagine_step(
+                state, action, generator
+            )
+            features.append(agent.features(state))
             actions.append(action)
-            rewards.append(predictions.reward)
-            continues.append(torch.sigmoid(predictions.continue_logits))
-            previous, observation = current, predictions.observation_logits.argmax(-1)
-        features.append(agent.features(previous, observation))
+            rewards.append(reward)
+            continues.append(continuation)
+            state = following
+        features.append(agent.features(state))
     return Imagined(
         torch.stack(features, 1),
         torch.stack(actions, 1),
@@ -212,22 +209,19 @@ def losses(agent: Agent, imagined: Imagined, config: Config) -> dict[str, torch.
 
 
 def train(
-    model: WorldModel,
+    model: DynamicsModel,
     agent: Agent,
     optimizer: torch.optim.Optimizer,
-    starts: StartStates,
+    starts: torch.Tensor,
     config: Config,
     generator: torch.Generator,
     steps: int,
 ) -> list[dict[str, float]]:
     history = []
-    count = starts.observations.shape[0]
+    count = starts.shape[0]
     for _ in range(steps):
         index = torch.randint(0, count, (config.start_states,), generator=generator)
-        batch = StartStates(
-            starts.previous[index.to(starts.previous.device)],
-            starts.observations[index.to(starts.observations.device)],
-        )
+        batch = starts[index.to(starts.device)]
         imagined = imagine(model, agent, batch, config.horizon, generator)
         terms = losses(agent, imagined, config)
         optimizer.zero_grad()
@@ -238,7 +232,7 @@ def train(
 
 
 def run_in_environment(
-    model: WorldModel,
+    model: DynamicsModel,
     agent: Agent | None,
     config: Config,
     episodes: int,
@@ -246,8 +240,8 @@ def run_in_environment(
     greedy: bool,
 ) -> dict[str, Any]:
     """Run episodes in the real T-maze, cues alternating left/right. The agent
-    acts on the world model state built from real observations; `None` is the
-    uniform random policy."""
+    acts on the world model's policy state built from real observations; `None`
+    is the uniform random policy."""
     device = next(model.parameters()).device
     environments = [
         TMaze(config.model.corridor_length, config.model.max_steps)
@@ -258,7 +252,8 @@ def run_in_environment(
         [env.reset(cue) for env, cue in zip(environments, cues, strict=True)],
         device=device,
     )
-    previous = torch.zeros(episodes, config.model.hidden, device=device)
+    with torch.no_grad():
+        states = model.initial_policy_states(observations, generator)
     returns = torch.zeros(episodes)
     discounted = torch.zeros(episodes)
     lengths = torch.zeros(episodes, dtype=torch.long)
@@ -269,16 +264,7 @@ def run_in_environment(
             if agent is None:
                 actions = torch.randint(0, ACTIONS, (episodes,), generator=generator)
             else:
-                logits = agent.actor(agent.features(previous, observations))
-                if greedy:
-                    actions = logits.argmax(-1).cpu()
-                else:
-                    actions = torch.multinomial(
-                        torch.softmax(logits, -1).cpu(), 1, generator=generator
-                    ).squeeze(-1)
-            previous = model.recurrent(
-                observations.unsqueeze(1), actions.to(device).unsqueeze(1), previous
-            )[:, -1]
+                actions = agent.act(states, generator, greedy).cpu()
         next_observations = observations.clone()
         for i in torch.nonzero(running).squeeze(-1).tolist():
             observation, reward, terminated, truncated = environments[i].step(
@@ -295,6 +281,10 @@ def run_in_environment(
         observations = next_observations
         if not running.any():
             break
+        with torch.no_grad():
+            states = model.observe_step(
+                states, actions.to(device), observations, generator
+            )
     cue_right = torch.tensor([cue == Cue.RIGHT for cue in cues])
     return {
         "episodes": episodes,
@@ -316,18 +306,20 @@ def run_in_environment(
 
 
 def imagined_from_episode_start(
-    model: WorldModel, agent: Agent, config: Config, greedy: bool
+    model: DynamicsModel, agent: Agent, config: Config, greedy: bool
 ) -> dict[str, float]:
     """Discounted return the world model imagines for the agent from each cue's
     real start state, over the episode step limit, for comparison with the real
-    discounted return from the same start."""
+    discounted return from the same start. A stochastic world model or a sampling
+    policy is averaged over 128 rollouts."""
     device = next(model.parameters()).device
     cues = torch.tensor([Observation.CUE_LEFT, Observation.CUE_RIGHT], device=device)
-    starts = StartStates(torch.zeros(2, config.model.hidden, device=device), cues)
     generator = torch.Generator().manual_seed(config.model.seed)
+    with torch.no_grad():
+        starts = model.initial_policy_states(cues, generator)
     rollouts = [
         imagine(model, agent, starts, config.model.max_steps, generator, greedy)
-        for _ in range(1 if greedy else 128)
+        for _ in range(1 if greedy and model.deterministic else 128)
     ]
     totals = []
     for rollout in rollouts:
@@ -347,7 +339,7 @@ def imagined_from_episode_start(
 
 
 def evaluate(
-    model: WorldModel, agent: Agent, config: Config, seed: int
+    model: DynamicsModel, agent: Agent, config: Config, seed: int
 ) -> dict[str, Any]:
     """Real-environment results with greedy and sampled actions, each next to the
     discounted return the world model imagines for the same policy from the same
@@ -422,8 +414,9 @@ def load_checkpoint(
 
 def train_world_model(
     config: Config, device: torch.device
-) -> tuple[WorldModel, world_model.Episodes, dict[str, Any]]:
-    """The Stage 2C world model on uniform-random-policy data, then frozen."""
+) -> tuple[DynamicsModel, world_model.Episodes, dict[str, Any]]:
+    """The world model `config.model.kind` names, trained on uniform-random-policy
+    data, then frozen."""
     model_config = config.model
     episodes = world_model.collect_episodes(
         model_config,
@@ -453,8 +446,8 @@ def train_world_model(
 
 
 def train_with_curve(
-    model: WorldModel,
-    starts: StartStates,
+    model: DynamicsModel,
+    starts: torch.Tensor,
     memory: bool,
     config: Config,
     device: torch.device,
@@ -537,7 +530,7 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
             "held_out_one_step": model_evaluation,
             "frozen_during_actor_critic": True,
         },
-        "start_states": int(starts.observations.shape[0]),
+        "start_states": int(starts.shape[0]),
         "random_policy": random_policy,
         "agents": agents,
         "duration_seconds": time.monotonic() - started,

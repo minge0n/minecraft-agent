@@ -51,19 +51,20 @@ def test_lambda_returns_stop_at_a_terminal_transition():
 
 def test_no_memory_agent_ignores_the_recurrent_state():
     agent, _ = actor_critic.build(FAST, CPU, memory=False)
-    observations = torch.tensor([Observation.JUNCTION] * 2)
-    states = torch.stack([torch.zeros(32), torch.ones(32)])
+    seen = torch.nn.functional.one_hot(
+        torch.tensor([Observation.JUNCTION] * 2), len(Observation)
+    ).float()
+    states = torch.cat([torch.stack([torch.zeros(32), torch.ones(32)]), seen], -1)
     with torch.no_grad():
-        logits = agent.actor(agent.features(states, observations))
+        logits = agent.actor(agent.features(states))
     assert torch.equal(logits[0], logits[1])
 
 
 def test_imagined_rollout_shapes(frozen):
     model, starts = frozen
     agent, _ = actor_critic.build(FAST, CPU)
-    batch = actor_critic.StartStates(starts.previous[:5], starts.observations[:5])
     imagined = actor_critic.imagine(
-        model, agent, batch, 7, torch.Generator().manual_seed(0)
+        model, agent, starts[:5], 7, torch.Generator().manual_seed(0)
     )
     assert imagined.features.shape == (5, 8, 32 + len(Observation))
     assert imagined.actions.shape == imagined.rewards.shape == (5, 7)
@@ -71,14 +72,14 @@ def test_imagined_rollout_shapes(frozen):
 
 
 def test_start_states_cover_every_valid_step(frozen):
-    model, starts = frozen
+    model, _ = frozen
     episodes = world_model.collect_episodes(
         FAST.model, 4, torch.Generator().manual_seed(3)
     )
     states = actor_critic.start_states(model, episodes)
-    assert states.observations.shape[0] == int(episodes.mask.sum())
-    first = episodes.mask[:, 0].sum()
-    assert torch.all(states.previous[: int(first)][0] == 0)
+    assert states.shape[0] == int(episodes.mask.sum())
+    assert torch.all(states[0, :32] == 0)
+    assert states[0, 32:].argmax() == episodes.observations[0, 0]
 
 
 def test_actor_critic_learns_in_imagination_and_beats_random(frozen):

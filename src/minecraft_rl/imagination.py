@@ -1,9 +1,8 @@
 """Stage 2D imagination: open-loop rollouts of the Stage 2C world model.
 
 See docs/stage2d.md. From every real start point, the world model reads the real
-history up to that step and then rolls forward on its own: each predicted next
-observation (the most likely class) is fed back as its next input, together with
-the real episode's next action. The imagined observations, rewards and
+history up to that step and then rolls forward on its own with the real episode's
+next actions (`open_loop` of the model). The imagined observations, rewards and
 continuations are compared with what actually happened at horizons 1, 5, 10 and
 20, during training and under a behavior policy different from the training data.
 """
@@ -23,7 +22,7 @@ from minecraft_rl import world_model
 from minecraft_rl.devices import DEVICES, select_device
 from minecraft_rl.provenance import git_commit
 from minecraft_rl.tmaze import Action, Observation
-from minecraft_rl.world_model import Episodes, Predictions, WorldModel
+from minecraft_rl.world_model import Episodes, WorldModel
 
 EVALUATION_DATA_SEED_OFFSET = 1_000_000
 SHIFTED_DATA_SEED_OFFSET = 2_000_000
@@ -38,38 +37,11 @@ class Config:
     rollout_steps: tuple[int, ...] = (0, 200, 1000, 2000, 3000, 5000)
 
 
-def imagine(
-    model: WorldModel, episodes: Episodes, start: int, horizon: int
-) -> Predictions:
-    """Predictions (episodes, horizon) for transitions start .. start + horizon - 1.
-
-    The model reads the real (o_t, a_t) for t <= start; afterwards its input
-    observation is its own previous prediction and only the real actions are used.
-    Columns past the end of the padded episodes are not produced.
-    """
-    horizon = min(horizon, episodes.actions.shape[1] - start)
-    states = model.recurrent(
-        episodes.observations[:, : start + 1], episodes.actions[:, : start + 1]
-    )
-    state = states[:, -1]
-    predictions = [model.predict(state)]
-    for offset in range(1, horizon):
-        imagined_observation = predictions[-1].observation_logits.argmax(-1)
-        action = episodes.actions[:, start + offset]
-        state = model.recurrent(
-            imagined_observation.unsqueeze(1), action.unsqueeze(1), state
-        )[:, -1]
-        predictions.append(model.predict(state))
-    return Predictions(
-        *(
-            torch.stack([getattr(p, f) for p in predictions], dim=1)
-            for f in Predictions.__dataclass_fields__
-        )
-    )
-
-
 def rollout_errors(
-    model: WorldModel, episodes: Episodes, horizons: tuple[int, ...]
+    model: WorldModel,
+    episodes: Episodes,
+    horizons: tuple[int, ...],
+    generator: torch.Generator | None = None,
 ) -> dict[str, dict[str, float]]:
     """Imagined versus real outcome at each horizon k, pooled over every start s
     for which the real episode still runs at transition s + k - 1.
@@ -108,7 +80,7 @@ def rollout_errors(
             valid_start = episodes.mask[:, start]
             if not valid_start.any():
                 break
-            predictions = imagine(model, episodes, start, longest)
+            predictions = model.open_loop(episodes, start, longest, generator)
             length = predictions.reward.shape[1]
             window = slice(start, start + length)
             real_mask = episodes.mask[:, window]

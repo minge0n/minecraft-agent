@@ -1,7 +1,7 @@
 import torch
 
 from minecraft_rl import world_model
-from minecraft_rl.imagination import imagine, rollout_errors
+from minecraft_rl.imagination import rollout_errors
 from minecraft_rl.tmaze import Action, Observation
 
 CPU = torch.device("cpu")
@@ -28,7 +28,7 @@ def test_first_imagined_step_is_the_teacher_forced_prediction():
     with torch.no_grad():
         teacher_forced = model(data.observations, data.actions)
         for start in (0, 3, 7):
-            imagined = imagine(model, data, start, horizon=1)
+            imagined = model.open_loop(data, start, 1, None)
             assert torch.allclose(
                 imagined.reward[:, 0], teacher_forced.reward[:, start], atol=1e-6
             )
@@ -49,8 +49,8 @@ def test_imagination_never_reads_real_observations_after_the_start():
     altered.observations[:, start + 1 :] = Observation.ARM
     altered.next_observations[:, start:] = Observation.ARM
     with torch.no_grad():
-        original = imagine(model, data, start, horizon=6)
-        changed = imagine(model, altered, start, horizon=6)
+        original = model.open_loop(data, start, 6, None)
+        changed = model.open_loop(altered, start, 6, None)
     assert torch.equal(original.reward, changed.reward)
     assert torch.equal(original.observation_logits, changed.observation_logits)
 
@@ -63,8 +63,8 @@ def test_imagination_follows_the_real_actions():
     )
     altered.actions[:, 2] = (altered.actions[:, 2] + 1) % len(Action)
     with torch.no_grad():
-        original = imagine(model, data, 0, horizon=4)
-        changed = imagine(model, altered, 0, horizon=4)
+        original = model.open_loop(data, 0, 4, None)
+        changed = model.open_loop(altered, 0, 4, None)
     assert torch.equal(original.reward[:, :2], changed.reward[:, :2])
     assert not torch.equal(original.reward[:, 2:], changed.reward[:, 2:])
 
@@ -72,7 +72,7 @@ def test_imagination_follows_the_real_actions():
 def test_horizon_is_clipped_at_the_padded_length():
     model, _ = world_model.build(FAST, CPU)
     with torch.no_grad():
-        imagined = imagine(model, episodes(), FAST.max_steps - 3, horizon=20)
+        imagined = model.open_loop(episodes(), FAST.max_steps - 3, 20, None)
     assert imagined.reward.shape == (32, 3)
 
 

@@ -12,10 +12,11 @@ import argparse
 import json
 import platform
 import time
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 from torch import nn
@@ -42,6 +43,23 @@ class Config:
     steps: int = 5000
     batch: int = 32
     report_steps: tuple[int, ...] = (0, 100, 200, 500, 1000, 2000, 3000, 4000, 5000)
+    kind: str = "gru"
+    latent_variables: int = 8
+    latent_classes: int = 4
+    kl_scale: float = 1.0
+    prediction_samples: int = 16
+
+
+def config_from_dict(raw: dict[str, Any]) -> Config:
+    return Config(**raw | {"report_steps": tuple(raw["report_steps"])})
+
+
+def policy_state_size(config: Config) -> int:
+    """Size of the state an agent acts on: [h_{t-1}, onehot(o_t)] for the GRU,
+    [h_t, z_t] for the RSSM."""
+    if config.kind == "rssm":
+        return config.hidden + config.latent_variables * config.latent_classes
+    return config.hidden + OBSERVATIONS
 
 
 @dataclass(frozen=True)
@@ -115,6 +133,68 @@ class Predictions:
     continue_logits: torch.Tensor
 
 
+def stack_predictions(steps: list[Predictions]) -> Predictions:
+    """Per-step predictions (batch, ...) stacked along a new time dimension 1."""
+    return Predictions(
+        *(
+            torch.stack([getattr(p, f) for p in steps], dim=1)
+            for f in Predictions.__dataclass_fields__
+        )
+    )
+
+
+class DynamicsModel(Protocol):
+    """What training, evaluation, imagination and acting need from a world model.
+
+    A policy state is the model's summary of the history up to and including the
+    current observation, on which the next action is chosen.
+    """
+
+    policy_state_size: int
+    deterministic: bool
+
+    def parameters(self) -> Iterator[nn.Parameter]: ...
+
+    def training_losses(
+        self, episodes: Episodes, generator: torch.Generator | None
+    ) -> dict[str, torch.Tensor]: ...
+
+    def one_step(
+        self, episodes: Episodes, generator: torch.Generator | None
+    ) -> Predictions: ...
+
+    def open_loop(
+        self,
+        episodes: Episodes,
+        start: int,
+        horizon: int,
+        generator: torch.Generator | None,
+    ) -> Predictions: ...
+
+    def policy_states(
+        self, episodes: Episodes, generator: torch.Generator | None
+    ) -> torch.Tensor: ...
+
+    def initial_policy_states(
+        self, observations: torch.Tensor, generator: torch.Generator | None
+    ) -> torch.Tensor: ...
+
+    def observe_step(
+        self,
+        states: torch.Tensor,
+        actions: torch.Tensor,
+        observations: torch.Tensor,
+        generator: torch.Generator | None,
+    ) -> torch.Tensor: ...
+
+    def imagine_step(
+        self,
+        states: torch.Tensor,
+        actions: torch.Tensor,
+        generator: torch.Generator | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
+
+
 class WorldModel(nn.Module):
     """x_t = [onehot(o_t), onehot(a_t)] (batch, time, 8) -> state h_t (batch, time, H)
     -> next-observation logits (.., 5), reward (..), continuation logit (..).
@@ -126,6 +206,9 @@ class WorldModel(nn.Module):
     def __init__(self, hidden: int, memory: bool) -> None:
         super().__init__()
         self.memory = memory
+        self.hidden = hidden
+        self.deterministic = True
+        self.policy_state_size = hidden + OBSERVATIONS
         inputs = OBSERVATIONS + ACTIONS
         self.core = (
             nn.GRU(inputs, hidden, batch_first=True)
@@ -167,18 +250,133 @@ class WorldModel(nn.Module):
     def forward(self, observations: torch.Tensor, actions: torch.Tensor) -> Predictions:
         return self.predict(self.recurrent(observations, actions))
 
+    def training_losses(
+        self, episodes: Episodes, generator: torch.Generator | None
+    ) -> dict[str, torch.Tensor]:
+        return losses(self, episodes)
+
+    def one_step(
+        self, episodes: Episodes, generator: torch.Generator | None
+    ) -> Predictions:
+        """Teacher-forced prediction of every transition (episodes, time)."""
+        return self(episodes.observations, episodes.actions)
+
+    def policy_states(
+        self, episodes: Episodes, generator: torch.Generator | None
+    ) -> torch.Tensor:
+        """Policy states s_t = [h_{t-1}, onehot(o_t)] (episodes, time, H + 5) on
+        which a_t is chosen, with h_{-1} = 0. Deterministic; `generator` is unused."""
+        with torch.no_grad():
+            states = self.recurrent(episodes.observations, episodes.actions)
+        previous = torch.cat([torch.zeros_like(states[:, :1]), states[:, :-1]], dim=1)
+        seen = nn.functional.one_hot(episodes.observations, OBSERVATIONS).float()
+        return torch.cat([previous, seen], dim=-1)
+
+    def initial_policy_states(
+        self, observations: torch.Tensor, generator: torch.Generator | None
+    ) -> torch.Tensor:
+        previous = torch.zeros(
+            observations.shape[0], self.hidden, device=observations.device
+        )
+        seen = nn.functional.one_hot(observations, OBSERVATIONS).float()
+        return torch.cat([previous, seen], dim=-1)
+
+    def observe_step(
+        self,
+        states: torch.Tensor,
+        actions: torch.Tensor,
+        observations: torch.Tensor,
+        generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        """The next policy state after taking `actions` and seeing the real
+        `observations`."""
+        current = self._advance(states, actions)
+        seen = nn.functional.one_hot(observations, OBSERVATIONS).float()
+        return torch.cat([current, seen], dim=-1)
+
+    def imagine_step(
+        self,
+        states: torch.Tensor,
+        actions: torch.Tensor,
+        generator: torch.Generator | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The next policy state with the most likely predicted observation fed
+        back, the predicted reward and the continuation probability."""
+        current = self._advance(states, actions)
+        predictions = self.predict(current)
+        imagined = nn.functional.one_hot(
+            predictions.observation_logits.argmax(-1), OBSERVATIONS
+        ).float()
+        return (
+            torch.cat([current, imagined], dim=-1),
+            predictions.reward,
+            torch.sigmoid(predictions.continue_logits),
+        )
+
+    def open_loop(
+        self,
+        episodes: Episodes,
+        start: int,
+        horizon: int,
+        generator: torch.Generator | None,
+    ) -> Predictions:
+        """Predictions (episodes, horizon) for transitions start .. start + horizon - 1.
+
+        The model reads the real (o_t, a_t) for t <= start; afterwards its input
+        observation is its own previous most likely prediction and only the real
+        actions are used. Columns past the padded length are not produced.
+        Deterministic; `generator` is unused.
+        """
+        horizon = min(horizon, episodes.actions.shape[1] - start)
+        states = self.recurrent(
+            episodes.observations[:, : start + 1], episodes.actions[:, : start + 1]
+        )
+        state = states[:, -1]
+        steps = [self.predict(state)]
+        for offset in range(1, horizon):
+            imagined = steps[-1].observation_logits.argmax(-1)
+            action = episodes.actions[:, start + offset]
+            state = self.recurrent(imagined.unsqueeze(1), action.unsqueeze(1), state)[
+                :, -1
+            ]
+            steps.append(self.predict(state))
+        return stack_predictions(steps)
+
+    def _advance(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        previous, seen = states.split([self.hidden, OBSERVATIONS], dim=-1)
+        return self.recurrent(
+            seen.argmax(-1).unsqueeze(1), actions.unsqueeze(1), previous
+        )[:, -1]
+
 
 def build(
     config: Config, device: torch.device, memory: bool = True
-) -> tuple[WorldModel, torch.optim.Adam]:
+) -> tuple[DynamicsModel, torch.optim.Adam]:
+    """The world model `config.kind` names ("gru" or "rssm"); `memory=False` is
+    the GRU's no-memory control."""
     torch.manual_seed(config.seed)
-    model = WorldModel(config.hidden, memory).to(device)
+    if config.kind == "rssm":
+        from minecraft_rl.rssm import RSSM
+
+        model: DynamicsModel = RSSM(config).to(device)
+    elif config.kind == "gru":
+        model = WorldModel(config.hidden, memory).to(device)
+    else:
+        raise ValueError(f"unknown world model kind {config.kind!r}")
     return model, torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 
 
 def losses(model: WorldModel, episodes: Episodes) -> dict[str, torch.Tensor]:
     """Per-term losses averaged over valid steps; `total` is their sum."""
-    predictions = model(episodes.observations, episodes.actions)
+    return prediction_losses(model(episodes.observations, episodes.actions), episodes)
+
+
+def prediction_losses(
+    predictions: Predictions, episodes: Episodes
+) -> dict[str, torch.Tensor]:
+    """Next-observation cross-entropy, reward squared error and continuation
+    cross-entropy of per-transition predictions (episodes, time), averaged over
+    valid transitions; `total` is their sum."""
     valid = episodes.mask.float()
     count = valid.sum()
     observation = nn.functional.cross_entropy(
@@ -199,7 +397,7 @@ def losses(model: WorldModel, episodes: Episodes) -> dict[str, torch.Tensor]:
 
 
 def train(
-    model: WorldModel,
+    model: DynamicsModel,
     optimizer: torch.optim.Optimizer,
     episodes: Episodes,
     config: Config,
@@ -212,7 +410,9 @@ def train(
     for _ in range(steps):
         index = torch.randint(0, count, (config.batch,), generator=generator)
         optimizer.zero_grad()
-        loss = losses(model, episodes.select(index).to(device))["total"]
+        loss = model.training_losses(episodes.select(index).to(device), generator)[
+            "total"
+        ]
         loss.backward()
         optimizer.step()
         total_losses.append(loss.item())
@@ -220,14 +420,26 @@ def train(
 
 
 def evaluate(
-    model: WorldModel, episodes: Episodes, device: torch.device
+    model: DynamicsModel,
+    episodes: Episodes,
+    device: torch.device,
+    generator: torch.Generator | None = None,
 ) -> dict[str, Any]:
     """One-step prediction error on all valid steps, plus the two transition kinds
-    that need memory."""
+    that need memory. Each prediction is made before the predicted transition is
+    seen."""
     episodes = episodes.to(device)
     with torch.no_grad():
-        terms = losses(model, episodes)
-        predictions = model(episodes.observations, episodes.actions)
+        predictions = model.one_step(episodes, generator)
+        terms = prediction_losses(predictions, episodes)
+    return prediction_metrics(predictions, terms, episodes)
+
+
+def prediction_metrics(
+    predictions: Predictions, terms: dict[str, torch.Tensor], episodes: Episodes
+) -> dict[str, Any]:
+    """Accuracy of per-transition next-step predictions, overall and on the
+    transition kinds that need memory."""
     predicted_observation = predictions.observation_logits.argmax(-1)
     observation_correct = predicted_observation == episodes.next_observations
     continuation_correct = (predictions.continue_logits > 0) == (
@@ -330,12 +542,11 @@ def save_checkpoint(
 
 def load_checkpoint(
     path: Path, device: torch.device
-) -> tuple[Config, int, WorldModel, torch.optim.Adam]:
+) -> tuple[Config, int, DynamicsModel, torch.optim.Adam]:
     data = torch.load(path, map_location=device, weights_only=True)
     if data.get("format") != CHECKPOINT_FORMAT:
         raise ValueError(f"{path} is not a {CHECKPOINT_FORMAT} checkpoint")
-    raw = data["config"]
-    config = Config(**raw | {"report_steps": tuple(raw["report_steps"])})
+    config = config_from_dict(data["config"])
     model, optimizer = build(config, device)
     model.load_state_dict(data["model"])
     optimizer.load_state_dict(data["optimizer"])
@@ -352,7 +563,7 @@ def train_with_curve(
     training: Episodes,
     evaluation: Episodes,
     device: torch.device,
-) -> tuple[WorldModel, torch.optim.Adam, list[float], dict[str, Any]]:
+) -> tuple[DynamicsModel, torch.optim.Adam, list[float], dict[str, Any]]:
     """Train for `config.steps`, evaluating the held-out episodes at report steps."""
     model, optimizer = build(config, device, memory)
     generator = torch.Generator().manual_seed(config.seed)

@@ -24,7 +24,7 @@ from minecraft_rl.devices import DEVICES, select_device
 from minecraft_rl.imagination import rollout_errors
 from minecraft_rl.provenance import git_commit
 from minecraft_rl.tmaze import Action, Cue, Observation, TMaze
-from minecraft_rl.world_model import Episodes, WorldModel
+from minecraft_rl.world_model import DynamicsModel, Episodes
 
 COLLECTION_SEED_OFFSET = 5_000_000
 EXPLORATION_ENTROPY = 0.03
@@ -44,14 +44,14 @@ class Config:
 
 
 def collect_with_agent(
-    model: WorldModel,
+    model: DynamicsModel,
     agent: actor_critic.Agent,
     config: actor_critic.Config,
     count: int,
     generator: torch.Generator,
 ) -> Episodes:
     """Run `count` real episodes with random cues, sampling actions from the
-    actor on the world model state built from the real observations."""
+    actor on the world model's policy state built from the real observations."""
     model_config = config.model
     device = next(model.parameters()).device
     shape = (count, model_config.max_steps)
@@ -69,18 +69,12 @@ def collect_with_agent(
     current = torch.tensor(
         [env.reset(Cue(int(c))) for env, c in zip(environments, cues, strict=True)]
     )
-    previous = torch.zeros(count, model_config.hidden, device=device)
+    with torch.no_grad():
+        states = model.initial_policy_states(current.to(device), generator)
     running = torch.ones(count, dtype=torch.bool)
     for t in range(model_config.max_steps):
-        seen = current.to(device)
         with torch.no_grad():
-            logits = agent.actor(agent.features(previous, seen))
-            chosen = torch.multinomial(
-                torch.softmax(logits, -1).cpu(), 1, generator=generator
-            ).squeeze(-1)
-            previous = model.recurrent(
-                seen.unsqueeze(1), chosen.to(device).unsqueeze(1), previous
-            )[:, -1]
+            chosen = agent.act(states, generator, greedy=False).cpu()
         following = current.clone()
         for i in torch.nonzero(running).squeeze(-1).tolist():
             observation, reward, terminated, truncated = environments[i].step(
@@ -98,6 +92,10 @@ def collect_with_agent(
         current = following
         if not running.any():
             break
+        with torch.no_grad():
+            states = model.observe_step(
+                states, chosen.to(device), current.to(device), generator
+            )
     return Episodes(
         observations, actions, next_observations, rewards, continues, mask, cues
     )
