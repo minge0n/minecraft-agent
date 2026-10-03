@@ -6,12 +6,15 @@ from pathlib import Path
 import pytest
 
 from minecraft_rl import sweep
+from minecraft_rl.macos_thermal import CpuTemperature, thermal_pressure
 from minecraft_rl.sweep import (
     TASKPOLICY,
+    Reading,
+    Settings,
+    Thermostat,
     command,
     parse_seeds,
     pending_seeds,
-    thermal_pressure,
 )
 
 
@@ -21,8 +24,8 @@ def test_seed_ranges_and_lists():
     assert parse_seeds("0-1,7,9-10") == [0, 1, 7, 9, 10]
 
 
-def test_background_runs_go_through_taskpolicy():
-    run = command("world_model", 3, Path("out/metrics.json"), ["--steps", "5"], True)
+def test_runs_go_through_taskpolicy_background():
+    run = command("world_model", 3, Path("out/metrics.json"), ["--steps", "5"])
     assert run[:2] == [str(TASKPOLICY), "-b"]
     assert run[3:] == [
         "-m",
@@ -34,13 +37,14 @@ def test_background_runs_go_through_taskpolicy():
         "--steps",
         "5",
     ]
-    foreground = command("world_model", 3, Path("out/metrics.json"), [], False)
-    assert foreground[1:3] == ["-m", "minecraft_rl.world_model"]
 
 
-def test_thermal_pressure_is_a_known_level_or_unavailable():
+def test_macos_sensors_give_plausible_values():
     level = thermal_pressure()
     assert level is None or 0 <= level <= 4
+    sensor = CpuTemperature()
+    if sensor.available:
+        assert 0.0 < sensor.read() < 150.0
 
 
 def test_finished_seeds_are_skipped_unless_rerun(tmp_path):
@@ -48,6 +52,21 @@ def test_finished_seeds_are_skipped_unless_rerun(tmp_path):
     (tmp_path / "seed1" / "metrics.json").write_text("{}")
     assert pending_seeds([0, 1, 2], tmp_path, rerun=False) == [0, 2]
     assert pending_seeds([0, 1, 2], tmp_path, rerun=True) == [0, 1, 2]
+
+
+def test_thermostat_has_a_gap_between_pause_and_resume():
+    thermostat = Thermostat(
+        Settings(max_temperature=60.0, resume_temperature=57.0),
+        temperature=lambda: None,
+        pressure=lambda: None,
+    )
+    assert thermostat.too_hot(Reading(60.5, 0))
+    assert not thermostat.too_hot(Reading(59.0, 0))
+    assert thermostat.too_hot(Reading(50.0, 1))
+    assert not thermostat.cool_enough(Reading(58.0, 0))
+    assert thermostat.cool_enough(Reading(57.0, 0))
+    assert not thermostat.cool_enough(Reading(50.0, 1))
+    assert thermostat.cool_enough(Reading(None, None))
 
 
 class FakeProcess:
@@ -58,49 +77,64 @@ class FakeProcess:
         return None
 
 
-def test_duty_cycle_stops_then_resumes_every_process(monkeypatch):
+def fake_run(pid: int) -> sweep.SeedRun:
+    return sweep.SeedRun(0, [], FakeProcess(pid), None, 0.0, 0)
+
+
+def patch_signals(monkeypatch) -> list[tuple[int, int]]:
     sent: list[tuple[int, int]] = []
-    sleeps: list[float] = []
-    monkeypatch.setattr(
-        sweep.os, "killpg", lambda pid, number: sent.append((pid, number))
-    )
-    monkeypatch.setattr(sweep.time, "sleep", sleeps.append)
-    sweep.duty_cycle_period([FakeProcess(11), FakeProcess(12)], 0.25, 2.0)
-    assert sleeps == [0.5, 1.5]
+    monkeypatch.setattr(sweep.os, "killpg", lambda pid, n: sent.append((pid, n)))
+    monkeypatch.setattr(sweep.time, "sleep", lambda seconds: None)
+    return sent
+
+
+def test_cool_period_stops_then_resumes_for_the_duty_cycle(monkeypatch):
+    sent = patch_signals(monkeypatch)
+    runs = [fake_run(11), fake_run(12)]
+    thermostat = Thermostat(Settings(), temperature=lambda: 50.0, pressure=lambda: 0)
+    sweep.throttle_period(runs, Settings(duty_cycle=0.5), thermostat)
     assert sent == [
         (11, signal.SIGSTOP),
         (12, signal.SIGSTOP),
         (11, signal.SIGCONT),
         (12, signal.SIGCONT),
     ]
+    assert runs[0].temperatures == [50.0]
+    assert runs[0].thermostat_pause_events == 0
 
 
-def test_hot_system_pauses_processes_until_it_cools(monkeypatch):
-    levels = iter([2, 2, 2, 0])
-    sent: list[int] = []
-    monkeypatch.setattr(sweep, "thermal_pressure", lambda: next(levels))
-    monkeypatch.setattr(sweep.os, "killpg", lambda pid, number: sent.append(number))
-    monkeypatch.setattr(sweep.time, "sleep", lambda seconds: None)
-    assert sweep.wait_for_cool_system([FakeProcess(5)], max_level=0)
-    assert sent == [signal.SIGSTOP, signal.SIGCONT]
+def test_hot_period_pauses_until_the_resume_temperature(monkeypatch):
+    sent = patch_signals(monkeypatch)
+    temperatures = iter([62.0, 59.0, 58.0, 56.5])
+    runs = [fake_run(5)]
+    settings = Settings(duty_cycle=1.0, max_temperature=60.0, resume_temperature=57.0)
+    thermostat = Thermostat(
+        settings, temperature=lambda: next(temperatures), pressure=lambda: 0
+    )
+    sweep.throttle_period(runs, settings, thermostat)
+    assert [n for _, n in sent] == [signal.SIGSTOP, signal.SIGCONT]
+    assert runs[0].thermostat_pause_events == 1
+    assert runs[0].temperatures == [62.0]
 
 
-def test_cool_system_sends_no_signal(monkeypatch):
-    sent: list[int] = []
-    monkeypatch.setattr(sweep, "thermal_pressure", lambda: 0)
-    monkeypatch.setattr(sweep.os, "killpg", lambda pid, number: sent.append(number))
-    assert not sweep.wait_for_cool_system([FakeProcess(5)], max_level=0)
+def test_full_duty_cycle_on_a_cool_chip_sends_no_signal(monkeypatch):
+    sent = patch_signals(monkeypatch)
+    thermostat = Thermostat(Settings(), temperature=lambda: 50.0, pressure=lambda: 0)
+    sweep.throttle_period([fake_run(5)], Settings(duty_cycle=1.0), thermostat)
     assert sent == []
 
 
-def test_unfinished_processes_are_resumed_before_they_are_terminated(tmp_path):
-    process = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(60)"],
-        start_new_session=True,
+def test_a_pause_ends_at_its_limit_on_a_chip_that_stays_warm(monkeypatch):
+    sent = patch_signals(monkeypatch)
+    clock = iter(range(0, 1000, 10))
+    monkeypatch.setattr(sweep.time, "monotonic", lambda: float(next(clock)))
+    settings = Settings(
+        max_temperature=50.0, resume_temperature=48.0, max_pause_seconds=30.0
     )
-    sweep.signal_all([process], signal.SIGSTOP)
-    sweep.stop_processes([process])
-    assert process.returncode == -signal.SIGTERM
+    thermostat = Thermostat(settings, temperature=lambda: 57.0, pressure=lambda: 0)
+    paused = sweep.cool_down([FakeProcess(5)], thermostat, thermostat.read())
+    assert [n for _, n in sent] == [signal.SIGSTOP, signal.SIGCONT]
+    assert 30.0 <= paused <= 50.0
 
 
 @pytest.mark.parametrize("error", [ProcessLookupError, PermissionError])
@@ -110,3 +144,13 @@ def test_a_process_that_exits_before_the_signal_is_ignored(monkeypatch, error):
 
     monkeypatch.setattr(sweep.os, "killpg", exited)
     sweep.signal_all([FakeProcess(9)], signal.SIGSTOP)
+
+
+def test_unfinished_processes_are_resumed_before_they_are_terminated():
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
+    sweep.signal_all([process], signal.SIGSTOP)
+    sweep.stop_processes([process])
+    assert process.returncode == -signal.SIGTERM

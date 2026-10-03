@@ -35,18 +35,28 @@ The target is stable results for repeated runs on the same documented hardware a
 
 ## Running sweeps with little heat
 
-`python -m minecraft_rl.sweep <experiment> --seeds 0-9 --output-root <dir>` runs one process per seed. Arguments after `--` go to the experiment, for example `-- --world-model rssm`. The runner limits heat in four ways:
+`python -m minecraft_rl.sweep <experiment> --seeds 0-9 --output-root <dir>` runs one process per seed on a Mac. It supports macOS only. Arguments after `--` go to the experiment, for example `-- --world-model rssm`. The runner limits heat in four ways:
 
-1. `--jobs` limits the number of processes that run at the same time. The default is 1.
-2. `--duty-cycle` limits the share of time that the processes compute. The default is 0.5. In every period of `--period` seconds (default 1), the runner stops each process group with SIGSTOP for the remaining share and resumes it with SIGCONT. A duty cycle of 0.5 halves the average power and doubles the wall-clock time.
-3. On macOS, each process runs under `taskpolicy -b`, the background quality of service. The scheduler then gives these processes low priority and uses lower clock speeds.
-4. On macOS, the runner reads the thermal pressure level (`notify_get_state` on `com.apple.system.thermalpressurelevel`: 0 nominal, 1 moderate, 2 heavy). While the level is above `--max-thermal-level` (default 0), the runner stops all running seed processes and starts no new seed. It resumes them when the level drops. `--cooldown <seconds>` adds a pause after each finished seed.
-
-On other systems, the runner uses only 1 and 2 and calls no macOS API.
+1. It runs one seed process at a time (`--jobs`, default 1).
+2. Each process runs under `taskpolicy -b`, the background quality of service of macOS. macOS then runs it on the efficiency cores at a low clock speed.
+3. `--duty-cycle` (default 0.5) limits the share of each period of `--period` seconds (default 1) in which the process computes. The runner stops the process group with SIGSTOP for the rest of the period and resumes it with SIGCONT.
+4. A thermostat reads the die temperature of the SoC once per period. The value is the highest "PMU tdie" sensor of the IOKit HID event system (`src/minecraft_rl/macos_thermal.py`), which needs no root rights. If the temperature is above `--max-temperature` (default 65 C), or the macOS thermal pressure level is above `--max-thermal-level` (default 0, nominal), the runner stops all seed processes. It resumes them at or below `--resume-temperature` (default 3 C lower), or after `--max-pause` seconds (default 120). The limit exists because other programs can keep the chip warm, and the sweep must not wait forever.
 
 The runner skips a seed whose `metrics.json` exists, so the same command resumes an interrupted sweep. `--rerun` runs such seeds again. The runner deletes an old `metrics.json` before it starts a seed, so a seed that stops early leaves no stale result. If the runner gets SIGINT or SIGTERM, it resumes and then terminates every unfinished seed process.
 
-Next to each `metrics.json`, the runner writes `sweep.json`: the command, the exit code, `jobs`, `duty_cycle`, the period, the QoS flag, the thermal limit, the wall-clock time, the time stopped by the duty cycle, the thermal pause time and the number of thermal pause events, the thermal level at start and end, and the thread counts that the experiment recorded.
+Next to each `metrics.json`, the runner writes `sweep.json`: the command, the exit code, `jobs`, `duty_cycle`, the period, the thermostat limits, the wall-clock time, the time stopped by the duty cycle, the thermostat pause time and number of pause events, the mean and highest die temperature, the thermal pressure level at start and end, and the thread counts that the experiment recorded.
+
+### Measured heat
+
+Die temperature on the machine above, for an RSSM world-model run with one thread, mean of the last 60 s of a 150 s window:
+
+| Setting | Mean | Highest |
+|---|---|---|
+| Idle between runs | 49-58 C | - |
+| Normal priority, duty cycle 1.0 | 63.5 C | 66.5 C |
+| `taskpolicy -b`, duty cycle 1.0 | 56.5 C | 62.8 C |
+
+Background QoS removes most of the heat that one seed process adds. The idle temperature varies by about 9 C with the other programs on the machine, so the remaining heat of a sweep is small next to that variation. A thermostat limit below the idle temperature stops the sweep at every period: with a limit of 56 C, a 300-step run took 265 s instead of 15 s and its mean temperature was not lower. The defaults therefore keep the duty cycle as a fixed reduction and use the thermostat as a guard against high temperatures.
 
 ### Evidence for the sweep runner
 
@@ -57,6 +67,7 @@ SIGSTOP and SIGCONT change only when a process computes, not what it computes. E
 | RSSM `world_model`, seed 0, 1,500 steps | 50 s | 101 s (duty cycle 0.5) | 608 metric fields identical, 131 checkpoint tensors identical |
 | RSSM `dreamer_loop`, seed 1, 2 iterations | 79 s | 156 s (duty cycle 0.5) | 573 of 575 metric fields identical (the 2 others are checkpoint paths), world-model and agent weights identical |
 | RSSM `world_model`, seed 0, 300 steps, with a 6 s thermal pause | 14 s | 20 s (duty cycle 1.0 and the pause) | 476 metric fields identical |
+| RSSM `world_model`, seed 0, 300 steps, thermostat at 56 C | 15 s | 265 s (duty cycle 0.5, 15 thermostat pauses) | 638 metric fields identical |
 
 The comparison ignores only the time stamp, durations and file paths. Other process-level checks:
 
