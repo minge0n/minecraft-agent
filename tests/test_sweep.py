@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from minecraft_rl.sweep import TASKPOLICY, command, parse_seeds
+from minecraft_rl import sweep
+from minecraft_rl.sweep import TASKPOLICY, command, parse_seeds, thermal_pressure
 
 
 def test_seed_ranges_and_lists():
@@ -24,3 +25,16 @@ def test_background_runs_go_through_taskpolicy():
     ]
     foreground = command("world_model", 3, Path("out/metrics.json"), [], False)
     assert foreground[1:3] == ["-m", "minecraft_rl.world_model"]
+
+
+def test_thermal_pressure_is_a_known_level_or_unavailable():
+    level = thermal_pressure()
+    assert level is None or 0 <= level <= 4
+
+
+def test_wait_blocks_until_the_level_drops(monkeypatch):
+    levels = iter([2, 2, 0])
+    monkeypatch.setattr(sweep, "thermal_pressure", lambda: next(levels))
+    monkeypatch.setattr(sweep.time, "sleep", lambda seconds: None)
+    sweep.wait_for_cool_system(max_level=0, poll_seconds=1.0)
+    assert next(levels, "exhausted") == "exhausted"

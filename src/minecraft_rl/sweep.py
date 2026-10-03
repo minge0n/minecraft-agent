@@ -1,10 +1,15 @@
-"""Run one Stage 2 experiment over many seeds with few processes at a time.
+"""Run one Stage 2 experiment over many seeds with little heat.
 
-macOS only. Each seed runs in its own process under `taskpolicy -b`, the
-background QoS of macOS. The scheduler then uses lower clock speeds and yields
-to other work, so a long sweep makes less heat. The canonical runtime uses one
-thread per process (docs/decisions/reproducibility.md), so neither the number
-of parallel jobs nor the QoS changes the results.
+macOS only. Three mechanisms limit heat, and none of them changes results,
+because the canonical runtime uses one thread per process
+(docs/decisions/reproducibility.md):
+
+1. `--jobs` limits the number of seed processes that run at the same time.
+2. Each process runs under `taskpolicy -b`, the background QoS of macOS. The
+   scheduler then uses lower clock speeds and yields to other work.
+3. Before it starts a new seed, the runner reads the thermal pressure level of
+   macOS. If the level is above `--max-thermal-level`, it waits until the level
+   drops. `--cooldown` adds a fixed pause after each finished seed.
 
 Example:
 
@@ -13,12 +18,16 @@ Example:
 """
 
 import argparse
+import ctypes
+import ctypes.util
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 TASKPOLICY = Path("/usr/sbin/taskpolicy")
+THERMAL_NOTIFICATION = b"com.apple.system.thermalpressurelevel"
+THERMAL_LEVELS = ("nominal", "moderate", "heavy", "trapping", "sleeping")
 EXPERIMENTS = (
     "parity",
     "cue_recall",
@@ -58,6 +67,33 @@ def command(
     return [str(TASKPOLICY), "-b", *run] if background else run
 
 
+def thermal_pressure() -> int | None:
+    """The current macOS thermal pressure level (0 nominal, 1 moderate,
+    2 heavy, 3 trapping, 4 sleeping), or None where it cannot be read."""
+    library = ctypes.util.find_library("System")
+    if library is None:
+        return None
+    system = ctypes.CDLL(library)
+    token = ctypes.c_int()
+    if system.notify_register_check(THERMAL_NOTIFICATION, ctypes.byref(token)):
+        return None
+    level = ctypes.c_uint64()
+    status = system.notify_get_state(token, ctypes.byref(level))
+    system.notify_cancel(token)
+    return None if status else int(level.value)
+
+
+def wait_for_cool_system(max_level: int, poll_seconds: float) -> None:
+    """Block while the thermal pressure level is above `max_level`."""
+    reported = False
+    while (level := thermal_pressure()) is not None and level > max_level:
+        if not reported:
+            name = THERMAL_LEVELS[min(level, len(THERMAL_LEVELS) - 1)]
+            print(f"thermal pressure {name}: waiting before next seed", flush=True)
+            reported = True
+        time.sleep(poll_seconds)
+
+
 def sweep(
     experiment: str,
     seeds: list[int],
@@ -65,6 +101,8 @@ def sweep(
     output_root: Path,
     extra: list[str],
     background: bool,
+    max_thermal_level: int = 0,
+    cooldown_seconds: float = 0.0,
 ) -> dict[int, int]:
     """Run every seed, at most `jobs` at a time. Returns the exit code per seed."""
     pending = list(seeds)
@@ -72,6 +110,7 @@ def sweep(
     codes: dict[int, int] = {}
     while pending or running:
         while pending and len(running) < jobs:
+            wait_for_cool_system(max_thermal_level, poll_seconds=10.0)
             seed = pending.pop(0)
             directory = output_root / f"seed{seed}"
             directory.mkdir(parents=True, exist_ok=True)
@@ -96,6 +135,8 @@ def sweep(
             status = "done" if process.returncode == 0 else "FAILED"
             print(f"seed {seed}: {status} (exit {process.returncode})", flush=True)
             del running[seed]
+            if pending and cooldown_seconds > 0:
+                time.sleep(cooldown_seconds)
         time.sleep(0.5)
     return codes
 
@@ -113,6 +154,19 @@ def main() -> None:
         action="store_true",
         help="run at normal priority instead of macOS background QoS",
     )
+    parser.add_argument(
+        "--max-thermal-level",
+        type=int,
+        default=0,
+        help="start a new seed only at or below this macOS thermal pressure level "
+        "(0 nominal, 1 moderate, 2 heavy)",
+    )
+    parser.add_argument(
+        "--cooldown",
+        type=float,
+        default=0.0,
+        help="seconds to pause after each finished seed",
+    )
     parser.add_argument("extra", nargs="*", help="arguments after -- go to the run")
     args = parser.parse_args()
     if args.jobs < 1:
@@ -126,6 +180,8 @@ def main() -> None:
         args.output_root,
         args.extra,
         background=not args.foreground,
+        max_thermal_level=args.max_thermal_level,
+        cooldown_seconds=args.cooldown,
     )
     failed = sorted(seed for seed, code in codes.items() if code != 0)
     if failed:

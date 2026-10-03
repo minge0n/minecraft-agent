@@ -35,4 +35,10 @@ The target is stable results for repeated runs on the same documented hardware a
 
 ## Running sweeps on macOS
 
-`python -m minecraft_rl.sweep <experiment> --seeds 0-9 --jobs 2 --output-root <dir>` runs one process per seed under `taskpolicy -b`, the background quality of service of macOS. The scheduler then gives these processes low priority, moves them to efficiency settings and lets other work go first, so a sweep makes less heat. `--jobs` limits the number of processes that run at the same time. Because each process uses one thread, neither the job count nor the priority changes the results (measured for Stage 2C seeds 0 and 1). Arguments after `--` go to the experiment, for example `-- --world-model rssm`.
+`python -m minecraft_rl.sweep <experiment> --seeds 0-9 --jobs 2 --output-root <dir>` runs one process per seed and limits heat in three ways:
+
+1. `--jobs` limits the number of processes that run at the same time (default 2).
+2. Each process runs under `taskpolicy -b`, the background quality of service of macOS. The scheduler then gives these processes low priority, uses lower clock speeds and lets other work go first.
+3. Before it starts a seed, the runner reads the thermal pressure level of macOS (`notify_get_state` on `com.apple.system.thermalpressurelevel`: 0 nominal, 1 moderate, 2 heavy). While the level is above `--max-thermal-level` (default 0), it waits. `--cooldown <seconds>` adds a pause after each finished seed.
+
+Because each process uses one thread, none of these changes the results (measured for Stage 2C seeds 0 and 1). Arguments after `--` go to the experiment, for example `-- --world-model rssm`.
