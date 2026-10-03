@@ -114,12 +114,14 @@ def too_hot(max_level: int) -> bool:
 def signal_all(processes: list[subprocess.Popen[bytes]], number: int) -> None:
     """Send a signal to the process group of every process that still runs.
     Each seed process leads its own group, so the signal also reaches a
-    program that `taskpolicy` started."""
+    program that `taskpolicy` started. A process can exit between the check
+    and the signal. macOS then reports ESRCH, or EPERM while the exited
+    process is not yet reaped, and both are ignored."""
     for process in processes:
         if process.poll() is None:
             try:
                 os.killpg(process.pid, number)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
 
 

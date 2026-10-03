@@ -3,6 +3,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from minecraft_rl import sweep
 from minecraft_rl.sweep import (
     TASKPOLICY,
@@ -99,3 +101,12 @@ def test_unfinished_processes_are_resumed_before_they_are_terminated(tmp_path):
     sweep.signal_all([process], signal.SIGSTOP)
     sweep.stop_processes([process])
     assert process.returncode == -signal.SIGTERM
+
+
+@pytest.mark.parametrize("error", [ProcessLookupError, PermissionError])
+def test_a_process_that_exits_before_the_signal_is_ignored(monkeypatch, error):
+    def exited(pid, number):
+        raise error
+
+    monkeypatch.setattr(sweep.os, "killpg", exited)
+    sweep.signal_all([FakeProcess(9)], signal.SIGSTOP)
