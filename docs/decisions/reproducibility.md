@@ -33,12 +33,33 @@ The target is stable results for repeated runs on the same documented hardware a
 - `tests/test_runtime.py` (part of `./scripts/check`) starts two separate Python processes that train a small world model and agent with the same seed, and requires identical weights.
 - Every canonical Stage 2C, 2D, 2E and 2F run for seeds 0-9 ran twice, in separate processes. The `metrics.json` files are identical except for the time stamp, the duration and the file paths: 10 of 10 seeds for each of the four stages.
 
-## Running sweeps on macOS
+## Running sweeps with little heat
 
-`python -m minecraft_rl.sweep <experiment> --seeds 0-9 --jobs 2 --output-root <dir>` runs one process per seed and limits heat in three ways:
+`python -m minecraft_rl.sweep <experiment> --seeds 0-9 --output-root <dir>` runs one process per seed. Arguments after `--` go to the experiment, for example `-- --world-model rssm`. The runner limits heat in four ways:
 
-1. `--jobs` limits the number of processes that run at the same time (default 2).
-2. Each process runs under `taskpolicy -b`, the background quality of service of macOS. The scheduler then gives these processes low priority, uses lower clock speeds and lets other work go first.
-3. Before it starts a seed, the runner reads the thermal pressure level of macOS (`notify_get_state` on `com.apple.system.thermalpressurelevel`: 0 nominal, 1 moderate, 2 heavy). While the level is above `--max-thermal-level` (default 0), it waits. `--cooldown <seconds>` adds a pause after each finished seed.
+1. `--jobs` limits the number of processes that run at the same time. The default is 1.
+2. `--duty-cycle` limits the share of time that the processes compute. The default is 0.5. In every period of `--period` seconds (default 1), the runner stops each process group with SIGSTOP for the remaining share and resumes it with SIGCONT. A duty cycle of 0.5 halves the average power and doubles the wall-clock time.
+3. On macOS, each process runs under `taskpolicy -b`, the background quality of service. The scheduler then gives these processes low priority and uses lower clock speeds.
+4. On macOS, the runner reads the thermal pressure level (`notify_get_state` on `com.apple.system.thermalpressurelevel`: 0 nominal, 1 moderate, 2 heavy). While the level is above `--max-thermal-level` (default 0), the runner stops all running seed processes and starts no new seed. It resumes them when the level drops. `--cooldown <seconds>` adds a pause after each finished seed.
 
-Because each process uses one thread, none of these changes the results (measured for Stage 2C seeds 0 and 1). Arguments after `--` go to the experiment, for example `-- --world-model rssm`.
+On other systems, the runner uses only 1 and 2 and calls no macOS API.
+
+The runner skips a seed whose `metrics.json` exists, so the same command resumes an interrupted sweep. `--rerun` runs such seeds again. The runner deletes an old `metrics.json` before it starts a seed, so a seed that stops early leaves no stale result. If the runner gets SIGINT or SIGTERM, it resumes and then terminates every unfinished seed process.
+
+Next to each `metrics.json`, the runner writes `sweep.json`: the command, the exit code, `jobs`, `duty_cycle`, the period, the QoS flag, the thermal limit, the wall-clock time, the time stopped by the duty cycle, the thermal pause time and the number of thermal pause events, the thermal level at start and end, and the thread counts that the experiment recorded.
+
+### Evidence for the sweep runner
+
+SIGSTOP and SIGCONT change only when a process computes, not what it computes. Each process uses one thread and seeded generators, so the result must not change. Measured on the machine named in the Problem section:
+
+| Run | Reference (duty cycle 1.0) | Throttled | Result |
+|---|---|---|---|
+| RSSM `world_model`, seed 0, 1,500 steps | 50 s | 101 s (duty cycle 0.5) | 608 metric fields identical, 131 checkpoint tensors identical |
+| RSSM `dreamer_loop`, seed 1, 2 iterations | 79 s | 156 s (duty cycle 0.5) | 573 of 575 metric fields identical (the 2 others are checkpoint paths), world-model and agent weights identical |
+| RSSM `world_model`, seed 0, 300 steps, with a 6 s thermal pause | 14 s | 20 s (duty cycle 1.0 and the pause) | 476 metric fields identical |
+
+The comparison ignores only the time stamp, durations and file paths. Other process-level checks:
+
+1. A thermal pause, with a heavy level faked for 6 s, put the seed process into the stopped state (`T`) and back to running (`R`). `sweep.json` recorded 1 event and 6.0 s.
+2. SIGTERM and SIGINT to the runner while the seed process was stopped left no process behind.
+3. After the interruption, the same command finished the sweep. A second call skipped both seeds, and `--rerun` ran seed 1 again.
