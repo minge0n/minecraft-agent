@@ -46,6 +46,16 @@ The runner skips a seed whose `metrics.json` exists, so the same command resumes
 
 Next to each `metrics.json`, the runner writes `sweep.json`: the command, the exit code, `jobs`, `duty_cycle`, the period, the thermostat limits, the wall-clock time, the time stopped by the duty cycle, the thermostat pause time and number of pause events, the mean and highest die temperature, the thermal pressure level at start and end, and the thread counts that the experiment recorded.
 
+### Runs that take longer than one call
+
+One seed of some RSSM experiments takes longer than a shell call may last (600 s) at a duty cycle of 0.5. Measured: one Dreamer-loop iteration with the RSSM takes 32 s of computation and 75 s of wall-clock time, so 12 iterations take about 15 minutes. The imagination, actor-critic and Dreamer-loop experiments can therefore stop and continue (`src/minecraft_rl/resumable.py`).
+
+A unit of work ends at a boundary. The boundaries are each Dreamer-loop iteration, each trained imagination model, the frozen actor-critic world model, and each actor-critic report step. With `--state <file> --stop-after <seconds>`, a run saves its state at the first boundary after that time and exits with code 75. The state holds every model and optimizer state, the state of every random generator (the explicit generators and the global Python, NumPy and PyTorch generators), and all data that the run produced. The next process with the same `--state` file continues at the same boundary. A state file of another configuration is refused.
+
+The sweep runner passes these options when it gets `--time-budget <seconds>`. It starts no new seed after the budget. A resumable seed saves its state and the call ends. The same command continues it. `sweep.json` then lists every process of the seed in `processes`, and `complete` is true only after the last one.
+
+Measured: a run split into 3-5 processes gives the same `metrics.json` as a run in one process, except the file paths and the `sessions` count, for the RSSM Dreamer loop (seed 1, 3 iterations, 532 fields), RSSM imagination (seed 0, 200 steps, 2,451 fields) and RSSM actor-critic (seed 0, 60 steps, 438 fields, also through the sweep runner). All checkpoints are identical tensor for tensor.
+
 ### Measured heat
 
 Die temperature on the machine above, for an RSSM world-model run with one thread, mean of the last 60 s of a 150 s window:

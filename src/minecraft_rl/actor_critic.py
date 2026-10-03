@@ -10,7 +10,7 @@ observation without the recurrent state.
 
 import argparse
 import json
-import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,7 +19,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from minecraft_rl import runtime, world_model
+from minecraft_rl import resumable, runtime, world_model
 from minecraft_rl.devices import DEVICES, select_device
 from minecraft_rl.provenance import git_commit
 from minecraft_rl.tmaze import Action, Cue, Observation, TMaze
@@ -477,23 +477,60 @@ def train_with_curve(
     config: Config,
     device: torch.device,
     evaluation_seed: int,
+    session: resumable.Session | None = None,
+    saved: dict[str, Any] | None = None,
+    state: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> tuple[Agent, torch.optim.Adam, list[dict[str, float]], dict[str, Any]]:
+    """Train the agent, evaluating at each report step. With a `session`, the
+    run can stop after a report step: `state(agent_state)` gives the full run
+    state to save, and `saved` is the agent state of a stopped run."""
     agent, optimizer = build(config, device, memory)
     generator = torch.Generator().manual_seed(config.model.seed)
     history: list[dict[str, float]] = []
-    curve = {}
-    for step in sorted({0, *config.report_steps, config.steps}):
+    curve: dict[str, Any] = {}
+    if saved is not None:
+        agent.load_state_dict(saved["agent"])
+        optimizer.load_state_dict(saved["optimizer"])
+        generator = resumable.restore_generator(saved["generator"])
+        history = saved["history"]
+        curve = saved["curve"]
+        if session is not None:
+            session.restore_global_random_state()
+    report = sorted({0, *config.report_steps, config.steps})
+    for step in report:
         if step > config.steps:
             break
+        if str(step) in curve:
+            continue
         history += train(
             model, agent, optimizer, starts, config, generator, step - len(history)
         )
         curve[str(step)] = evaluate(model, agent, config, evaluation_seed)
+        if session is not None and state is not None:
+            session.boundary(
+                lambda trained=history: state(
+                    {
+                        "agent": agent.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "generator": generator.get_state(),
+                        "history": trained,
+                        "curve": curve,
+                    }
+                )
+            )
     return agent, optimizer, history, curve
 
 
-def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
-    started = time.monotonic()
+def run(
+    config: Config,
+    device: torch.device,
+    output: Path,
+    session: resumable.Session | None = None,
+) -> dict[str, Any]:
+    """Train the frozen world model, then each agent variant. With a
+    `session`, the run can stop after the world model or after any report step
+    of an agent and continue in a later process with identical results."""
+    session = session or resumable.Session(None, None, {})
     seeds = {
         "torch_initialization": config.model.seed,
         "world_model_data": config.model.seed,
@@ -504,7 +541,33 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
         "latent_sampling": config.model.seed + LATENT_SEED_OFFSET,
         "real_evaluation": config.model.seed + EVALUATION_SEED_OFFSET,
     }
-    model, episodes, model_evaluation = train_world_model(config, device)
+    saved = session.load()
+    if saved is None:
+        model, episodes, model_evaluation = train_world_model(config, device)
+        agents: dict[str, Any] = {}
+        in_progress: dict[str, Any] | None = None
+    else:
+        model, _ = world_model.build(config.model, device)
+        model.load_state_dict(saved["world_model"])
+        model.requires_grad_(False)
+        model.eval()
+        episodes = world_model.Episodes(**saved["episodes"])
+        model_evaluation = saved["model_evaluation"]
+        agents = saved["agents"]
+        in_progress = saved["in_progress"]
+        session.restore_global_random_state()
+
+    def state(agent_state: dict[str, Any] | None) -> dict[str, Any]:
+        return {
+            "world_model": model.state_dict(),
+            "episodes": resumable.tensors_of(episodes),
+            "model_evaluation": model_evaluation,
+            "agents": agents,
+            "in_progress": agent_state,
+        }
+
+    if saved is None:
+        session.boundary(lambda: state(None))
     starts = start_states(
         model,
         episodes.to(device),
@@ -519,13 +582,23 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
         torch.Generator().manual_seed(evaluation_seed),
         greedy=False,
     )
-    agents = {}
     variants = (("recurrent_state", True), ("no_memory", False))
     if config.model.kind != "gru":
         variants = variants[:1]
     for name, memory in variants:
+        if name in agents:
+            continue
+        resume = in_progress if in_progress and in_progress["name"] == name else None
         agent, optimizer, history, curve = train_with_curve(
-            model, starts, memory, config, device, evaluation_seed
+            model,
+            starts,
+            memory,
+            config,
+            device,
+            evaluation_seed,
+            session,
+            resume,
+            lambda agent_state, name=name: state(agent_state | {"name": name}),
         )
         checkpoint = output.parent / f"{name}.pt"
         save_checkpoint(checkpoint, config, config.steps, agent, optimizer)
@@ -541,6 +614,7 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
             "evaluation": curve[str(config.steps)],
             "checkpoint": str(checkpoint),
         }
+        in_progress = None
 
     result: dict[str, Any] = {
         "stage": "2e-actor-critic-in-imagination-tmaze",
@@ -566,10 +640,12 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
         "start_states": int(starts.shape[0]),
         "random_policy": random_policy,
         "agents": agents,
-        "duration_seconds": time.monotonic() - started,
+        "duration_seconds": session.elapsed_seconds,
+        "sessions": session.sessions,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    session.finish()
     return result
 
 
@@ -579,6 +655,7 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=Config.steps)
     parser.add_argument("--horizon", type=int, default=Config.horizon)
     world_model.add_world_model_arguments(parser)
+    resumable.add_arguments(parser)
     parser.add_argument("--device", default="cpu", choices=DEVICES)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -598,7 +675,14 @@ def main() -> None:
         / datetime.now(UTC).strftime("stage2e-%Y%m%dT%H%M%S%fZ")
         / "metrics.json"
     )
-    result = run(config, select_device(args.device), output)
+    session = resumable.session_from(
+        args, {"experiment": "actor_critic", "config": asdict(config)}
+    )
+    try:
+        result = run(config, select_device(args.device), output, session)
+    except resumable.Incomplete as stopped:
+        print(stopped)
+        raise SystemExit(resumable.INCOMPLETE_EXIT_CODE) from None
 
     runtime_info = result["runtime"]
     print(

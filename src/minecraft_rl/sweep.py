@@ -21,7 +21,11 @@ The runner limits heat in four ways:
    and the pressure is back at the limit, or after `--max-pause` seconds.
 
 A seed whose `metrics.json` exists is skipped, so the same command resumes an
-interrupted sweep. `--rerun` disables this. On SIGINT or SIGTERM, the runner
+interrupted sweep. `--rerun` disables this. With `--time-budget`, the sweep
+starts no new seed after that many seconds. A resumable experiment (imagination,
+actor-critic, Dreamer loop) then saves its state at its next boundary and exits.
+The same command continues it, with results identical to a run in one process.
+On SIGINT or SIGTERM, the runner
 resumes and then terminates every unfinished seed process. Next to each
 `metrics.json`, it writes `sweep.json` with the settings, the measured pauses
 and the measured temperatures.
@@ -46,10 +50,13 @@ from types import FrameType
 from typing import IO, Any
 
 from minecraft_rl.macos_thermal import THERMAL_LEVELS, CpuTemperature, thermal_pressure
+from minecraft_rl.resumable import INCOMPLETE_EXIT_CODE
 
 TASKPOLICY = Path("/usr/sbin/taskpolicy")
 THERMOSTAT_POLL_SECONDS = 2.0
 TERMINATE_GRACE_SECONDS = 10.0
+STATE_FILE = "state.pt"
+RESUMABLE = ("imagination", "actor_critic", "dreamer_loop")
 EXPERIMENTS = (
     "parity",
     "cue_recall",
@@ -131,6 +138,7 @@ class Settings:
     max_thermal_level: int = 0
     cooldown_seconds: float = 0.0
     max_pause_seconds: float = 120.0
+    time_budget: float | None = None
 
 
 @dataclass
@@ -306,19 +314,60 @@ def sweep_record(
 
 
 def start_seed(
-    experiment: str, seed: int, output_root: Path, extra: list[str]
+    experiment: str,
+    seed: int,
+    output_root: Path,
+    extra: list[str],
+    stop_after: float | None,
 ) -> SeedRun:
+    """Start one seed process. With `stop_after`, a resumable experiment gets
+    its state file and stops at the first boundary after that many seconds."""
     directory = output_root / f"seed{seed}"
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "metrics.json").unlink(missing_ok=True)
-    run_command = command(experiment, seed, directory / "metrics.json", extra)
-    log = (directory / "log.txt").open("wb")
+    resume = []
+    if experiment in RESUMABLE:
+        resume = ["--state", str(directory / STATE_FILE)]
+        if stop_after is not None:
+            resume += ["--stop-after", f"{max(0.0, stop_after):.1f}"]
+    run_command = command(
+        experiment, seed, directory / "metrics.json", [*extra, *resume]
+    )
+    log = (directory / "log.txt").open("ab")
     process = subprocess.Popen(
         run_command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
     )
     return SeedRun(
         seed, run_command, process, log, time.monotonic(), thermal_pressure()
     )
+
+
+def write_record(directory: Path, record: dict[str, Any], complete: bool) -> None:
+    """Write `sweep.json`. A seed that ran in several processes keeps one
+    record per process in `processes`. The top-level fields describe the last
+    process, and the totals cover all of them."""
+    path = directory / "sweep.json"
+    earlier: list[dict[str, Any]] = []
+    if (directory / STATE_FILE).exists() or complete:
+        try:
+            earlier = json.loads(path.read_text(encoding="utf-8")).get("processes", [])
+        except (OSError, ValueError):
+            earlier = []
+        if earlier and earlier[-1].get("complete"):
+            earlier = []
+    processes = [*earlier, record | {"complete": complete}]
+    total = record | {
+        "complete": complete,
+        "processes": processes,
+        "total_wall_seconds": sum(p["wall_seconds"] for p in processes),
+        "total_thermostat_pause_seconds": sum(
+            p["thermostat_pause_seconds"] for p in processes
+        ),
+        "total_thermostat_pause_events": sum(
+            p["thermostat_pause_events"] for p in processes
+        ),
+    }
+    path.write_text(json.dumps(total, indent=2) + "\n", encoding="utf-8")
 
 
 def sweep(
@@ -330,20 +379,46 @@ def sweep(
     thermostat: Thermostat | None = None,
 ) -> dict[int, int]:
     """Run every seed, at most `settings.jobs` at a time. Returns the exit
-    code per seed."""
+    code per seed.
+
+    With `settings.time_budget`, the sweep starts no seed after the budget
+    passes, and a resumable seed saves its state and stops at its first
+    boundary after the budget. The same command continues it later."""
     thermostat = thermostat or Thermostat(settings)
+    started = time.monotonic()
+    budget = settings.time_budget
     pending = list(seeds)
     running: dict[int, SeedRun] = {}
     codes: dict[int, int] = {}
     try:
         while pending or running:
-            if pending and len(running) < settings.jobs:
+            remaining = (
+                None if budget is None else budget - (time.monotonic() - started)
+            )
+            if remaining is not None and remaining <= 0 and not running:
+                print(
+                    f"time budget used; seeds left for the next call: {pending}",
+                    flush=True,
+                )
+                break
+            if (
+                pending
+                and len(running) < settings.jobs
+                and (remaining is None or remaining > 0)
+            ):
                 reading = thermostat.read()
                 if not running and thermostat.too_hot(reading):
                     cool_down([], thermostat, reading)
-            while pending and len(running) < settings.jobs:
-                seed = pending.pop(0)
-                running[seed] = start_seed(experiment, seed, output_root, extra)
+                while pending and len(running) < settings.jobs:
+                    seed = pending.pop(0)
+                    stop_after = (
+                        None
+                        if budget is None
+                        else budget - (time.monotonic() - started)
+                    )
+                    running[seed] = start_seed(
+                        experiment, seed, output_root, extra, stop_after
+                    )
             throttle_period(list(running.values()), settings, thermostat)
             for seed, run in list(running.items()):
                 if run.process.poll() is None:
@@ -351,19 +426,25 @@ def sweep(
                 run.log.close()
                 directory = output_root / f"seed{seed}"
                 record = sweep_record(experiment, run, settings, directory)
-                (directory / "sweep.json").write_text(
-                    json.dumps(record, indent=2) + "\n", encoding="utf-8"
-                )
-                codes[seed] = run.process.returncode
-                status = "done" if run.process.returncode == 0 else "FAILED"
+                code = run.process.returncode
+                paused = code == INCOMPLETE_EXIT_CODE
+                write_record(directory, record, complete=code == 0)
+                del running[seed]
                 mean = record["temperature_mean_celsius"]
+                status = (
+                    "state saved" if paused else ("done" if code == 0 else "FAILED")
+                )
                 print(
-                    f"seed {seed}: {status} (exit {run.process.returncode}, "
+                    f"seed {seed}: {status} (exit {code}, "
                     f"{record['wall_seconds']:.0f} s, mean die temperature "
                     f"{'unknown' if mean is None else f'{mean:.1f} C'})",
                     flush=True,
                 )
-                del running[seed]
+                if paused:
+                    pending.insert(0, seed)
+                    budget = 0.0
+                    continue
+                codes[seed] = code
                 if pending and settings.cooldown_seconds > 0:
                     time.sleep(settings.cooldown_seconds)
     finally:
@@ -436,6 +517,13 @@ def main() -> None:
         action="store_true",
         help="also run seeds whose metrics.json already exists",
     )
+    parser.add_argument(
+        "--time-budget",
+        type=float,
+        help="seconds after which the sweep starts no new seed; a resumable "
+        f"experiment ({', '.join(RESUMABLE)}) saves its state at its next "
+        "boundary and the same command continues it",
+    )
     parser.add_argument("extra", nargs="*", help="arguments after -- go to the run")
     args = parser.parse_args()
     if not TASKPOLICY.exists():
@@ -462,9 +550,13 @@ def main() -> None:
         max_thermal_level=args.max_thermal_level,
         cooldown_seconds=args.cooldown,
         max_pause_seconds=args.max_pause,
+        time_budget=args.time_budget,
     )
     requested = parse_seeds(args.seeds)
     seeds = pending_seeds(requested, args.output_root, args.rerun)
+    if args.rerun:
+        for seed in seeds:
+            (args.output_root / f"seed{seed}" / STATE_FILE).unlink(missing_ok=True)
     if len(seeds) < len(requested):
         skipped = sorted(set(requested) - set(seeds))
         print(f"skipping seeds with existing metrics.json: {skipped}", flush=True)
@@ -477,6 +569,9 @@ def main() -> None:
     failed = sorted(seed for seed, code in codes.items() if code != 0)
     if failed:
         raise SystemExit(f"failed seeds: {failed}")
+    left = sorted(set(seeds) - set(codes))
+    if left:
+        raise SystemExit(f"unfinished seeds, run the same command again: {left}")
 
 
 if __name__ == "__main__":

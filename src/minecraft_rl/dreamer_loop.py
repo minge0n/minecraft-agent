@@ -10,7 +10,6 @@ the policy's own behavior.
 
 import argparse
 import json
-import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,7 +17,7 @@ from typing import Any
 
 import torch
 
-from minecraft_rl import actor_critic, runtime, world_model
+from minecraft_rl import actor_critic, resumable, runtime, world_model
 from minecraft_rl.devices import DEVICES, select_device
 from minecraft_rl.imagination import rollout_errors
 from minecraft_rl.provenance import git_commit
@@ -110,8 +109,15 @@ def concatenate(first: Episodes, second: Episodes) -> Episodes:
     )
 
 
-def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
-    started = time.monotonic()
+def run(
+    config: Config,
+    device: torch.device,
+    output: Path,
+    session: resumable.Session | None = None,
+) -> dict[str, Any]:
+    """The integrated loop. With a `session`, the run can stop after any
+    iteration and continue in a later process with identical results."""
+    session = session or resumable.Session(None, None, {})
     agent_config = config.agent
     model_config = agent_config.model
     seed = model_config.seed
@@ -124,20 +130,50 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
         "latent_sampling": seed + LATENT_SEED_OFFSET,
         "real_evaluation": seed + actor_critic.EVALUATION_SEED_OFFSET,
     }
-    replay = world_model.collect_episodes(
-        model_config, config.initial_episodes, torch.Generator().manual_seed(seed)
-    )
+    saved = session.load()
     model, model_optimizer = world_model.build(model_config, device)
     agent, agent_optimizer = actor_critic.build(agent_config, device)
-    model_generator = torch.Generator().manual_seed(seed)
-    agent_generator = torch.Generator().manual_seed(seed)
-    latent_generator = torch.Generator().manual_seed(seed + LATENT_SEED_OFFSET)
-    collection_generator = torch.Generator().manual_seed(
-        seeds["policy_data_collection"]
-    )
+    if saved is None:
+        replay = world_model.collect_episodes(
+            model_config, config.initial_episodes, torch.Generator().manual_seed(seed)
+        )
+        model_generator = torch.Generator().manual_seed(seed)
+        agent_generator = torch.Generator().manual_seed(seed)
+        latent_generator = torch.Generator().manual_seed(seed + LATENT_SEED_OFFSET)
+        collection_generator = torch.Generator().manual_seed(
+            seeds["policy_data_collection"]
+        )
+        iterations: list[dict[str, Any]] = []
+    else:
+        replay = Episodes(**saved["replay"])
+        model.load_state_dict(saved["model"])
+        model_optimizer.load_state_dict(saved["model_optimizer"])
+        agent.load_state_dict(saved["agent"])
+        agent_optimizer.load_state_dict(saved["agent_optimizer"])
+        model_generator = resumable.restore_generator(saved["model_generator"])
+        agent_generator = resumable.restore_generator(saved["agent_generator"])
+        latent_generator = resumable.restore_generator(saved["latent_generator"])
+        collection_generator = resumable.restore_generator(
+            saved["collection_generator"]
+        )
+        iterations = saved["iterations"]
+        session.restore_global_random_state()
 
-    iterations = []
-    for iteration in range(config.iterations):
+    def state() -> dict[str, Any]:
+        return {
+            "replay": resumable.tensors_of(replay),
+            "model": model.state_dict(),
+            "model_optimizer": model_optimizer.state_dict(),
+            "agent": agent.state_dict(),
+            "agent_optimizer": agent_optimizer.state_dict(),
+            "model_generator": model_generator.get_state(),
+            "agent_generator": agent_generator.get_state(),
+            "latent_generator": latent_generator.get_state(),
+            "collection_generator": collection_generator.get_state(),
+            "iterations": iterations,
+        }
+
+    for iteration in range(len(iterations), config.iterations):
         model_terms: list[dict[str, float]] = []
         model_losses = world_model.train(
             model,
@@ -195,6 +231,8 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
                 "real_transitions_total": int(replay.mask.sum()),
             }
         )
+        if iteration + 1 < config.iterations:
+            session.boundary(state)
 
     world_model.save_checkpoint(
         output.parent / "world_model.pt",
@@ -235,10 +273,12 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
             "world_model": str(output.parent / "world_model.pt"),
             "agent": str(output.parent / "agent.pt"),
         },
-        "duration_seconds": time.monotonic() - started,
+        "duration_seconds": session.elapsed_seconds,
+        "sessions": session.sessions,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    session.finish()
     return result
 
 
@@ -248,6 +288,7 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=Config.iterations)
     parser.add_argument("--entropy", type=float, default=EXPLORATION_ENTROPY)
     world_model.add_world_model_arguments(parser)
+    resumable.add_arguments(parser)
     parser.add_argument("--device", default="cpu", choices=DEVICES)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -269,7 +310,14 @@ def main() -> None:
         / datetime.now(UTC).strftime("stage2f-%Y%m%dT%H%M%S%fZ")
         / "metrics.json"
     )
-    result = run(config, select_device(args.device), output)
+    session = resumable.session_from(
+        args, {"experiment": "dreamer_loop", "config": asdict(config)}
+    )
+    try:
+        result = run(config, select_device(args.device), output, session)
+    except resumable.Incomplete as stopped:
+        print(stopped)
+        raise SystemExit(resumable.INCOMPLETE_EXIT_CODE) from None
 
     runtime_info = result["runtime"]
     print(

@@ -9,7 +9,6 @@ continuations are compared with what actually happened at horizons 1, 5, 10 and
 
 import argparse
 import json
-import time
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,7 +16,7 @@ from typing import Any
 
 import torch
 
-from minecraft_rl import runtime, world_model
+from minecraft_rl import resumable, runtime, world_model
 from minecraft_rl.devices import DEVICES, select_device
 from minecraft_rl.provenance import git_commit
 from minecraft_rl.tmaze import Action, Observation
@@ -203,11 +202,20 @@ def train_and_measure(
     return model, optimizer, curve
 
 
-def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
+def run(
+    config: Config,
+    device: torch.device,
+    output: Path,
+    session: resumable.Session | None = None,
+) -> dict[str, Any]:
     """Three world models on the same budget: the Stage 2C GRU and its no-memory
     control trained on uniform-policy data, and a GRU trained on a half-uniform,
-    half-shifted-policy mixture of the same size (data coverage)."""
-    started = time.monotonic()
+    half-shifted-policy mixture of the same size (data coverage). With a
+    `session`, the run can stop after any trained model and continue in a later
+    process with identical results. Each model starts from its own seeded
+    generators, so the finished models are the only state."""
+    session = session or resumable.Session(None, None, {})
+    saved = session.load()
     model_config = config.model
     seeds = {
         "torch_initialization": model_config.seed,
@@ -260,8 +268,12 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
             "rssm_uniform_data": (True, uniform_training, "rssm"),
             "rssm_mixed_data": (True, mixed_training, "rssm"),
         }
-    models = {}
-    for name, (memory, training, kind) in variants.items():
+    models: dict[str, Any] = {} if saved is None else saved["models"]
+    if saved is not None:
+        session.restore_global_random_state()
+    for index, (name, (memory, training, kind)) in enumerate(variants.items()):
+        if name in models:
+            continue
         variant_config = replace(model_config, kind=kind)
         model, optimizer, curve = train_and_measure(
             memory, config, training, evaluations, device, variant_config
@@ -278,6 +290,8 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
             "curve": curve,
             "final": curve[str(model_config.steps)],
         }
+        if index + 1 < len(variants):
+            session.boundary(lambda: {"models": models})
 
     result: dict[str, Any] = {
         "stage": "2d-imagination-tmaze",
@@ -303,10 +317,12 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
         "next action",
         "models": models,
         "checkpoint_format": world_model.CHECKPOINT_FORMAT,
-        "duration_seconds": time.monotonic() - started,
+        "duration_seconds": session.elapsed_seconds,
+        "sessions": session.sessions,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    session.finish()
     return result
 
 
@@ -315,6 +331,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=world_model.Config.seed)
     parser.add_argument("--steps", type=int, default=world_model.Config.steps)
     world_model.add_world_model_arguments(parser)
+    resumable.add_arguments(parser)
     parser.add_argument("--device", default="cpu", choices=DEVICES)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -332,7 +349,14 @@ def main() -> None:
         / datetime.now(UTC).strftime("stage2d-%Y%m%dT%H%M%S%fZ")
         / "metrics.json"
     )
-    result = run(config, select_device(args.device), output)
+    session = resumable.session_from(
+        args, {"experiment": "imagination", "config": asdict(config)}
+    )
+    try:
+        result = run(config, select_device(args.device), output, session)
+    except resumable.Incomplete as stopped:
+        print(stopped)
+        raise SystemExit(resumable.INCOMPLETE_EXIT_CODE) from None
 
     runtime_info = result["runtime"]
     print(
