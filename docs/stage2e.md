@@ -53,6 +53,8 @@ actor loss  = -mean_t w_t [ log pi(a_t | s_t) sg(R_t - v(s_t)) + eta H(pi(. | s_
 
 ## Results (macOS arm64, Python 3.12.11, PyTorch 2.14.0, CPU, about 25 s per seed alone)
 
+Canonical runtime check (`docs/decisions/reproducibility.md`): the run was repeated for seeds 0-9 with one intra-op and one inter-op thread, twice per seed in separate processes. Both repetitions and the numbers in this section agree for every seed, including the seed 0 exploitation.
+
 The frozen world model reaches 100% held-out turn-reward sign accuracy for every seed. The uniform random policy succeeds in 48-55% of real episodes (return -0.04 to +0.11).
 
 Seed 1, recurrent agent, real maze with greedy actions:

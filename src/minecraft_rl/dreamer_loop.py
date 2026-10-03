@@ -10,7 +10,6 @@ the policy's own behavior.
 
 import argparse
 import json
-import platform
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -19,7 +18,7 @@ from typing import Any
 
 import torch
 
-from minecraft_rl import actor_critic, world_model
+from minecraft_rl import actor_critic, runtime, world_model
 from minecraft_rl.devices import DEVICES, select_device
 from minecraft_rl.imagination import rollout_errors
 from minecraft_rl.provenance import git_commit
@@ -207,7 +206,7 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
         "config": asdict(config),
         "seeds": seeds,
         "device": str(device),
-        "versions": {"python": platform.python_version(), "torch": torch.__version__},
+        "runtime": runtime.metadata(device),
         "environment": {
             "name": "TMaze",
             "observations": {o.name: int(o) for o in Observation},
@@ -240,6 +239,7 @@ def main() -> None:
     parser.add_argument("--device", default="cpu", choices=DEVICES)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    runtime.configure(args.seed)
     if args.iterations < 1:
         parser.error("--iterations must be positive")
     config = Config(
@@ -256,7 +256,11 @@ def main() -> None:
     )
     result = run(config, select_device(args.device), output)
 
-    print(f"Device {result['device']}, torch {result['versions']['torch']}")
+    runtime_info = result["runtime"]
+    print(
+        f"Device {result['device']}, torch {runtime_info['versions']['torch']}, "
+        f"threads {runtime_info['intra_op_threads']}+{runtime_info['inter_op_threads']}"
+    )
     print(
         f"World model {result['parameters']['world_model']} parameters, "
         f"agent {result['parameters']['agent']}"

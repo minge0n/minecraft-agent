@@ -10,7 +10,6 @@ same prediction heads must fail exactly there.
 
 import argparse
 import json
-import platform
 import time
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
@@ -21,6 +20,7 @@ from typing import Any, Protocol
 import torch
 from torch import nn
 
+from minecraft_rl import runtime
 from minecraft_rl.devices import DEVICES, select_device
 from minecraft_rl.provenance import git_commit
 from minecraft_rl.tmaze import Action, Cue, Observation, TMaze
@@ -628,7 +628,7 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
             "minibatch_sampling": config.seed,
         },
         "device": str(device),
-        "versions": {"python": platform.python_version(), "torch": torch.__version__},
+        "runtime": runtime.metadata(device),
         "environment": {
             "name": "TMaze",
             "observations": {o.name: int(o) for o in Observation},
@@ -689,6 +689,7 @@ def main() -> None:
     parser.add_argument("--device", default="cpu", choices=DEVICES)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    runtime.configure(args.seed)
     if args.steps < 1 or args.corridor_length < 1:
         parser.error("--steps and --corridor-length must be positive")
     config = Config(
@@ -705,7 +706,11 @@ def main() -> None:
     )
     result = run(config, select_device(args.device), output)
 
-    print(f"Device {result['device']}, torch {result['versions']['torch']}")
+    runtime_info = result["runtime"]
+    print(
+        f"Device {result['device']}, torch {runtime_info['versions']['torch']}, "
+        f"threads {runtime_info['intra_op_threads']}+{runtime_info['inter_op_threads']}"
+    )
     print(
         f"Model {result['model']['architecture']}, "
         f"{result['model']['parameters']} parameters "

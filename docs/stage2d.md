@@ -44,6 +44,8 @@ Unit tests: `tests/test_imagination.py` (about 1.5 s): first-step equality with 
 
 ## Results (macOS arm64, Python 3.12.11, PyTorch 2.14.0, CPU, about 28 s per seed alone)
 
+Canonical runtime check (`docs/decisions/reproducibility.md`): the run was repeated for seeds 0-9 with one intra-op and one inter-op thread, twice per seed in separate processes. Both repetitions and the ranges in this section agree for every seed.
+
 Ranges over seeds 0-9 after 5,000 steps.
 
 | Evaluation | Model | k | Observation acc. | Return abs. error | Non-turn reward abs. error | Turn sign acc. |

@@ -70,6 +70,8 @@ Unit tests: `tests/test_world_model.py` (about 1.6 s on CPU, part of `./scripts/
 
 ## Results (macOS arm64, Python 3.12.11, PyTorch 2.14.0, CPU, about 14 s per seed alone)
 
+Canonical runtime check (`docs/decisions/reproducibility.md`): the run was repeated for seeds 0-9 with one intra-op and one inter-op thread, twice per seed in separate processes. Both repetitions and the numbers in this section agree for every seed. These results did not depend on the thread count.
+
 Seed 0, held-out episodes (4,090 transitions, 256 junction turns, 256 junction arrivals), GRU | no-memory control:
 
 | Step | Total loss | Observation accuracy | Turn reward squared error | Turn reward sign accuracy | Junction arrival accuracy |

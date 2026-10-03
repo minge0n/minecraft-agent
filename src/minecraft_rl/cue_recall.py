@@ -10,7 +10,6 @@ way and must stay at 50%.
 
 import argparse
 import json
-import platform
 import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -20,6 +19,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from minecraft_rl import runtime
 from minecraft_rl.devices import DEVICES, select_device
 from minecraft_rl.provenance import git_commit
 
@@ -250,7 +250,7 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
         "config": asdict(config),
         "seed_torch": config.seed,
         "device": str(device),
-        "versions": {"python": platform.python_version(), "torch": torch.__version__},
+        "runtime": runtime.metadata(device),
         "task": {
             "tokens": {
                 "cue_a": CUE_A,
@@ -317,6 +317,7 @@ def main() -> None:
     parser.add_argument("--device", default="cpu", choices=DEVICES)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    runtime.configure(args.seed)
     if args.steps < 1 or args.max_delay < Config.min_delay:
         parser.error("--steps must be positive and --max-delay at least 1")
     config = Config(
@@ -330,7 +331,11 @@ def main() -> None:
     )
     result = run(config, select_device(args.device), output)
 
-    print(f"Device {result['device']}, torch {result['versions']['torch']}")
+    runtime_info = result["runtime"]
+    print(
+        f"Device {result['device']}, torch {runtime_info['versions']['torch']}, "
+        f"threads {runtime_info['intra_op_threads']}+{runtime_info['inter_op_threads']}"
+    )
     print(
         f"Model {result['model']['architecture']}, "
         f"{result['model']['parameters']} parameters"

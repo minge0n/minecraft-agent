@@ -9,7 +9,6 @@ continuations are compared with what actually happened at horizons 1, 5, 10 and
 
 import argparse
 import json
-import platform
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -18,7 +17,7 @@ from typing import Any
 
 import torch
 
-from minecraft_rl import world_model
+from minecraft_rl import runtime, world_model
 from minecraft_rl.devices import DEVICES, select_device
 from minecraft_rl.provenance import git_commit
 from minecraft_rl.tmaze import Action, Observation
@@ -267,7 +266,7 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
         "config": asdict(config),
         "seeds": seeds,
         "device": str(device),
-        "versions": {"python": platform.python_version(), "torch": torch.__version__},
+        "runtime": runtime.metadata(device),
         "environment": {
             "name": "TMaze",
             "observations": {o.name: int(o) for o in Observation},
@@ -298,6 +297,7 @@ def main() -> None:
     parser.add_argument("--device", default="cpu", choices=DEVICES)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    runtime.configure(args.seed)
     if args.steps < 1:
         parser.error("--steps must be positive")
     config = Config(model=world_model.Config(seed=args.seed, steps=args.steps))
@@ -309,7 +309,11 @@ def main() -> None:
     )
     result = run(config, select_device(args.device), output)
 
-    print(f"Device {result['device']}, torch {result['versions']['torch']}")
+    runtime_info = result["runtime"]
+    print(
+        f"Device {result['device']}, torch {runtime_info['versions']['torch']}, "
+        f"threads {runtime_info['intra_op_threads']}+{runtime_info['inter_op_threads']}"
+    )
     for name, data in result["evaluation_data"].items():
         print(
             f"Evaluation {name}: {data['episodes']} episodes, mean length "
