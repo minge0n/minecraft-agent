@@ -9,6 +9,8 @@ from minecraft_rl.rssm import (
     RSSM,
     categorical_entropy,
     categorical_kl,
+    categorical_kl_per_variable,
+    first_cue_states,
     kl_loss,
     sample_one_hot,
 )
@@ -247,3 +249,57 @@ def test_checkpoint_round_trip_and_resume(tmp_path):
     assert step == 10
     for a, b in zip(uninterrupted.parameters(), restored.parameters(), strict=True):
         assert torch.equal(a, b)
+
+
+def test_first_cue_state_is_the_first_cue_observation():
+    observations = torch.tensor(
+        [
+            [Observation.CUE_LEFT, Observation.CORRIDOR, Observation.CUE_LEFT],
+            [Observation.CORRIDOR, Observation.CUE_RIGHT, Observation.CORRIDOR],
+            [Observation.CORRIDOR, Observation.CORRIDOR, Observation.CORRIDOR],
+        ]
+    )
+    valid = torch.ones_like(observations, dtype=torch.bool)
+    expected = torch.tensor(
+        [[True, False, False], [False, True, False], [False, False, False]]
+    )
+    assert torch.equal(first_cue_states(observations, valid), expected)
+
+
+def test_per_variable_kl_sums_to_the_total_kl():
+    q, p = torch.randn(5, 8, 4), torch.randn(5, 8, 4)
+    assert torch.allclose(
+        categorical_kl_per_variable(q, p).sum(-1), categorical_kl(q, p)
+    )
+
+
+def test_diagnostics_report_the_free_nats_effect_and_latent_use(trained):
+    latent = trained.diagnostics(
+        episodes(FAST.evaluation_episodes, seed=1), torch.Generator().manual_seed(0)
+    )
+    assert (
+        latent["kl_posterior_part_effective"]
+        >= max(FAST.free_nats, latent["kl_mean"]) - 1e-6
+    )
+    assert latent["kl_loss_effective"] >= latent["kl_mean"]
+    assert len(latent["kl_per_variable_cue_step"]) == FAST.latent_variables
+    assert sum(latent["kl_per_variable_cue_step"]) == pytest.approx(
+        latent["kl_cue_step"], rel=1e-4
+    )
+    assert 1 <= latent["active_variables"] <= FAST.latent_variables
+    assert 1.0 <= latent["class_perplexity_mean"] <= FAST.latent_classes
+    assert 0.0 <= latent["prior_posterior_agreement"] <= 1.0
+    intervention = latent["cue_from_prior"]
+    assert intervention["reward_sign_accuracy_posterior"] > 0.95
+    assert intervention["reward_sign_accuracy_cue_from_prior"] < 0.9
+
+
+def test_diagnostics_do_not_change_the_callers_random_numbers(trained):
+    data = episodes(32, seed=2)
+    first = torch.Generator().manual_seed(5)
+    trained.diagnostics(data, first)
+    second = torch.Generator().manual_seed(5)
+    observations, _ = trained._states(data)
+    trained.filter(observations, data.actions, second)
+    trained.training_losses(data, second)
+    assert torch.equal(torch.rand(3, generator=first), torch.rand(3, generator=second))

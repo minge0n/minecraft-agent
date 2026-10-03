@@ -32,6 +32,7 @@ import torch
 from minecraft_rl import runtime, world_model
 from minecraft_rl.devices import DEVICES, select_device
 from minecraft_rl.provenance import git_commit
+from minecraft_rl.rssm import RSSM
 from minecraft_rl.tmaze import Action, Observation
 from minecraft_rl.world_model import DynamicsModel, Episodes
 
@@ -73,7 +74,12 @@ def signal_distribution(
     One open-loop rollout per probe episode: each imagines its own signal at
     the first step, then the turn reward at the end. For a model that keeps
     each imagined future consistent, the reward is near +1 after an imagined
-    left signal and near -1 after a right one."""
+    left signal and near -1 after a right one.
+
+    `given_observed_signal` repeats the rollout after the model reads the real
+    signal observation: the reward then depends on a signal that the model saw,
+    not on one that it sampled. The true turn-left reward is +1 after a left
+    signal and -1 after a right signal."""
     probe = probe_episodes(config, rollouts)
     turn_index = config.corridor_length + 2
     with torch.no_grad():
@@ -88,21 +94,114 @@ def signal_distribution(
     consistent = (torch.sign(turn_reward) == expected_sign) & (
         left_signal | right_signal
     )
-    return {
+    p = config.signal_left_probability
+    probability_left = signal_probability[:, Observation.CUE_LEFT].mean().item()
+    result: dict[str, Any] = {
         "rollouts": rollouts,
-        "one_step_probability_cue_left": signal_probability[:, Observation.CUE_LEFT]
-        .mean()
-        .item(),
+        "one_step_probability_cue_left": probability_left,
         "one_step_probability_cue_right": signal_probability[:, Observation.CUE_RIGHT]
         .mean()
         .item(),
+        "one_step_probability_error": abs(probability_left - p),
         "imagined_fraction_cue_left": left_signal.float().mean().item(),
         "imagined_fraction_cue_right": right_signal.float().mean().item(),
         "turn_reward_mean": turn_reward.mean().item(),
+        "turn_reward_mean_error": turn_reward.mean().item() - (2 * p - 1),
         "turn_reward_fraction_positive": (turn_reward > 0).float().mean().item(),
         "turn_reward_mean_given_cue_left": masked_mean(turn_reward, left_signal),
         "turn_reward_mean_given_cue_right": masked_mean(turn_reward, right_signal),
+        "turn_reward_positive_given_cue_left": masked_mean(
+            (turn_reward > 0).float(), left_signal
+        ),
+        "turn_reward_positive_given_cue_right": masked_mean(
+            (turn_reward > 0).float(), right_signal
+        ),
         "signal_consistent_fraction": consistent.float().mean().item(),
+        "given_observed_signal": observed_signal_rollouts(
+            model, config, rollouts, generator
+        ),
+    }
+    if isinstance(model, RSSM):
+        result["prior_signal_codes"] = prior_signal_codes(
+            model, config, rollouts, generator
+        )
+    return result
+
+
+def observed_signal_probe(
+    config: world_model.Config, count: int, signal: Observation
+) -> Episodes:
+    probe = probe_episodes(config, count)
+    probe.observations[:, 1] = signal
+    return probe
+
+
+def observed_signal_rollouts(
+    model: DynamicsModel,
+    config: world_model.Config,
+    rollouts: int,
+    generator: torch.Generator,
+) -> dict[str, float]:
+    """Mean imagined turn-left reward and its share of positive values after
+    the model reads the real signal o_1, then rolls forward open loop."""
+    turn_offset = config.corridor_length + 1
+    result = {}
+    for signal in (Observation.CUE_LEFT, Observation.CUE_RIGHT):
+        probe = observed_signal_probe(config, rollouts, signal)
+        with torch.no_grad():
+            imagined = model.open_loop(probe, 1, turn_offset + 1, generator)
+        reward = imagined.reward[:, turn_offset]
+        name = signal.name.lower()
+        result[f"turn_reward_mean_{name}"] = reward.mean().item()
+        result[f"turn_reward_positive_{name}"] = (reward > 0).float().mean().item()
+    return result
+
+
+def prior_signal_codes(
+    model: RSSM,
+    config: world_model.Config,
+    rollouts: int,
+    generator: torch.Generator,
+) -> dict[str, Any]:
+    """Do prior samples at the signal step look like a real signal code?
+
+    The posterior code of a signal is the most likely class of each latent
+    variable after the model reads that signal. A variable is cue-coding when
+    the two codes differ there. The prior samples each variable independently.
+    If the cue is spread over several variables, a prior sample can mix the
+    left code in one variable with the right code in another: a code that no
+    real signal produces. This measures how often that happens."""
+    codes = {}
+    with torch.no_grad():
+        for signal in (Observation.CUE_LEFT, Observation.CUE_RIGHT):
+            probe = observed_signal_probe(config, 1, signal)
+            filtered = model.filter(
+                probe.observations[:, :2], probe.actions[:, :1], generator
+            )
+            codes[signal] = filtered["posterior"][0, 1].argmax(-1)
+        probe = probe_episodes(config, rollouts)
+        filtered = model.filter(
+            probe.observations[:, :1], probe.actions[:, :0], generator
+        )
+        h = model.transition(
+            filtered["h"][:, 0], filtered["z"][:, 0], probe.actions[:, 0]
+        )
+        prior = model.prior_logits(h)
+        samples = model.latent(prior, generator).unflatten(
+            -1, (model.variables, model.classes)
+        )
+    sampled = samples.argmax(-1)
+    left, right = codes[Observation.CUE_LEFT], codes[Observation.CUE_RIGHT]
+    coding = left != right
+    if not coding.any():
+        return {"cue_coding_variables": 0}
+    matches_left = (sampled[:, coding] == left[coding]).all(-1)
+    matches_right = (sampled[:, coding] == right[coding]).all(-1)
+    return {
+        "cue_coding_variables": int(coding.sum()),
+        "fraction_left_code": matches_left.float().mean().item(),
+        "fraction_right_code": matches_right.float().mean().item(),
+        "fraction_mixed_code": (~matches_left & ~matches_right).float().mean().item(),
     }
 
 

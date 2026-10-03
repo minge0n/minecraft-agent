@@ -16,11 +16,12 @@ observations.
 """
 
 import math
+from typing import Any
 
 import torch
 from torch import nn
 
-from minecraft_rl.tmaze import Observation
+from minecraft_rl.tmaze import Action, Observation
 from minecraft_rl.world_model import (
     ACTIONS,
     OBSERVATIONS,
@@ -29,6 +30,8 @@ from minecraft_rl.world_model import (
     Predictions,
     stack_predictions,
 )
+
+CUE_INTERVENTION_SEED = 7_000_000
 
 
 def sample_one_hot(
@@ -56,13 +59,20 @@ def sample_one_hot(
     return sample + probabilities - probabilities.detach()
 
 
+def categorical_kl_per_variable(
+    posterior_logits: torch.Tensor, prior_logits: torch.Tensor
+) -> torch.Tensor:
+    """KL(q || p) of each of the V latent variables, shape (..., V)."""
+    log_q = torch.log_softmax(posterior_logits, -1)
+    log_p = torch.log_softmax(prior_logits, -1)
+    return (log_q.exp() * (log_q - log_p)).sum(-1)
+
+
 def categorical_kl(
     posterior_logits: torch.Tensor, prior_logits: torch.Tensor
 ) -> torch.Tensor:
     """KL(q || p) summed over the V latent variables, shape (...)."""
-    log_q = torch.log_softmax(posterior_logits, -1)
-    log_p = torch.log_softmax(prior_logits, -1)
-    return (log_q.exp() * (log_q - log_p)).sum((-1, -2))
+    return categorical_kl_per_variable(posterior_logits, prior_logits).sum(-1)
 
 
 def kl_loss(
@@ -89,6 +99,21 @@ def categorical_entropy(logits: torch.Tensor) -> torch.Tensor:
     """Entropy summed over the V latent variables, shape (...)."""
     log_q = torch.log_softmax(logits, -1)
     return -(log_q.exp() * log_q).sum((-1, -2))
+
+
+def first_cue_states(observations: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Mask (episodes, K + 1) of the first valid state of each episode whose
+    observation is a cue. In the T-maze this is k = 0. In the signal T-maze it
+    is the state where the drawn signal appears, if the episode reaches it."""
+    cue = valid & (
+        (observations == Observation.CUE_LEFT) | (observations == Observation.CUE_RIGHT)
+    )
+    first = cue & (cue.long().cumsum(1) == 1)
+    return first
+
+
+def mean_or_nan(values: torch.Tensor) -> float:
+    return values.mean().item() if values.numel() else float("nan")
 
 
 class RSSM(nn.Module):
@@ -160,10 +185,15 @@ class RSSM(nn.Module):
         actions: torch.Tensor,
         generator: torch.Generator | None,
         straight_through: bool = False,
+        prior_at: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Posterior states for o_0 .. o_K (batch, K + 1) and a_0 .. a_{K-1}
         (batch, K): h (batch, K + 1, H), sampled z (batch, K + 1, V K), and the
-        prior and posterior logits (batch, K + 1, V, K)."""
+        prior and posterior logits (batch, K + 1, V, K).
+
+        `prior_at` (batch, K + 1) is an evaluation intervention: at the marked
+        states, z is sampled from the prior instead of the posterior, so the
+        observation there cannot enter the latent state."""
         batch, length = observations.shape
         h = torch.zeros(batch, self.hidden, device=observations.device)
         hs, zs, priors, posteriors = [], [], [], []
@@ -172,10 +202,13 @@ class RSSM(nn.Module):
                 h = self.transition(h, zs[-1], actions[:, k - 1])
             prior = self.prior_logits(h)
             posterior = self.posterior_logits(h, observations[:, k])
+            source = posterior
+            if prior_at is not None:
+                source = torch.where(prior_at[:, k, None, None], prior, posterior)
             if straight_through:
-                z = sample_one_hot(posterior, generator, True).flatten(-2)
+                z = sample_one_hot(source, generator, True).flatten(-2)
             else:
-                z = self.latent(posterior, generator)
+                z = self.latent(source, generator)
             hs.append(h)
             zs.append(z)
             priors.append(prior)
@@ -255,32 +288,54 @@ class RSSM(nn.Module):
 
     def diagnostics(
         self, episodes: Episodes, generator: torch.Generator | None
-    ) -> dict[str, float]:
-        """Latent statistics on valid states (nats). The cue step is k = 0, the
-        only state whose observation the prior cannot predict; one bit of cue
-        costs at least ln 2 = 0.693 nats of KL there.
+    ) -> dict[str, Any]:
+        """Latent statistics on valid states (nats). The cue step is the first
+        state of each episode that shows a cue: k = 0 in the T-maze, the state
+        where the drawn signal appears in the signal T-maze. Its observation is
+        the only one the prior cannot predict. One bit of cue costs at least
+        ln 2 = 0.693 nats of KL there.
 
-        - kl_*: plain KL(q || p). The dynamics part KL(sg(q) || p) and the
-          representation part KL(q || sg(p)) have the same value; they differ
-          only in which network gets the gradient.
+        - kl_*: plain KL(q || p) before the free-nats threshold. The dynamics
+          part KL(sg(q) || p) and the representation part KL(q || sg(p)) have
+          the same value. They differ only in which network gets the gradient.
+        - kl_loss_effective: the KL term that the loss uses, after the
+          threshold. kl_posterior_part_effective is its posterior part,
+          max(free_nats, KL).
         - below_free_nats_fraction: share of states whose KL is below
           `free_nats`. Those states give the posterior no KL gradient.
+        - kl_per_variable_*: mean KL of each of the V variables.
+          active_variables counts variables with a mean KL above 0.01 nats.
         - classes_used: number of (variable, class) pairs that are the most
           likely posterior class in at least one valid state, out of V K.
-          Low values mean unused stochastic capacity.
+          class_perplexity_mean is exp(entropy) of the class frequency of each
+          variable over all valid states, averaged over variables (1 to K).
+        - prior_posterior_agreement*: share of (state, variable) pairs where
+          the most likely prior class equals the most likely posterior class.
         - cue_coding_variables: variables whose most frequent posterior class
-          at the first step differs between the two cues; -1 when the first
-          observation never shows both cues (the Stage 2H signal T-maze).
+          at the cue step differs between the two cues, -1 without both cues.
+        - cue_from_prior: the junction-turn reward sign accuracy when the
+          latent at the cue step is sampled from the prior instead of the
+          posterior. Near 0.5 means that the cue reaches the reward only
+          through z at the cue step. It uses its own generator, so it does not
+          change the random numbers of the caller.
         """
         observations, valid = self._states(episodes)
         with torch.no_grad():
             filtered = self.filter(observations, episodes.actions, generator)
             terms = self.training_losses(episodes, generator)
-        kl = categorical_kl(filtered["posterior"], filtered["prior"])
-        prior_entropy = categorical_entropy(filtered["prior"])
-        posterior_entropy = categorical_entropy(filtered["posterior"])
-        cue = torch.zeros_like(valid)
-        cue[:, 0] = valid[:, 0]
+        prior_logits, posterior_logits = filtered["prior"], filtered["posterior"]
+        kl_variables = categorical_kl_per_variable(posterior_logits, prior_logits)
+        kl = kl_variables.sum(-1)
+        regularizer = kl_loss(
+            posterior_logits,
+            prior_logits,
+            self.kl_prior_scale,
+            self.kl_posterior_scale,
+            self.free_nats,
+        )
+        prior_entropy = categorical_entropy(prior_logits)
+        posterior_entropy = categorical_entropy(posterior_logits)
+        cue = first_cue_states(observations, valid)
         later = valid & ~cue
         reconstruction = nn.functional.cross_entropy(
             self.predict(
@@ -289,44 +344,93 @@ class RSSM(nn.Module):
             observations,
             reduction="none",
         )
-        codes = filtered["posterior"][:, 0].argmax(-1)
-        cue_right = episodes.observations[:, 0] == Observation.CUE_RIGHT
-        cue_left = episodes.observations[:, 0] == Observation.CUE_LEFT
         cue_coding = -1
-        if cue_right.any() and cue_left.any():
-            left_code = codes[cue_left].mode(0).values
-            right_code = codes[cue_right].mode(0).values
+        has_cue = cue.any(1)
+        cue_codes = posterior_logits[cue].argmax(-1)
+        cue_seen = observations[cue]
+        cue_left = cue_seen == Observation.CUE_LEFT
+        cue_right = cue_seen == Observation.CUE_RIGHT
+        if cue_left.any() and cue_right.any():
+            left_code = cue_codes[cue_left].mode(0).values
+            right_code = cue_codes[cue_right].mode(0).values
             cue_coding = int((left_code != right_code).sum())
-        winners = nn.functional.one_hot(
-            filtered["posterior"][valid].argmax(-1), self.classes
-        )
+        posterior_class = posterior_logits[valid].argmax(-1)
+        winners = nn.functional.one_hot(posterior_class, self.classes)
+        frequency = winners.float().mean(0)
+        perplexity = torch.exp(-(frequency * frequency.clamp(min=1e-12).log()).sum(-1))
+        agreement = prior_logits.argmax(-1) == posterior_logits.argmax(-1)
         return {
             "reconstruction_loss": terms["reconstruction"].item(),
             "reward_loss": terms["reward"].item(),
             "continuation_loss": terms["continuation"].item(),
-            "reconstruction_loss_cue_step": reconstruction[cue].mean().item(),
+            "reconstruction_loss_cue_step": mean_or_nan(reconstruction[cue]),
             "kl_mean": kl[valid].mean().item(),
-            "kl_cue_step": kl[cue].mean().item(),
-            "kl_later_steps": kl[later].mean().item(),
-            "kl_later_steps_max": kl[later].max().item(),
+            "kl_cue_step": mean_or_nan(kl[cue]),
+            "kl_later_steps": mean_or_nan(kl[later]),
+            "kl_later_steps_max": kl[later].max().item() if later.any() else 0.0,
+            "kl_loss_effective": regularizer[valid].mean().item(),
+            "kl_posterior_part_effective": kl[valid]
+            .clamp(min=self.free_nats)
+            .mean()
+            .item(),
             "free_nats": self.free_nats,
             "below_free_nats_fraction": (kl[valid] < self.free_nats)
             .float()
             .mean()
             .item(),
-            "below_free_nats_fraction_cue_step": (kl[cue] < self.free_nats)
-            .float()
-            .mean()
-            .item(),
-            "prior_entropy_cue_step": prior_entropy[cue].mean().item(),
-            "prior_entropy_later_steps": prior_entropy[later].mean().item(),
+            "below_free_nats_fraction_cue_step": mean_or_nan(
+                (kl[cue] < self.free_nats).float()
+            ),
+            "below_free_nats_fraction_later_steps": mean_or_nan(
+                (kl[later] < self.free_nats).float()
+            ),
+            "kl_per_variable_cue_step": kl_variables[cue].mean(0).tolist()
+            if cue.any()
+            else [],
+            "kl_per_variable_all_steps": kl_variables[valid].mean(0).tolist(),
+            "active_variables": int((kl_variables[valid].mean(0) > 0.01).sum()),
+            "prior_entropy_cue_step": mean_or_nan(prior_entropy[cue]),
+            "prior_entropy_later_steps": mean_or_nan(prior_entropy[later]),
             "posterior_entropy_mean": posterior_entropy[valid].mean().item(),
-            "posterior_entropy_cue_step": posterior_entropy[cue].mean().item(),
+            "posterior_entropy_cue_step": mean_or_nan(posterior_entropy[cue]),
             "maximum_entropy": self.variables * math.log(self.classes),
             "classes_used": int(winners.amax(0).sum()),
             "classes_total": self.latent_size,
+            "class_perplexity_mean": perplexity.mean().item(),
+            "prior_posterior_agreement": agreement[valid].float().mean().item(),
+            "prior_posterior_agreement_cue_step": mean_or_nan(agreement[cue].float()),
+            "episodes_with_cue": int(has_cue.sum()),
             "cue_coding_variables": cue_coding,
+            "cue_from_prior": self.cue_from_prior(episodes, observations, cue),
         }
+
+    def cue_from_prior(
+        self, episodes: Episodes, observations: torch.Tensor, cue: torch.Tensor
+    ) -> dict[str, float]:
+        """Junction-turn reward sign accuracy of the posterior states, with the
+        normal posterior latent and with a prior latent at the cue step."""
+        turn = (
+            episodes.mask
+            & (episodes.observations == Observation.JUNCTION)
+            & (episodes.actions != Action.FORWARD)
+        )
+        if not turn.any():
+            return {"turns": 0}
+        result: dict[str, float] = {"turns": int(turn.sum())}
+        for name, prior_at in (("posterior", None), ("cue_from_prior", cue)):
+            with torch.no_grad():
+                filtered = self.filter(
+                    observations,
+                    episodes.actions,
+                    torch.Generator().manual_seed(CUE_INTERVENTION_SEED),
+                    prior_at=prior_at,
+                )
+                reward = self.predict(
+                    torch.cat([filtered["h"], filtered["z"]], -1)
+                ).reward[:, 1:]
+            correct = (reward[turn] > 0) == (episodes.rewards[turn] > 0)
+            result[f"reward_sign_accuracy_{name}"] = correct.float().mean().item()
+        return result
 
     def one_step(
         self, episodes: Episodes, generator: torch.Generator | None
