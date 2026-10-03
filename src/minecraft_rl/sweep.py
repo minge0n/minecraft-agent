@@ -35,6 +35,7 @@ EXPERIMENTS = (
     "imagination",
     "actor_critic",
     "dreamer_loop",
+    "stochastic_world",
 )
 
 

@@ -26,6 +26,7 @@ from minecraft_rl.tmaze import Action, Cue, Observation, TMaze
 from minecraft_rl.world_model import DynamicsModel, Episodes
 
 COLLECTION_SEED_OFFSET = 5_000_000
+LATENT_SEED_OFFSET = 6_000_000
 EXPLORATION_ENTROPY = 0.03
 
 
@@ -120,6 +121,7 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
         "world_model_minibatches": seed,
         "imagination_sampling": seed,
         "policy_data_collection": seed + COLLECTION_SEED_OFFSET,
+        "latent_sampling": seed + LATENT_SEED_OFFSET,
         "real_evaluation": seed + actor_critic.EVALUATION_SEED_OFFSET,
     }
     replay = world_model.collect_episodes(
@@ -129,12 +131,14 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
     agent, agent_optimizer = actor_critic.build(agent_config, device)
     model_generator = torch.Generator().manual_seed(seed)
     agent_generator = torch.Generator().manual_seed(seed)
+    latent_generator = torch.Generator().manual_seed(seed + LATENT_SEED_OFFSET)
     collection_generator = torch.Generator().manual_seed(
         seeds["policy_data_collection"]
     )
 
     iterations = []
     for iteration in range(config.iterations):
+        model_terms: list[dict[str, float]] = []
         model_losses = world_model.train(
             model,
             model_optimizer,
@@ -143,8 +147,9 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
             device,
             model_generator,
             config.world_model_updates,
+            model_terms,
         )
-        starts = actor_critic.start_states(model, replay.to(device))
+        starts = actor_critic.start_states(model, replay.to(device), latent_generator)
         agent_history = actor_critic.train(
             model,
             agent,
@@ -167,8 +172,13 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
         )
         on_policy = collected.to(device)
         model_error_on_new_data = {
-            "one_step": world_model.evaluate(model, on_policy, device),
-            "imagined": rollout_errors(model, on_policy, config.horizons),
+            "one_step": world_model.evaluate(
+                model, on_policy, device, latent_generator
+            ),
+            "imagined": rollout_errors(
+                model, on_policy, config.horizons, latent_generator
+            ),
+            "latent": model.diagnostics(on_policy, latent_generator),
         }
         replay = concatenate(replay, collected)
 
@@ -176,6 +186,7 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
             {
                 "iteration": iteration,
                 "world_model_final_loss": model_losses[-1],
+                "world_model_training_terms": world_model.mean_terms(model_terms),
                 "actor_critic_final": agent_history[-1],
                 "evaluation": evaluation,
                 "collected": world_model.dataset_summary(collected),
@@ -236,6 +247,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=world_model.Config.seed)
     parser.add_argument("--iterations", type=int, default=Config.iterations)
     parser.add_argument("--entropy", type=float, default=EXPLORATION_ENTROPY)
+    world_model.add_world_model_arguments(parser)
     parser.add_argument("--device", default="cpu", choices=DEVICES)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -244,7 +256,10 @@ def main() -> None:
         parser.error("--iterations must be positive")
     config = Config(
         agent=actor_critic.Config(
-            model=world_model.Config(seed=args.seed), entropy=args.entropy
+            model=world_model.Config(
+                seed=args.seed, **world_model.world_model_options(args)
+            ),
+            entropy=args.entropy,
         ),
         iterations=args.iterations,
     )
@@ -262,7 +277,8 @@ def main() -> None:
         f"threads {runtime_info['intra_op_threads']}+{runtime_info['inter_op_threads']}"
     )
     print(
-        f"World model {result['parameters']['world_model']} parameters, "
+        f"World model {config.agent.model.kind} "
+        f"{result['parameters']['world_model']} parameters, "
         f"agent {result['parameters']['agent']}"
     )
     longest = str(max(config.horizons))

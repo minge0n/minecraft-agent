@@ -10,7 +10,7 @@ continuations are compared with what actually happened at horizons 1, 5, 10 and
 import argparse
 import json
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -21,11 +21,12 @@ from minecraft_rl import runtime, world_model
 from minecraft_rl.devices import DEVICES, select_device
 from minecraft_rl.provenance import git_commit
 from minecraft_rl.tmaze import Action, Observation
-from minecraft_rl.world_model import Episodes, WorldModel
+from minecraft_rl.world_model import DynamicsModel, Episodes
 
 EVALUATION_DATA_SEED_OFFSET = 1_000_000
 SHIFTED_DATA_SEED_OFFSET = 2_000_000
 SHIFTED_TRAINING_DATA_SEED_OFFSET = 3_000_000
+LATENT_SEED_OFFSET = 6_000_000
 
 
 @dataclass(frozen=True)
@@ -37,7 +38,7 @@ class Config:
 
 
 def rollout_errors(
-    model: WorldModel,
+    model: DynamicsModel,
     episodes: Episodes,
     horizons: tuple[int, ...],
     generator: torch.Generator | None = None,
@@ -157,10 +158,12 @@ def train_and_measure(
     training: Episodes,
     evaluations: dict[str, Episodes],
     device: torch.device,
-) -> tuple[WorldModel, torch.optim.Adam, dict[str, Any]]:
+    model_config: world_model.Config | None = None,
+) -> tuple[DynamicsModel, torch.optim.Adam, dict[str, Any]]:
     """Train for the world-model step budget, measuring one-step and imagined error
-    on every evaluation set at each rollout step."""
-    model_config = config.model
+    on every evaluation set at each rollout step. Latent samples are drawn from a
+    generator reseeded identically at every rollout step."""
+    model_config = model_config or config.model
     model, optimizer = world_model.build(model_config, device, memory)
     generator = torch.Generator().manual_seed(model_config.seed)
     evaluations = {name: data.to(device) for name, data in evaluations.items()}
@@ -179,10 +182,21 @@ def train_and_measure(
             step - trained,
         )
         trained = step
+        latent_seed = model_config.seed + LATENT_SEED_OFFSET
         curve[str(step)] = {
             name: {
-                "one_step": world_model.evaluate(model, data, device),
-                "imagined": rollout_errors(model, data, config.horizons),
+                "one_step": world_model.evaluate(
+                    model, data, device, torch.Generator().manual_seed(latent_seed)
+                ),
+                "imagined": rollout_errors(
+                    model,
+                    data,
+                    config.horizons,
+                    torch.Generator().manual_seed(latent_seed),
+                ),
+                "latent": model.diagnostics(
+                    data, torch.Generator().manual_seed(latent_seed)
+                ),
             }
             for name, data in evaluations.items()
         }
@@ -237,18 +251,24 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
         ),
     }
     variants = {
-        "gru_uniform_data": (True, uniform_training),
-        "no_memory_uniform_data": (False, uniform_training),
-        "gru_mixed_data": (True, mixed_training),
+        "gru_uniform_data": (True, uniform_training, "gru"),
+        "no_memory_uniform_data": (False, uniform_training, "gru"),
+        "gru_mixed_data": (True, mixed_training, "gru"),
     }
+    if model_config.kind == "rssm":
+        variants |= {
+            "rssm_uniform_data": (True, uniform_training, "rssm"),
+            "rssm_mixed_data": (True, mixed_training, "rssm"),
+        }
     models = {}
-    for name, (memory, training) in variants.items():
+    for name, (memory, training, kind) in variants.items():
+        variant_config = replace(model_config, kind=kind)
         model, optimizer, curve = train_and_measure(
-            memory, config, training, evaluations, device
+            memory, config, training, evaluations, device, variant_config
         )
         checkpoint = output.parent / f"{name}.pt"
         world_model.save_checkpoint(
-            checkpoint, model_config, model_config.steps, model, optimizer
+            checkpoint, variant_config, model_config.steps, model, optimizer
         )
         models[name] = {
             "memory": memory,
@@ -294,13 +314,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, default=world_model.Config.seed)
     parser.add_argument("--steps", type=int, default=world_model.Config.steps)
+    world_model.add_world_model_arguments(parser)
     parser.add_argument("--device", default="cpu", choices=DEVICES)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     runtime.configure(args.seed)
     if args.steps < 1:
         parser.error("--steps must be positive")
-    config = Config(model=world_model.Config(seed=args.seed, steps=args.steps))
+    config = Config(
+        model=world_model.Config(
+            seed=args.seed, steps=args.steps, **world_model.world_model_options(args)
+        )
+    )
     output = (
         args.output
         or Path("runs")

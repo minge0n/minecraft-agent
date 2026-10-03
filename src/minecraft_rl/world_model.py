@@ -12,10 +12,10 @@ import argparse
 import json
 import time
 from collections.abc import Iterator
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 from torch import nn
@@ -24,6 +24,9 @@ from minecraft_rl import runtime
 from minecraft_rl.devices import DEVICES, select_device
 from minecraft_rl.provenance import git_commit
 from minecraft_rl.tmaze import Action, Cue, Observation, TMaze
+
+if TYPE_CHECKING:
+    from minecraft_rl.signal_tmaze import SignalTMaze
 
 OBSERVATIONS = len(Observation)
 ACTIONS = len(Action)
@@ -46,8 +49,12 @@ class Config:
     kind: str = "gru"
     latent_variables: int = 8
     latent_classes: int = 4
-    kl_scale: float = 1.0
+    kl_prior_scale: float = 1.0
+    kl_posterior_scale: float = 1.0
+    free_nats: float = 1.0
     prediction_samples: int = 16
+    environment: str = "tmaze"
+    signal_left_probability: float = 0.7
 
 
 def config_from_dict(raw: dict[str, Any]) -> Config:
@@ -93,6 +100,15 @@ def collect_episodes(
 ) -> Episodes:
     """Run `count` episodes with random cues and a random behavior policy: uniform,
     or drawing actions with the given relative weights."""
+    if config.environment == "signal":
+        from minecraft_rl.signal_tmaze import SignalTMaze
+
+        signal_environment = SignalTMaze(
+            config.corridor_length, config.max_steps, config.signal_left_probability
+        )
+        return collect_signal_episodes(
+            signal_environment, config, count, generator, action_weights
+        )
     environment = TMaze(config.corridor_length, config.max_steps)
     weights = None if action_weights is None else torch.tensor(action_weights)
     shape = (count, config.max_steps)
@@ -126,6 +142,49 @@ def collect_episodes(
     )
 
 
+def collect_signal_episodes(
+    environment: "SignalTMaze",
+    config: Config,
+    count: int,
+    generator: torch.Generator,
+    action_weights: tuple[float, ...] | None,
+) -> Episodes:
+    """Episodes of the Stage 2H signal T-maze with a random behavior policy.
+    `cues` holds the drawn signal (privileged); 0 also when the agent never
+    reached the signal cell."""
+    weights = None if action_weights is None else torch.tensor(action_weights)
+    shape = (count, config.max_steps)
+    observations = torch.zeros(shape, dtype=torch.long)
+    actions = torch.zeros(shape, dtype=torch.long)
+    next_observations = torch.zeros(shape, dtype=torch.long)
+    rewards = torch.zeros(shape)
+    continues = torch.zeros(shape)
+    mask = torch.zeros(shape, dtype=torch.bool)
+    cues = torch.zeros(count, dtype=torch.long)
+    for episode in range(count):
+        observation = environment.reset(generator)
+        for t in range(config.max_steps):
+            if weights is None:
+                index = torch.randint(0, ACTIONS, (1,), generator=generator)
+            else:
+                index = torch.multinomial(weights, 1, generator=generator)
+            action = Action(int(index))
+            next_observation, reward, terminated, truncated = environment.step(action)
+            observations[episode, t] = observation
+            actions[episode, t] = action
+            next_observations[episode, t] = next_observation
+            rewards[episode, t] = reward
+            continues[episode, t] = 0.0 if terminated else 1.0
+            mask[episode, t] = True
+            if terminated or truncated:
+                break
+            observation = next_observation
+        cues[episode] = int(environment.cue) if environment.signal_drawn else 0
+    return Episodes(
+        observations, actions, next_observations, rewards, continues, mask, cues
+    )
+
+
 @dataclass(frozen=True)
 class Predictions:
     observation_logits: torch.Tensor
@@ -152,6 +211,7 @@ class DynamicsModel(Protocol):
 
     policy_state_size: int
     deterministic: bool
+    mode_latents: bool
 
     def parameters(self) -> Iterator[nn.Parameter]: ...
 
@@ -194,6 +254,10 @@ class DynamicsModel(Protocol):
         generator: torch.Generator | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
 
+    def diagnostics(
+        self, episodes: Episodes, generator: torch.Generator | None
+    ) -> dict[str, float]: ...
+
 
 class WorldModel(nn.Module):
     """x_t = [onehot(o_t), onehot(a_t)] (batch, time, 8) -> state h_t (batch, time, H)
@@ -208,6 +272,7 @@ class WorldModel(nn.Module):
         self.memory = memory
         self.hidden = hidden
         self.deterministic = True
+        self.mode_latents = False
         self.policy_state_size = hidden + OBSERVATIONS
         inputs = OBSERVATIONS + ACTIONS
         self.core = (
@@ -260,6 +325,12 @@ class WorldModel(nn.Module):
     ) -> Predictions:
         """Teacher-forced prediction of every transition (episodes, time)."""
         return self(episodes.observations, episodes.actions)
+
+    def diagnostics(
+        self, episodes: Episodes, generator: torch.Generator | None
+    ) -> dict[str, float]:
+        """No latent variables to report."""
+        return {}
 
     def policy_states(
         self, episodes: Episodes, generator: torch.Generator | None
@@ -404,18 +475,22 @@ def train(
     device: torch.device,
     generator: torch.Generator,
     steps: int,
+    terms: list[dict[str, float]] | None = None,
 ) -> list[float]:
+    """Train for `steps` minibatches and return the total loss of each. If
+    `terms` is a list, the per-term losses of each step are appended to it."""
     total_losses = []
     count = episodes.mask.shape[0]
     for _ in range(steps):
         index = torch.randint(0, count, (config.batch,), generator=generator)
         optimizer.zero_grad()
-        loss = model.training_losses(episodes.select(index).to(device), generator)[
-            "total"
-        ]
+        step_terms = model.training_losses(episodes.select(index).to(device), generator)
+        loss = step_terms["total"]
         loss.backward()
         optimizer.step()
         total_losses.append(loss.item())
+        if terms is not None:
+            terms.append({name: value.item() for name, value in step_terms.items()})
     return total_losses
 
 
@@ -564,7 +639,9 @@ def train_with_curve(
     evaluation: Episodes,
     device: torch.device,
 ) -> tuple[DynamicsModel, torch.optim.Adam, list[float], dict[str, Any]]:
-    """Train for `config.steps`, evaluating the held-out episodes at report steps."""
+    """Train for `config.steps`, evaluating the held-out episodes at report steps.
+    Latent samples during evaluation use a generator reseeded identically at every
+    report step."""
     model, optimizer = build(config, device, memory)
     generator = torch.Generator().manual_seed(config.seed)
     training_losses: list[float] = []
@@ -572,6 +649,7 @@ def train_with_curve(
     for step in sorted({0, *config.report_steps, config.steps}):
         if step > config.steps:
             break
+        step_terms: list[dict[str, float]] = []
         training_losses += train(
             model,
             optimizer,
@@ -580,9 +658,25 @@ def train_with_curve(
             device,
             generator,
             step - len(training_losses),
+            step_terms,
         )
-        curve[str(step)] = evaluate(model, evaluation, device)
+        evaluation_seed = config.seed + EVALUATION_DATA_SEED_OFFSET
+        curve[str(step)] = evaluate(
+            model, evaluation, device, torch.Generator().manual_seed(evaluation_seed)
+        ) | {
+            "latent": model.diagnostics(
+                evaluation.to(device), torch.Generator().manual_seed(evaluation_seed)
+            ),
+            "training_terms_since_last_report": mean_terms(step_terms),
+        }
     return model, optimizer, training_losses, curve
+
+
+def mean_terms(terms: list[dict[str, float]]) -> dict[str, float]:
+    """The mean of each loss term over training steps, empty for no steps."""
+    if not terms:
+        return {}
+    return {name: sum(t[name] for t in terms) / len(terms) for name in terms[0]}
 
 
 def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
@@ -600,7 +694,7 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
         True, config, training, evaluation, device
     )
     control, _, control_losses, control_curve = train_with_curve(
-        False, config, training, evaluation, device
+        False, replace(config, kind="gru"), training, evaluation, device
     )
 
     checkpoint = output.parent / "checkpoint.pt"
@@ -608,8 +702,8 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
     _, restored_step, restored, _ = load_checkpoint(checkpoint, device)
     probe = evaluation.select(torch.arange(8)).to(device)
     with torch.no_grad():
-        before = model(probe.observations, probe.actions)
-        after = restored(probe.observations, probe.actions)
+        before = model.one_step(probe, torch.Generator().manual_seed(0))
+        after = restored.one_step(probe, torch.Generator().manual_seed(0))
     roundtrip = all(
         torch.equal(getattr(before, f), getattr(after, f))
         for f in Predictions.__dataclass_fields__
@@ -640,11 +734,8 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
         "training_data": dataset_summary(training),
         "evaluation_data": dataset_summary(evaluation),
         "model": {
-            "name": "WorldModel (GRU)",
-            "architecture": f"onehot obs+action ({OBSERVATIONS + ACTIONS}) -> "
-            f"GRU({OBSERVATIONS + ACTIONS},{config.hidden}) -> heads: "
-            f"Linear({config.hidden},{OBSERVATIONS}) next observation, "
-            f"Linear({config.hidden},1) reward, Linear({config.hidden},1) continuation",
+            "name": "RSSM" if config.kind == "rssm" else "WorldModel (GRU)",
+            "architecture": architecture(config),
             "parameters": parameter_count(model),
             "parameter_shapes": {
                 name: list(p.shape) for name, p in model.named_parameters()
@@ -658,7 +749,10 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
             "evaluation": control_curve[final],
         },
         "optimizer": {"name": "Adam", "learning_rate": config.learning_rate},
-        "loss": "cross_entropy(next observation) + mse(reward) "
+        "loss": "cross_entropy(observation) + mse(reward) + "
+        "binary_cross_entropy(continuation) + KL loss (docs/stage2g.md), per state"
+        if config.kind == "rssm"
+        else "cross_entropy(next observation) + mse(reward) "
         "+ binary_cross_entropy(continuation), averaged over valid steps",
         "training_loss_at_steps": {
             str(s): training_losses[s]
@@ -680,12 +774,48 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
     return result
 
 
+def architecture(config: Config) -> str:
+    if config.kind == "rssm":
+        latent = f"{config.latent_variables}x{config.latent_classes}"
+        return (
+            f"RSSM: h = GRUCell({latent} + {ACTIONS}, {config.hidden}), "
+            f"z = {latent} one-hot categoricals, prior MLP(h), posterior "
+            f"MLP(h, onehot(o)), heads on [h, z] ({config.hidden} + "
+            f"{config.latent_variables * config.latent_classes})"
+        )
+    return (
+        f"onehot obs+action ({OBSERVATIONS + ACTIONS}) -> "
+        f"GRU({OBSERVATIONS + ACTIONS},{config.hidden}) -> heads: "
+        f"Linear({config.hidden},{OBSERVATIONS}) next observation, "
+        f"Linear({config.hidden},1) reward, Linear({config.hidden},1) continuation"
+    )
+
+
+def add_world_model_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--world-model", default=Config.kind, choices=("gru", "rssm"))
+    parser.add_argument("--free-nats", type=float, default=Config.free_nats)
+    parser.add_argument("--kl-prior-scale", type=float, default=Config.kl_prior_scale)
+    parser.add_argument(
+        "--kl-posterior-scale", type=float, default=Config.kl_posterior_scale
+    )
+
+
+def world_model_options(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "kind": args.world_model,
+        "free_nats": args.free_nats,
+        "kl_prior_scale": args.kl_prior_scale,
+        "kl_posterior_scale": args.kl_posterior_scale,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, default=Config.seed)
     parser.add_argument("--steps", type=int, default=Config.steps)
     parser.add_argument("--hidden", type=int, default=Config.hidden)
     parser.add_argument("--corridor-length", type=int, default=Config.corridor_length)
+    add_world_model_arguments(parser)
     parser.add_argument("--device", default="cpu", choices=DEVICES)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -697,6 +827,7 @@ def main() -> None:
         steps=args.steps,
         hidden=args.hidden,
         corridor_length=args.corridor_length,
+        **world_model_options(args),
     )
     output = (
         args.output
@@ -725,8 +856,8 @@ def main() -> None:
         f"+1 rewards {data['positive_rewards']}, -1 rewards {data['negative_rewards']}"
     )
     print(
-        "Held-out one-step error by training step "
-        "(GRU | no-memory control):\n"
+        f"Held-out one-step error by training step "
+        f"({config.kind.upper()} | no-memory control):\n"
         "   step  total   obs acc  turn reward mse  turn sign acc  "
         "junction-arrival acc"
     )
@@ -742,7 +873,19 @@ def main() -> None:
             f"  {gru['junction_arrival']['observation_accuracy']:.0%}|"
             f"{control['junction_arrival']['observation_accuracy']:.0%}"
         )
-    print("Mean predicted junction-turn reward (GRU | no-memory control):")
+    for step, at in result["evaluation_curve"].items():
+        if at["latent"]:
+            latent = at["latent"]
+            print(
+                f"  latent {step:>5}: KL cue step {latent['kl_cue_step']:.3f} "
+                f"later {latent['kl_later_steps']:.3f}, prior entropy later "
+                f"{latent['prior_entropy_later_steps']:.3f}, cue-coding variables "
+                f"{latent['cue_coding_variables']}"
+            )
+    print(
+        f"Mean predicted junction-turn reward ({config.kind.upper()} | "
+        "no-memory control):"
+    )
     gru_rewards = result["evaluation"]["junction_turn"]["mean_predicted_reward"]
     control_rewards = result["control"]["evaluation"]["junction_turn"][
         "mean_predicted_reward"

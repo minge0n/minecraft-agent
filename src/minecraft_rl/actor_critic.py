@@ -27,6 +27,7 @@ from minecraft_rl.world_model import ACTIONS, OBSERVATIONS, DynamicsModel
 
 CHECKPOINT_FORMAT = "tmaze-actor-critic-v1"
 EVALUATION_SEED_OFFSET = 4_000_000
+LATENT_SEED_OFFSET = 6_000_000
 
 
 @dataclass(frozen=True)
@@ -291,6 +292,7 @@ def run_in_environment(
         "wrong_turn_rate": (outcome < 0).float().mean().item(),
         "truncated_rate": (outcome == 0).float().mean().item(),
         "mean_return": returns.mean().item(),
+        "return_standard_deviation": returns.std(unbiased=False).item(),
         "mean_discounted_return": discounted.mean().item(),
         "mean_length": lengths.float().mean().item(),
         "success_rate_by_cue": {
@@ -342,7 +344,25 @@ def evaluate(
 ) -> dict[str, Any]:
     """Real-environment results with greedy and sampled actions, each next to the
     discounted return the world model imagines for the same policy from the same
-    cue start states."""
+    cue start states.
+
+    A stochastic world model is also evaluated with `mode_latents` set: every
+    latent takes its most likely class instead of a sample, in the real
+    environment and in imagination. This diagnostic separates latent sampling
+    noise from a weak policy. Training never uses it."""
+    result = evaluate_actions(model, agent, config, seed)
+    if not model.deterministic:
+        model.mode_latents = True
+        try:
+            result["latent_mode"] = evaluate_actions(model, agent, config, seed)
+        finally:
+            model.mode_latents = False
+    return result
+
+
+def evaluate_actions(
+    model: DynamicsModel, agent: Agent, config: Config, seed: int
+) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for mode, greedy in (("greedy", True), ("sampled", False)):
         real = run_in_environment(
@@ -441,7 +461,13 @@ def train_world_model(
             model_config.seed + world_model.EVALUATION_DATA_SEED_OFFSET
         ),
     )
-    return model, episodes, world_model.evaluate(model, evaluation, device)
+    latent = torch.Generator().manual_seed(model_config.seed + LATENT_SEED_OFFSET)
+    one_step = world_model.evaluate(model, evaluation, device, latent)
+    return (
+        model,
+        episodes,
+        one_step | {"latent": model.diagnostics(evaluation.to(device), latent)},
+    )
 
 
 def train_with_curve(
@@ -475,10 +501,15 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
         "world_model_evaluation_data": config.model.seed
         + world_model.EVALUATION_DATA_SEED_OFFSET,
         "imagination_sampling": config.model.seed,
+        "latent_sampling": config.model.seed + LATENT_SEED_OFFSET,
         "real_evaluation": config.model.seed + EVALUATION_SEED_OFFSET,
     }
     model, episodes, model_evaluation = train_world_model(config, device)
-    starts = start_states(model, episodes.to(device))
+    starts = start_states(
+        model,
+        episodes.to(device),
+        torch.Generator().manual_seed(seeds["latent_sampling"]),
+    )
     evaluation_seed = seeds["real_evaluation"]
     random_policy = run_in_environment(
         model,
@@ -489,7 +520,10 @@ def run(config: Config, device: torch.device, output: Path) -> dict[str, Any]:
         greedy=False,
     )
     agents = {}
-    for name, memory in (("recurrent_state", True), ("no_memory", False)):
+    variants = (("recurrent_state", True), ("no_memory", False))
+    if config.model.kind != "gru":
+        variants = variants[:1]
+    for name, memory in variants:
         agent, optimizer, history, curve = train_with_curve(
             model, starts, memory, config, device, evaluation_seed
         )
@@ -544,6 +578,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=world_model.Config.seed)
     parser.add_argument("--steps", type=int, default=Config.steps)
     parser.add_argument("--horizon", type=int, default=Config.horizon)
+    world_model.add_world_model_arguments(parser)
     parser.add_argument("--device", default="cpu", choices=DEVICES)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -551,7 +586,9 @@ def main() -> None:
     if args.steps < 1 or args.horizon < 1:
         parser.error("--steps and --horizon must be positive")
     config = Config(
-        model=world_model.Config(seed=args.seed),
+        model=world_model.Config(
+            seed=args.seed, **world_model.world_model_options(args)
+        ),
         steps=args.steps,
         horizon=args.horizon,
     )
