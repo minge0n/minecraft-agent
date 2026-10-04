@@ -1,6 +1,6 @@
 # Learning roadmap: Dreamer first
 
-Status: **decided direction; Stage 1, Stage 1.5, Stage 2A, Stage 2B, Stage 2C, Stage 2D, Stage 2E, Stage 2F and Stage 2G are done; the toy Dreamer-style agent works with a deterministic GRU world model and with an RSSM (stochastic latent, KL). Stage 2H tests the RSSM on a stochastic environment before Minecraft.** Supersedes the earlier "Q-learning, then DQN" path. DQN may appear later as an optional baseline but is not on the critical path.
+Status: **decided direction; Stage 1, Stage 1.5, Stage 2A, Stage 2B, Stage 2C, Stage 2D, Stage 2E, Stage 2F, Stage 2G and Stage 2H are done; the toy Dreamer-style agent works with a deterministic GRU world model and with an RSSM (stochastic latent, KL), and the RSSM represents an uncertain future that the GRU cannot. Next is the first Minecraft RSSM world-model smoke test.** Supersedes the earlier "Q-learning, then DQN" path. DQN may appear later as an optional baseline but is not on the critical path.
 
 ```text
 Stage 1   tabular Q-learning baseline (done, docs/stage1.md)
@@ -12,7 +12,8 @@ Stage 2D  imagination and compounding-error measurement (done, docs/stage2d.md)
 Stage 2E  actor-critic trained in imagination (done, docs/stage2e.md)
 Stage 2F  integrated Dreamer-style toy agent (done, docs/stage2f.md)
 Stage 2G  RSSM world model (stochastic latent, KL) in the same toy loop (done, docs/stage2g.md)
-Next      Stage 2H stochastic signal T-maze: GRU against RSSM (docs/stage2h.md)
+Stage 2H  stochastic signal T-maze: GRU against RSSM (done, docs/stage2h.md)
+Next      Minecraft RSSM world-model smoke test on real structured transitions
 Later     Dreamer on the structured Minecraft observation
 ```
 
