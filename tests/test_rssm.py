@@ -292,6 +292,7 @@ def test_diagnostics_report_the_free_nats_effect_and_latent_use(trained):
     intervention = latent["cue_from_prior"]
     assert intervention["reward_sign_accuracy_posterior"] > 0.95
     assert intervention["reward_sign_accuracy_cue_from_prior"] < 0.9
+    assert intervention["reward_sign_accuracy_every_cue_from_prior"] < 0.7
 
 
 def test_diagnostics_do_not_change_the_callers_random_numbers(trained):

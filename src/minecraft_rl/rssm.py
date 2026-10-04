@@ -314,10 +314,11 @@ class RSSM(nn.Module):
         - cue_coding_variables: variables whose most frequent posterior class
           at the cue step differs between the two cues, -1 without both cues.
         - cue_from_prior: the junction-turn reward sign accuracy when the
-          latent at the cue step is sampled from the prior instead of the
-          posterior. Near 0.5 means that the cue reaches the reward only
-          through z at the cue step. It uses its own generator, so it does not
-          change the random numbers of the caller.
+          latent at the first cue step, or at every state that shows a cue, is
+          sampled from the prior instead of the posterior. Near 0.5 for every
+          cue state means that the cue reaches the reward only through z. It
+          uses its own generator, so it does not change the random numbers of
+          the caller.
         """
         observations, valid = self._states(episodes)
         with torch.no_grad():
@@ -407,8 +408,11 @@ class RSSM(nn.Module):
     def cue_from_prior(
         self, episodes: Episodes, observations: torch.Tensor, cue: torch.Tensor
     ) -> dict[str, float]:
-        """Junction-turn reward sign accuracy of the posterior states, with the
-        normal posterior latent and with a prior latent at the cue step."""
+        """Junction-turn reward sign accuracy of the posterior states with the
+        normal posterior latent, with a prior latent at the first cue step
+        (`cue`), and with a prior latent at every state that shows a cue. An
+        agent that turns or waits on the cue cell sees the cue again, so only
+        the last variant removes every observation of the cue from z."""
         turn = (
             episodes.mask
             & (episodes.observations == Observation.JUNCTION)
@@ -416,8 +420,17 @@ class RSSM(nn.Module):
         )
         if not turn.any():
             return {"turns": 0}
+        every_cue = cue | (
+            (observations == Observation.CUE_LEFT)
+            | (observations == Observation.CUE_RIGHT)
+        )
         result: dict[str, float] = {"turns": int(turn.sum())}
-        for name, prior_at in (("posterior", None), ("cue_from_prior", cue)):
+        variants = (
+            ("posterior", None),
+            ("cue_from_prior", cue),
+            ("every_cue_from_prior", every_cue),
+        )
+        for name, prior_at in variants:
             with torch.no_grad():
                 filtered = self.filter(
                     observations,
