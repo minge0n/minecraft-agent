@@ -41,9 +41,15 @@ from minecraft_rl.minecraft_launch import launched_client
 from minecraft_rl.provenance import git_commit
 from minecraft_rl.recording import WorkerRecorder
 
-# World seeds per split: disjoint ranges, so held-out seeds never train.
-SPLIT_SEED_BASE = {"train": 100_000, "eval_episode": 200_000, "eval_seed": 300_000}
-POLICY_SEED_OFFSET = 7_919
+# Splits: `train` worlds; `eval_episode` replays the training worlds with a
+# different exploration seed (held-out episodes from seen worlds); `eval_seed`
+# uses world seeds that no training episode uses (held-out worlds).
+SPLIT_SEED_BASE = {"train": 100_000, "eval_episode": 100_000, "eval_seed": 300_000}
+POLICY_SEED_BASE = {
+    "train": 1_000_000,
+    "eval_episode": 2_000_000,
+    "eval_seed": 3_000_000,
+}
 WORKER = "env-0000"
 
 
@@ -52,7 +58,7 @@ def world_seed(split: str, episode: int) -> int:
 
 
 def policy_seed(split: str, episode: int) -> int:
-    return world_seed(split, episode) * POLICY_SEED_OFFSET % 2_147_483_647
+    return POLICY_SEED_BASE[split] + episode
 
 
 def run_episode(
@@ -144,7 +150,7 @@ def manifest(args: argparse.Namespace, config: ExplorationConfig) -> dict[str, A
         "git_commit": git_commit(),
         "exploration_policy": config.to_json(),
         "split_seed_base": SPLIT_SEED_BASE,
-        "policy_seed_rule": f"world_seed * {POLICY_SEED_OFFSET} mod 2^31 - 1",
+        "policy_seed_base": POLICY_SEED_BASE,
         "preset": args.preset,
         "max_steps": args.max_steps,
         "pacing": "unpaced",
@@ -191,11 +197,9 @@ def main() -> None:
     manifest_path = args.dataset / "manifest.json"
     if manifest_path.exists():
         previous = json.loads(manifest_path.read_text(encoding="utf-8"))
-        changed = [
-            k
-            for k in ("exploration_policy", "observation_schema", "preset", "max_steps")
-            if previous.get(k) != info[k]
-        ]
+        current = json.loads(json.dumps(info))
+        keys = ("exploration_policy", "observation_schema", "preset", "max_steps")
+        changed = [k for k in keys if previous.get(k) != current[k]]
         if changed:
             raise SystemExit(f"dataset settings differ from {manifest_path}: {changed}")
     write_json(manifest_path, info)
