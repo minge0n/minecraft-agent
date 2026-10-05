@@ -209,6 +209,7 @@ def main() -> None:
     with launched_client(
         args.port, world_seed(args.split, todo[0]), log, args.startup_timeout
     ) as client:
+        write_json(args.dataset / "schema.json", client.request("SCHEMA"))
         client.set_pacing("unpaced", render_frames=True)
         recorder = None
         if not args.no_video:
