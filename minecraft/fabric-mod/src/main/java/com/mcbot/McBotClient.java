@@ -4,6 +4,7 @@ import com.mcbot.mixin.KeyMappingAccessor;
 import java.io.IOException;
 import java.util.function.Function;
 import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
@@ -58,6 +59,8 @@ public class McBotClient implements ClientModInitializer {
         observerMode = true;
         pendingWorld = new WorldRequest(worldSeed, WorldRequest.Preset.FLAT);
         new TickControl().start(Integer.parseInt(port));
+        ClientLifecycleEvents.CLIENT_STARTED.register(
+                minecraft -> EnvironmentSettings.mute(minecraft.options));
         ClientTickEvents.START_CLIENT_TICK.register(this::applyScriptedAction);
         ClientTickEvents.END_CLIENT_TICK.register(minecraft -> {
             finishClientTick(minecraft);

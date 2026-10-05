@@ -7,6 +7,7 @@ import net.minecraft.client.InactivityFpsLimit;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Options;
 import net.minecraft.server.level.ParticleStatus;
+import net.minecraft.sounds.SoundSource;
 
 // Environment client settings applied in observer mode, independent of any personal
 // options file. Rendering is for human observation and recording only; the policy
@@ -31,6 +32,20 @@ final class EnvironmentSettings {
         options.cloudStatus().set(CloudStatus.OFF);
         options.entityShadows().set(false);
         options.pauseOnLostFocus = false;
+        mute(options);
+    }
+
+    // The environment plays no sound: the policy never hears it, and a muted
+    // client is quieter for the person next to the machine. Set MCBOT_SOUND=on
+    // to keep the volumes of the options file.
+    static boolean soundEnabled() {
+        return "on".equalsIgnoreCase(System.getenv("MCBOT_SOUND"));
+    }
+
+    static void mute(Options options) {
+        if (!soundEnabled()) {
+            options.getSoundSourceOptionInstance(SoundSource.MASTER).set(0.0);
+        }
     }
 
     static JsonObject describe(Minecraft minecraft) {
@@ -42,6 +57,7 @@ final class EnvironmentSettings {
         json.addProperty("vsync", options.enableVsync().get());
         json.addProperty("frame_limit", options.framerateLimit().get());
         json.addProperty("particles", options.particles().get().name().toLowerCase(java.util.Locale.ROOT));
+        json.addProperty("master_volume", options.getSoundSourceVolume(SoundSource.MASTER));
         json.addProperty("framebuffer_width", minecraft.getWindow().getWidth());
         json.addProperty("framebuffer_height", minecraft.getWindow().getHeight());
         return json;
