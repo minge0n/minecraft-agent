@@ -32,6 +32,7 @@ class Probe:
         self.block_id = {name: index for index, name in enumerate(registry["block"])}
         self.entity_id = {name: index for index, name in enumerate(registry["entity"])}
         self.item_id = {name: index for index, name in enumerate(registry["item"])}
+        self.effect_id = {name: index for index, name in enumerate(registry["effect"])}
         self.steps: list[StepResult] = []
 
     def step(self, action: PlayerAction = NOOP) -> StepResult:
@@ -264,6 +265,67 @@ def run_mining(probe: Probe) -> dict:
     return {"held_attack_ticks_to_break_dirt": held_ticks}
 
 
+def run_self_state(probe: Probe) -> dict:
+    """The v2 self state reports the main inventory, durability, armor, offhand,
+    experience, air and effects that the scene set, on the next step."""
+    scene = probe.privileged.scene("self_state")
+    observation = probe.step().observation
+    item = probe.item_id
+    effect = probe.effect_id
+    tool, main = scene["tool_slot"], scene["main_slot"]
+    check(
+        observation.inventory_item[tool] == item["minecraft:iron_pickaxe"],
+        "tool slot does not hold the pickaxe",
+    )
+    check(
+        0.4 <= observation.inventory_durability[tool] <= 0.6,
+        f"half-damaged pickaxe shows {observation.inventory_durability[tool]}",
+    )
+    check(
+        observation.inventory_item[main] == item["minecraft:torch"]
+        and observation.inventory_count[main] == scene["torch_count"],
+        "main-inventory torches missing",
+    )
+    check(
+        observation.armor_item[3] == item["minecraft:iron_helmet"]
+        and observation.armor_durability[3] == 1.0,
+        f"helmet missing: {observation.armor_item}",
+    )
+    check(observation.armor > 0, "armor points missing")
+    check(observation.offhand_item == item["minecraft:shield"], "offhand missing")
+    check(observation.xp_level == scene["xp_levels"], "xp level wrong")
+    check(5 <= observation.air_bubbles <= 6, f"air bubbles {observation.air_bubbles}")
+    present = {
+        type_id - 1: (amplifier, seconds)
+        for type_id, amplifier, seconds in zip(
+            observation.effect_type,
+            observation.effect_amplifier,
+            observation.effect_seconds,
+            strict=True,
+        )
+        if type_id
+    }
+    speed = present.get(effect["minecraft:speed"])
+    check(
+        speed is not None
+        and speed[0] == scene["speed_amplifier"]
+        and scene["speed_seconds"] - 1 <= speed[1] <= scene["speed_seconds"],
+        f"speed effect wrong: {present}",
+    )
+    check(
+        present.get(effect["minecraft:night_vision"]) == (0, -1),
+        f"infinite night vision wrong: {present}",
+    )
+    later = probe.step().observation
+    check(later.xp_level == scene["xp_levels"], "xp level changed without cause")
+    return {
+        "pickaxe_durability": observation.inventory_durability[tool],
+        "armor_points": observation.armor,
+        "air_bubbles": observation.air_bubbles,
+        "effects": {str(key): value for key, value in present.items()},
+    }
+
+
 def run_reset(probe: Probe, seed: int) -> dict:
     check(probe.privileged.kill(), "debug kill did not kill the player")
     dead = probe.step()
@@ -342,6 +404,7 @@ def run_probes(
         "same_step_sync": run_same_step_sync(probe),
         "combat": run_combat(probe),
         "mining": run_mining(probe),
+        "self_state": run_self_state(probe),
         "throughput": run_throughput(probe, steps),
         "reset": run_reset(probe, seed),
     }

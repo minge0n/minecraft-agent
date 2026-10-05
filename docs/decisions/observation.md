@@ -1,6 +1,6 @@
 # Policy observation: structured visible field
 
-Status: **decided for schema `visible-field-v1`; implemented over protocol v2 and runtime-verified for a scripted occlusion scene (see `docs/minecraft-spike.md`).** Supersedes the earlier target of a primarily RGB/visual policy input (RGB is deferred, not rejected) and the earlier allowance of the vanilla Recipe Book as policy information.
+Status: **decided for schema `visible-field-v2`; implemented over protocol v2 and runtime-verified for a scripted occlusion scene and a scripted self-state scene (see `docs/minecraft-spike.md` and `scripts/minecraft-observation-probe.py`).** `visible-field-v2` supersedes `visible-field-v1`. It keeps the camera rays unchanged and replaces the hotbar-only self state with the full self state that a player can read from the HUD and the inventory screen. Earlier decisions: this ADR superseded the target of a primarily RGB/visual policy input (RGB is deferred, not rejected) and the allowance of the vanilla Recipe Book as policy information.
 
 ## Principle
 
@@ -27,7 +27,7 @@ A block or entity behind the player, outside the camera field of view, or hidden
 
 The camera-ray grid is the simplest defensible choice: fixed shape, occlusion by construction, straightforward tests, and a natural Dreamer reconstruction target. Its main weakness is angular resolution: small or distant entities (dropped items, far mobs) can fall between rays. A fixed-size visible-entity slot list is the planned extension if experiments show the need; it is not implemented.
 
-## Schema `visible-field-v1`
+## Schema `visible-field-v2`
 
 The observation is computed on the integrated server thread at the end of the stepped server tick, from post-step authoritative server state (player eye position and rotation after the step's client input was applied). With RGB deferred, server state defines what is visible; client rendering may interpolate entity positions differently and is not part of this contract.
 
@@ -45,14 +45,31 @@ Visibility rules: blocks use their outline shape (the same shape the crosshair t
 
 ### Self state (always available, HUD-like)
 
+Every self-state field is something that a player can read from the HUD or from the inventory screen. Where the screen shows less than the engine knows, the field has the resolution of the screen. Inventory slots `0..8` are the hotbar, so there are no separate hotbar fields. Python exposes `hotbar_item`, `hotbar_count` and `main_hand_item` as views of the inventory fields.
+
 | Field | Shape | Type | Meaning, units, normalization |
 | --- | --- | --- | --- |
-| `health` | scalar | continuous | Server-side player health in half-hearts, `[0, max health]` (20 by default); divide by 20. |
-| `food` | scalar | integer, continuous use | Food level `[0, 20]`; divide by 20. |
+| `health` | scalar | continuous | Server-side player health in half-hearts, `[0, max_health]`. Divide by 20. |
+| `max_health` | scalar | continuous | Maximum health in half-hearts, 20 by default. The HUD shows it as the number of heart containers. Divide by 20. |
+| `absorption` | scalar | continuous | Absorption health in half-hearts (the golden hearts). Divide by 20. |
+| `food` | scalar | integer | Food level `[0, 20]`. Divide by 20. Saturation is not exposed, because the HUD does not show it. |
+| `air_bubbles` | scalar | integer | The air bubbles that the HUD draws, `[0, 10]`, 10 at full air, rounded up. Divide by 10. |
+| `armor` | scalar | integer | Armor points that the HUD draws, `[0, 20]` in vanilla. Divide by 20. |
+| `xp_level` | scalar | integer | Experience level, `>= 0`. Suggested encoding `log1p(level) / log1p(30)`. |
+| `xp_progress` | scalar | continuous | Fill of the experience bar, `[0, 1]`. |
 | `selected_slot` | scalar | categorical, 9 values | Selected hotbar slot `0..8`. |
-| `hotbar_item` | `9` | categorical | Item registry index per hotbar slot; `0` (air) when empty. |
-| `hotbar_count` | `9` | integer | Stack size `0..99`; suggested normalization `log1p` or divide by 64. |
-| `pitch` | scalar | continuous | Camera pitch in degrees `[-90, 90]`, positive looking down (Minecraft convention); divide by 90. Pitch relative to gravity is perceivable from the horizon, so it is egocentric. |
+| `inventory_item` | `36` | categorical | Item registry index per main-inventory slot. Slots `0..8` are the hotbar. `0` (air) when empty. |
+| `inventory_count` | `36` | integer | Stack size per slot, `0` when empty. Suggested normalization `log1p(count) / log1p(64)`. |
+| `inventory_durability` | `36` | continuous | The durability bar of the item, `k / 13` for `k` in `0..13`. It is `1.0` when the item takes no damage or has no bar. |
+| `armor_item` | `4` | categorical | Item registry index of the feet, legs, chest and head slot, in this order. |
+| `armor_durability` | `4` | continuous | Durability bar of each armor slot, as for the inventory. |
+| `offhand_item`, `offhand_count`, `offhand_durability` | scalar | as above | The offhand slot. |
+| `effect_type` | `8` | categorical | Active effects with a HUD icon, in registry order, in the first slots. The value is the effect registry index plus 1. `0` marks an empty slot. |
+| `effect_amplifier` | `8` | integer | Effect level minus 1 (the vanilla amplifier), `0` in an empty slot. |
+| `effect_seconds` | `8` | integer | Remaining duration in seconds, rounded up as the inventory screen shows it. `-1` for an infinite effect. `0` in an empty slot. Suggested normalization `log1p(seconds) / log1p(600)` with a separate flag for `-1`. |
+| `pitch` | scalar | continuous | Camera pitch in degrees `[-90, 90]`, positive looking down (Minecraft convention). Divide by 90. Pitch relative to gravity is perceivable from the horizon, so it is egocentric. |
+
+Not exposed, because an ordinary player cannot read it: saturation, exhaustion, exact air ticks, exact item damage values, item NBT and components beyond the item type, effects without a HUD icon, and the internal experience point total. Item, block, fluid, entity and effect ids are categorical. Never treat them as ordered numbers. Encode them with embeddings or one-hot vectors. The parser checks that every id lies inside its vocabulary, that empty effect slots report zeros, and that effects fill the first slots in registry order.
 
 Absolute world coordinates and absolute yaw are not policy fields. If they are ever used, they are an explicit privileged ablation.
 
@@ -60,14 +77,15 @@ Absolute world coordinates and absolute yaw are not policy fields. If they are e
 
 While an inventory or crafting GUI is open, a later schema version may expose inventory slots, item categorical IDs, stack counts, crafting-grid slots and the cursor stack. Recipe suggestions, recipe lists and Recipe Book contents are never exposed, even though the vanilla client has a Recipe Book internally. The exact GUI boundary will be documented and may be ablated.
 
-## Known limitations of v1 (open, not hidden)
+## Known limitations of v2 (open, not hidden)
 
 - Lighting is ignored: a ray reports a block in an unlit cave that a player would see as nearly black. Adding per-ray light level, or masking unlit hits, must be decided before Minecraft training.
 - Underwater, rays start inside the fluid and hit it immediately.
 - Block state properties (orientation, crop age) and surface normals are not exposed; only the block type.
 - Small and distant entities can be missed between rays.
-- Status bars other than health and food (air, armor, experience) are not yet included.
+- More than 8 effects with an icon: the effects after the eighth in registry order are dropped. Vanilla play rarely has more than 8.
+- The armor points, the air bubbles and the durability bars are HUD resolutions. A player who opens the item tooltip can read more exact durability. v2 does not model tooltips.
 
 ## Separation and versioning
 
-Policy observations and privileged/debug data travel in separate protocol commands and parse into separate Python types: `PolicyObservation` (in `minecraft_rl.minecraft_interface`) versus `StepInfo`, `ResetInfo` and the `PrivilegedProbe` debug commands (in `minecraft_rl.minecraft_client`). The parser rejects missing or unknown observation fields, wrong types, out-of-range categorical IDs and distances, so a protocol change cannot silently widen the policy input. A change to any field, shape, range or visibility rule bumps the schema version. Vocabulary sizes come from `v2 SCHEMA`; human-readable registry names come only from privileged `DEBUG_REGISTRY` for tests and are never a policy input.
+Policy observations and privileged/debug data travel in separate protocol commands and parse into separate Python types: `PolicyObservation` (in `minecraft_rl.minecraft_interface`) versus `StepInfo`, `ResetInfo` and the `PrivilegedProbe` debug commands (in `minecraft_rl.minecraft_client`). The parser rejects missing or unknown observation fields, wrong types, out-of-range categorical IDs and distances, so a protocol change cannot silently widen the policy input. A change to any field, shape, range or visibility rule bumps the schema version. `v2 SCHEMA` reports every layout size (`inventory_slots`, `armor_slots`, `effect_slots`, `air_bubbles`, `durability_steps`) and the vocabulary sizes, including `effect_types`. The Python client refuses a server whose layout differs from its own. Vocabulary sizes come from `v2 SCHEMA`; human-readable registry names come only from privileged `DEBUG_REGISTRY` for tests and are never a policy input.

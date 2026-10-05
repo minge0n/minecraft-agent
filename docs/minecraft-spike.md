@@ -13,7 +13,7 @@ Revised by the observation architecture update (`docs/decisions/observation.md`)
 | Physics and hostile-mob progression only on steps | proven (v1 probe) |
 | Same-step action application | proven for v2 factorized yaw, pitch, forward, attack, hotbar |
 | Basic combat timing | proven: first attack damages on its step; held attack does not re-hit; see below |
-| Structured visible observation | proven: `visible-field-v1` over v2 |
+| Structured visible observation | proven: `visible-field-v2` over v2 (v1 superseded) |
 | Observation/action tick alignment | proven: post-step yaw/pitch and positions appear in the same step's observation |
 | Visibility and occlusion boundary, hidden-information audit | proven for the scripted scene (4 runs); see limitations |
 | Episode reset semantics for experiments | proven: fresh disposable world per reset, gated and frozen, `terminated` after death |

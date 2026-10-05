@@ -10,9 +10,12 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.effect.MobEffectInstance;
+import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntitySpawnReason;
 import net.minecraft.world.entity.EntityTypes;
+import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.player.Inventory;
@@ -35,6 +38,11 @@ final class DebugScene {
     private static final int MAX_NEARBY_RADIUS = 32;
     private static final int COMBAT_WEAPON_SLOT = 1;
     private static final int REPLAY_BLOCK_SLOT = 2;
+    private static final int SELF_STATE_TOOL_SLOT = 3;
+    private static final int SELF_STATE_MAIN_SLOT = 20;
+    private static final int SELF_STATE_TORCHES = 17;
+    private static final int SELF_STATE_XP_LEVELS = 5;
+    private static final int SELF_STATE_SPEED_SECONDS = 30;
     private static final long MAX_TRACE_BLOCKS = 65_536;
 
     private DebugScene() {}
@@ -90,6 +98,7 @@ final class DebugScene {
                 scene.add("target_block", position(target));
             }
             case "replay" -> buildReplay(player, level, origin, scene, ai, flag(payload, "controlled"));
+            case "self_state" -> buildSelfState(player, scene);
             default -> throw new IllegalArgumentException("unknown_scene");
         }
         return scene;
@@ -121,7 +130,33 @@ final class DebugScene {
         player.setHealth(player.getMaxHealth());
         player.getFoodData().setFoodLevel(20);
         player.getInventory().clearContent();
+        player.setExperienceLevels(0);
+        player.setExperiencePoints(0);
+        player.setAirSupply(player.getMaxAirSupply());
         return origin;
+    }
+
+    // Known self state for the visible-field-v2 probe: items in the main
+    // inventory beyond the hotbar, a damaged tool, armor, an offhand item,
+    // experience, reduced air and two effects, one of them infinite.
+    private static void buildSelfState(ServerPlayer player, JsonObject scene) {
+        Inventory inventory = player.getInventory();
+        ItemStack pickaxe = new ItemStack(Items.IRON_PICKAXE);
+        pickaxe.setDamageValue(pickaxe.getMaxDamage() / 2);
+        inventory.setItem(SELF_STATE_TOOL_SLOT, pickaxe);
+        inventory.setItem(SELF_STATE_MAIN_SLOT, new ItemStack(Items.TORCH, SELF_STATE_TORCHES));
+        player.setItemSlot(EquipmentSlot.HEAD, new ItemStack(Items.IRON_HELMET));
+        player.setItemSlot(EquipmentSlot.OFFHAND, new ItemStack(Items.SHIELD));
+        player.giveExperienceLevels(SELF_STATE_XP_LEVELS);
+        player.setAirSupply(player.getMaxAirSupply() / 2);
+        player.addEffect(new MobEffectInstance(MobEffects.SPEED, SELF_STATE_SPEED_SECONDS * 20, 1));
+        player.addEffect(new MobEffectInstance(MobEffects.NIGHT_VISION, MobEffectInstance.INFINITE_DURATION, 0));
+        scene.addProperty("tool_slot", SELF_STATE_TOOL_SLOT);
+        scene.addProperty("main_slot", SELF_STATE_MAIN_SLOT);
+        scene.addProperty("torch_count", SELF_STATE_TORCHES);
+        scene.addProperty("xp_levels", SELF_STATE_XP_LEVELS);
+        scene.addProperty("speed_amplifier", 1);
+        scene.addProperty("speed_seconds", SELF_STATE_SPEED_SECONDS);
     }
 
     private static void buildVisibility(ServerLevel level, BlockPos origin, JsonObject scene) {
@@ -407,6 +442,7 @@ final class DebugScene {
         reply.add("fluid", names(BuiltInRegistries.FLUID));
         reply.add("entity", names(BuiltInRegistries.ENTITY_TYPE));
         reply.add("item", names(BuiltInRegistries.ITEM));
+        reply.add("effect", names(BuiltInRegistries.MOB_EFFECT));
         return reply;
     }
 
