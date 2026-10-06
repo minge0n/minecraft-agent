@@ -2,7 +2,7 @@
 
 Purpose: learn short-horizon dynamics from real structured Minecraft transitions with the Stage 2G RSSM (`docs/stage2g.md`), and compare the model against trivial baselines. No actor is trained. No reward exists: the reward design is a separate later milestone.
 
-Status: in progress. This document records the model size selection, the tests and the tiny-overfit test. The held-out results follow in a later section when the training run is complete.
+Status: first held-out run complete, with a mixed result. The model predicts changed rays better than every baseline. It predicts unchanged content and pitch worse than persistence, and it uses the action only weakly. The likely cause is the scale of the loss terms (section "Diagnosis"). The model is not yet good enough for actor training.
 
 ## Data
 
@@ -141,6 +141,116 @@ Latent diagnostics at update 2000: mean KL 0.08 nats, 99.4% of the states below 
 
 Cost: 2,000 updates in 666 s over two processes, 0.33 s per update on the efficiency cores, 351 J of CPU energy (0.18 J per update). One evaluation of the 8 windows takes 0.4 s.
 
+## Held-out run
+
+Run: `runs/stage3/train-3000`, seed 0, commit `07ccf4b`, the frozen model D. Batch 16, sequence length 32, Adam 1e-3, clip 1000. Staged budget: evaluation at 0, 100, 300, 1,000, 2,000 and 3,000 updates. Each evaluation uses 128 fixed windows per split, with 12 context steps and 21 scored transitions per window (2,688 transitions). Imagination ran at 1,000 and 3,000 updates on windows of 12 context and 20 imagined steps.
+
+The run stopped after 3,000 updates because the held-out gain became small. Accuracy on changed rays in `eval_episode` was 0.357 at 1,000, 0.351 at 2,000 and 0.360 at 3,000 updates.
+
+The same command with `--updates 1000` and the run with `--updates 3000` gave identical metrics at 0, 100, 300 and 1,000 updates, over different process boundaries. This confirms the resume determinism on the real workload.
+
+### One-step prediction at 3,000 updates
+
+The model reads the context with the posterior, then predicts each next observation from the prior with the real action. "Changed" metrics use only the elements whose target differs from the last real observation. Persistence is 0 on them by definition.
+
+| Metric | Split | Model | Shuffled actions | Persistence | Frequency |
+|---|---|---|---|---|---|
+| Ray accuracy, known targets | `train` | 0.779 | 0.776 | 0.855 | 0.342 |
+| | `eval_episode` | 0.761 | 0.760 | 0.855 | 0.306 |
+| | `eval_seed` | 0.639 | 0.638 | 0.839 | 0.298 |
+| Ray accuracy where the class changed | `train` | 0.375 | 0.365 | 0.000 | 0.269 |
+| | `eval_episode` | 0.360 | 0.354 | 0.000 | 0.265 |
+| | `eval_seed` | 0.279 | 0.275 | 0.000 | 0.229 |
+| Ray NLL where the class changed (nats) | `eval_episode` | 2.26 | 2.30 | | |
+| | `eval_seed` | 3.42 | 3.45 | | |
+| Ray distance error, hits (blocks) | `eval_episode` | 3.03 | 3.04 | 1.22 | |
+| | `eval_seed` | 3.63 | 3.62 | 1.22 | |
+| Pitch error (degrees) | `eval_episode` | 7.25 | 7.36 | 1.46 | |
+| | `eval_seed` | 12.15 | 12.08 | 1.45 | |
+| Health error where health changed | `eval_episode` | 1.51 | 1.56 | 0.54 | |
+| | `eval_seed` | 2.75 | 2.76 | 0.83 | |
+
+Unknown targets in `eval_seed`: 10.6% of the scored rays (the 16% in the data section counts block rays only). The model predicted the unknown class on 0% of them. The training data never contains the unknown class, so the model cannot learn to predict it.
+
+Continuation: no evaluation window contains a death, so the continuation head is untested on terminal transitions. On non-terminal transitions it predicts continue with p = 0.9999.
+
+### Action conditioning
+
+The action shuffle replaces the actions of each window with those of another window. At one step, the effect is small. In `eval_episode`, accuracy on changed rays falls from 0.360 to 0.354 and the NLL rises from 2.26 to 2.30. The prior on the full trained model changes little with the action: the mean KL between the priors after the real and a shuffled action was 0.014 nats at 1,000 updates.
+
+The effect grows with the horizon (next section). At horizon 10 in `eval_episode`, accuracy on changed rays is 0.231 with the real actions and 0.195 with shuffled actions, and the pitch error is 10.9 against 12.4 degrees. So the model uses the action, but weakly. Negative result: pitch follows from the previous pitch and the camera action, and persistence alone has an error of 1.5 degrees, yet the model error is 7-12 degrees.
+
+### Event subsets (`eval_episode`, 3,000 updates)
+
+Events with at least 20 transitions in the 2,688 scored transitions: camera turn (2,580), forward (1,255), attack (1,232), jump (538), sneak (300), use (273), many rays change (1,672), entity rays change (240). Too few examples: hotbar selection (12), health change (13), inventory change (4), food change (0), termination (0), no movement and no camera (0). The exploration policy almost always turns the camera, so no "still" subset exists.
+
+At 1,000 updates, accuracy on changed rays was 0.35-0.37 in every event subset of `eval_episode`. The real and the shuffled action differed by at most 0.004 in each subset. In `eval_seed`, the subset "use" was weakest (0.178). Per-event metrics at all update counts are in `metrics.json`.
+
+### Imagination
+
+The model filters 12 real steps, then rolls the prior forward with the 20 real future actions, without decoding and re-encoding. Values at 3,000 updates, `eval_episode`:
+
+| Horizon | Ray accuracy (model / shuffled / persistence) | Changed rays (model / shuffled) | Pitch error, degrees (model / shuffled / persistence) | Ray distance error, blocks (model / persistence) |
+|---|---|---|---|---|
+| 1 | 0.779 / 0.778 / 0.859 | 0.356 / 0.351 | 7.8 / 7.9 / 1.6 | 3.09 / 1.19 |
+| 5 | 0.674 / 0.662 / 0.685 | 0.289 / 0.273 | 9.0 / 9.8 / 6.4 | 3.23 / 3.00 |
+| 10 | 0.573 / 0.540 / 0.581 | 0.231 / 0.195 | 10.9 / 12.4 / 10.7 | 3.62 / 4.27 |
+| 20 | 0.485 / 0.458 / 0.488 | 0.206 / 0.177 | 13.5 / 15.6 / 14.7 | 4.01 / 5.38 |
+
+`eval_seed`, same columns:
+
+| Horizon | Ray accuracy | Changed rays | Pitch error | Ray distance error |
+|---|---|---|---|---|
+| 1 | 0.651 / 0.651 / 0.843 | 0.302 / 0.296 | 11.4 / 11.5 / 1.6 | 3.60 / 1.17 |
+| 5 | 0.566 / 0.558 / 0.644 | 0.256 / 0.234 | 12.3 / 12.9 / 6.4 | 3.80 / 3.31 |
+| 10 | 0.479 / 0.475 / 0.539 | 0.212 / 0.201 | 13.2 / 12.9 / 10.7 | 4.10 / 4.90 |
+| 20 | 0.381 / 0.376 / 0.439 | 0.148 / 0.142 | 15.1 / 14.7 / 14.5 | 4.62 / 6.23 |
+
+Error grows with the horizon for the model and for persistence. Persistence error grows faster. In `eval_episode` the model matches persistence on ray accuracy from horizon 5 on, beats it on ray distance from horizon 10 on, and keeps 0.21 accuracy on changed rays at horizon 20. In `eval_seed` the model stays below persistence on ray accuracy at every horizon.
+
+### Latent diagnostics
+
+| Split | Raw KL (nats) | Below free nats | Active variables | Prior entropy | Posterior entropy | Prior-posterior agreement |
+|---|---|---|---|---|---|---|
+| `train` | 6.55 | 2.9% | 16 / 16 | 18.9 | 12.6 | 0.572 |
+| `eval_episode` | 6.93 | 6.2% | 16 / 16 | 17.9 | 11.5 | 0.574 |
+| `eval_seed` | 8.04 | 9.0% | 16 / 16 | 18.2 | 11.7 | 0.542 |
+
+The maximum entropy of z is 44.4 nats. 86-94 of the 256 latent classes occur. The posterior carries 6-8 nats more than the prior, so the free nats of 1.0 almost never apply. On the full data, z carries information, unlike in the tiny-overfit test. The higher KL in `eval_seed` agrees with its unseen worlds. Free nats stay at 1.0. The latent shows no collapse that would need another setting.
+
+### Diagnosis
+
+The gradient on the encoder and RSSM core comes almost only from the ray-class term. At 1,000 updates, on one batch, the gradient norm from each loss term was:
+
+| Term | Loss | Gradient norm on encoder and core |
+|---|---|---|
+| Ray class | 822 | 223 |
+| Ray distance | 15.5 | 12.5 |
+| Inventory items | 0.62 | 1.10 |
+| Selected slot | 1.89 | 0.95 |
+| Scalars (with pitch) | 0.046 | 0.066 |
+
+The ray-class loss sums 825 categorical terms, while pitch is one squared error of a value divided by 90. The pitch error of 7 degrees costs (7 / 90)^2 = 0.006 in the loss. The objective is the correct likelihood under unit-variance Gaussians, but these variances do not fit the data: a change of 1 degree is important and a unit variance makes it free. The same holds for the ray distance. Hypothesis, not yet tested: a smaller fixed variance (a larger weight) for the continuous fields, or a mean instead of a sum over the rays, fixes pitch and copy behavior and makes the model use the action more. That changes the training objective, not the frozen architecture. It is the next experiment, not part of this run.
+
+### Compute
+
+| Item | Value |
+|---|---|
+| Update time, background QoS, efficiency cores | 0.66 s (800 sequence steps per second) |
+| Update time, default QoS (benchmark) | 0.177 s |
+| CPU energy, 3,000 updates with evaluations | 1,091 J (0.36 J per update) |
+| Wall-clock time | 2,131 s over 4 processes |
+| Die temperature | mean 53.7 C, max 59.2 C, one thermostat pause of 14 s |
+| One evaluation, 128 windows, one split | 9 s (imagination included) |
+| Peak memory of the benchmark process | 3.1 GB |
+
+Collection throughput is separate: the collector reached 93 environment steps per second with rendering and video (`docs/minecraft-spike.md`).
+
+### Not done
+
+- Render-distance benchmark for training workers (8, 6, 4). It needs Minecraft runs and does not affect offline training. It stays open.
+- Events that the data barely contains: inventory, health, food, hotbar selection and death. Their heads train, but no metric for them has enough examples.
+
 ## Commands
 
 ```
@@ -148,6 +258,14 @@ Cost: 2,000 updates in 666 s over two processes, 0.33 s per update on the effici
 .venv/bin/python -m minecraft_rl.sweep minecraft_world_model_train --seeds 0 \
     --output-root runs/stage3/tiny-overfit-v2 --duty-cycle 1.0 --time-budget 540 -- \
     --tiny-windows 8 --batch 8 --updates 2000 --eval-at 0,500,1000,2000
+```
+
+Held-out run:
+
+```
+.venv/bin/python -m minecraft_rl.sweep minecraft_world_model_train --seeds 0 \
+    --output-root runs/stage3/train-3000 --duty-cycle 1.0 --time-budget 570 -- \
+    --updates 3000 --eval-at 0,100,300,1000,2000,3000 --imagine-at 1000,3000
 ```
 
 If the time budget ends first, run the same command again. It continues from the saved state with the same results.
