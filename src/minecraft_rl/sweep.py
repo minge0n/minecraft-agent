@@ -56,7 +56,12 @@ TASKPOLICY = Path("/usr/sbin/taskpolicy")
 THERMOSTAT_POLL_SECONDS = 2.0
 TERMINATE_GRACE_SECONDS = 10.0
 STATE_FILE = "state.pt"
-RESUMABLE = ("imagination", "actor_critic", "dreamer_loop")
+RESUMABLE = (
+    "imagination",
+    "actor_critic",
+    "dreamer_loop",
+    "minecraft_world_model_train",
+)
 EXPERIMENTS = (
     "parity",
     "cue_recall",
@@ -65,6 +70,7 @@ EXPERIMENTS = (
     "actor_critic",
     "dreamer_loop",
     "stochastic_world",
+    "minecraft_world_model_train",
 )
 
 

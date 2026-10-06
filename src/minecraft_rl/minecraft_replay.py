@@ -14,6 +14,7 @@ keeps the categorical output layers small. Held-out data reports how often
 it hits the unknown index.
 """
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,6 +63,8 @@ class CompactVocabulary:
             for name in ("obs_inventory_item", "obs_armor_item", "obs_offhand_item"):
                 seen["item"] |= set(numpy.unique(a[name]).tolist())
             seen["effect"] |= set(numpy.unique(a["obs_effect_type"]).tolist())
+        # Raw index 0 means an empty slot. It is always kept and always maps
+        # to compact index 0, so "index > 0" still means a filled slot.
         seen["item"].add(0)
         seen["effect"].add(0)
         return cls({f: sorted(int(x) for x in seen[f]) for f in FAMILIES}, raw_sizes)
@@ -92,6 +95,11 @@ class CompactVocabulary:
             item_types=self.size("item"),
             effect_types=self.size("effect"),
         )
+
+    def identifier(self) -> str:
+        """A short hash of the id lists, for run metadata."""
+        text = json.dumps(self.ids, sort_keys=True).encode()
+        return hashlib.sha256(text).hexdigest()[:16]
 
     def to_json(self) -> dict[str, Any]:
         return {"ids": self.ids, "raw_sizes": self.raw_sizes}
@@ -177,15 +185,6 @@ class Batch:
     continues: torch.Tensor
     episodes: torch.Tensor
     starts: torch.Tensor
-
-    def to(self, device: torch.device) -> "Batch":
-        return Batch(
-            {k: v.to(device) for k, v in self.observations.items()},
-            self.actions.to(device),
-            self.continues.to(device),
-            self.episodes,
-            self.starts,
-        )
 
 
 class SequenceReplay:

@@ -1,23 +1,33 @@
 """Stage 3 RSSM world model of structured Minecraft observations.
 
 See docs/stage3-minecraft-world-model.md. The recurrent core is the Stage 2G
-RSSM (`rssm.py`): deterministic state h, 8 x 4... categorical state z, prior
-p(z | h), posterior q(z | h, e) with e the encoded observation, the same KL
+RSSM (`rssm.py`): a deterministic state h, a categorical state z, a prior
+p(z | h), a posterior q(z | h, e) with e the encoded observation, the same KL
 loss with free nats 1.0, and imagination that advances h and samples z from
 the prior without decoding observations. Only the input and output layers
 are new:
 
-- `ObservationEncoder` turns one observation into a vector e. The 25 x 33 ray
-  grid becomes per-ray features (a ray-kind embedding, a learned embedding of
-  the hit type within its kind, and the normalized distance), followed by a
-  small convolutional network. The self state uses normalized scalars and
-  learned item and effect embeddings.
-- `ActionEncoder` turns the factorized action (9 buttons, 2 camera deltas,
-  hotbar choice) into a vector.
-- `ObservationDecoder` predicts every observation field from s = [h, z] with
-  a loss that fits its type: cross-entropy for categorical fields, mean
-  squared error for normalized continuous fields, and masks where a field
-  has no meaning (no hit type on an empty ray).
+- `ObservationEncoder` turns one observation into a vector e. Each ray of
+  the 25 x 33 grid gets a learned embedding of its ray class and its
+  normalized distance. A ray class is one value for "no hit" plus one value
+  per hit type of each kind (block, fluid, entity), so kind and type form
+  one categorical variable. A ray-grid layer turns the grid into a vector.
+  The self state uses normalized scalars and learned item, effect and slot
+  embeddings.
+- The action is a vector of 9 buttons, 2 camera deltas and a one-hot hotbar
+  choice (`action_tensor`), followed by one learned layer.
+- `ObservationDecoder` predicts every observation field from s = [h, z].
+  The loss of one observation is its negative log-likelihood, summed over
+  all of its elements: cross-entropy for categorical fields and squared
+  error (a Gaussian with unit variance) for normalized continuous fields. A
+  field without meaning has a mask: no distance for a ray without a hit, and
+  no count, durability or effect timer for an empty slot.
+
+Two ray-grid layers exist. `conv` uses strided convolutions and transposed
+convolutions. `patch` cuts the grid into non-overlapping 4 x 4 patches and
+uses one linear layer per patch, the same weights for every patch. A patch
+layer is a convolution with kernel size equal to stride, and needs much less
+computation (docs/stage3-minecraft-world-model.md has the measurement).
 
 All embeddings start from random initialization. Ids are categorical
 indices into embedding tables, never numbers.
@@ -39,7 +49,7 @@ from minecraft_rl.minecraft_interface import (
     RAY_KIND_BLOCK,
     RAY_KIND_ENTITY,
     RAY_KIND_FLUID,
-    RAY_KINDS,
+    RAY_KIND_NONE,
 )
 from minecraft_rl.rssm import (
     categorical_entropy,
@@ -54,6 +64,7 @@ FOOD_SCALE = 20.0
 AIR_SCALE = 10.0
 ARMOR_SCALE = 20.0
 PITCH_SCALE = 90.0
+AMPLIFIER_SCALE = 4.0
 XP_LEVEL_LOG_SCALE = math.log1p(30.0)
 COUNT_LOG_SCALE = math.log1p(64.0)
 EFFECT_SECONDS_LOG_SCALE = math.log1p(600.0)
@@ -70,9 +81,33 @@ SCALARS = (
     "pitch",
 )
 
+# Field groups of the reconstruction loss, in report order.
+LOSS_TERMS = (
+    "ray_class",
+    "ray_distance",
+    "scalars",
+    "selected_slot",
+    "inventory_item",
+    "inventory_count",
+    "inventory_durability",
+    "armor_item",
+    "armor_durability",
+    "offhand_item",
+    "offhand_count",
+    "offhand_durability",
+    "effect_type",
+    "effect_amplifier",
+    "effect_seconds",
+    "effect_infinite",
+)
+
 
 @dataclass(frozen=True)
 class Vocabulary:
+    """Grid layout and category counts. Each count includes every value the
+    model can see, so a compact vocabulary passes its unknown index too.
+    Item index 0 and effect index 0 mean an empty slot."""
+
     rows: int
     columns: int
     max_distance: float
@@ -86,6 +121,42 @@ class Vocabulary:
     def rays(self) -> int:
         return self.rows * self.columns
 
+    @property
+    def ray_classes(self) -> int:
+        return 1 + self.block_types + self.fluid_types + self.entity_types
+
+    def kind_offsets(self) -> dict[int, int]:
+        """First ray class of each hit kind. Class 0 means no hit."""
+        return {
+            RAY_KIND_BLOCK: 1,
+            RAY_KIND_FLUID: 1 + self.block_types,
+            RAY_KIND_ENTITY: 1 + self.block_types + self.fluid_types,
+        }
+
+    def class_kinds(self) -> torch.Tensor:
+        """The ray kind of every ray class, shape (ray_classes,)."""
+        kinds = torch.full((self.ray_classes,), RAY_KIND_NONE, dtype=torch.long)
+        offsets = self.kind_offsets()
+        sizes = {
+            RAY_KIND_BLOCK: self.block_types,
+            RAY_KIND_FLUID: self.fluid_types,
+            RAY_KIND_ENTITY: self.entity_types,
+        }
+        for kind, first in offsets.items():
+            kinds[first : first + sizes[kind]] = kind
+        return kinds
+
+
+def ray_class(
+    kind: torch.Tensor, type_id: torch.Tensor, vocabulary: Vocabulary
+) -> torch.Tensor:
+    """The joint ray class of each ray: 0 for no hit, otherwise the offset of
+    the kind plus the type index within the kind."""
+    out = torch.zeros_like(kind, dtype=torch.long)
+    for value, first in vocabulary.kind_offsets().items():
+        out = torch.where(kind == value, first + type_id.long(), out)
+    return out
+
 
 @dataclass(frozen=True)
 class ModelConfig:
@@ -95,10 +166,14 @@ class ModelConfig:
     latent_variables: int = 16
     latent_classes: int = 16
     embed_dim: int = 256
-    type_embedding: int = 8
+    action_dim: int = 64
+    ray_embedding: int = 8
     item_embedding: int = 16
     effect_embedding: int = 8
-    conv_channels: int = 32
+    ray_layer: str = "patch"
+    encoder_channels: int = 16
+    decoder_channels: int = 16
+    patch: int = 4
     kl_prior_scale: float = 1.0
     kl_posterior_scale: float = 1.0
     free_nats: float = 1.0
@@ -167,86 +242,108 @@ def normalized_counts(count: torch.Tensor) -> torch.Tensor:
 def normalized_effect_seconds(
     seconds: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """A finite timer in [0, 1] and a flag for an infinite effect (-1)."""
     infinite = (seconds < 0).float()
     finite = torch.log1p(seconds.clamp(min=0)) / EFFECT_SECONDS_LOG_SCALE
     return finite, infinite
 
 
-class RayTypeEmbedding(nn.Module):
-    """One learned embedding table per ray kind. A ray of kind k looks up its
-    type in table k; an empty ray uses a zero vector."""
+def _patch_grid(rows: int, columns: int, patch: int) -> tuple[int, int]:
+    return math.ceil(rows / patch), math.ceil(columns / patch)
 
-    def __init__(self, vocabulary: Vocabulary, size: int) -> None:
+
+class PatchEncoder(nn.Module):
+    """(N, C, R, W) -> (N, patches * channels): one shared linear layer per
+    non-overlapping patch, after zero padding to whole patches."""
+
+    def __init__(self, inputs: int, channels: int, rows: int, columns: int, patch: int):
         super().__init__()
-        self.block = nn.Embedding(vocabulary.block_types, size)
-        self.fluid = nn.Embedding(vocabulary.fluid_types, size)
-        self.entity = nn.Embedding(vocabulary.entity_types, size)
+        self.rows, self.columns, self.patch = rows, columns, patch
+        self.grid_rows, self.grid_columns = _patch_grid(rows, columns, patch)
+        self.linear = nn.Linear(inputs * patch * patch, channels)
+        self.outputs = self.grid_rows * self.grid_columns * channels
 
-    def forward(self, kind: torch.Tensor, type_id: torch.Tensor) -> torch.Tensor:
-        out = torch.zeros(*kind.shape, self.block.embedding_dim, device=kind.device)
-        for table, value in (
-            (self.block, RAY_KIND_BLOCK),
-            (self.fluid, RAY_KIND_FLUID),
-            (self.entity, RAY_KIND_ENTITY),
-        ):
-            mask = kind == value
-            if mask.any():
-                out[mask] = table(type_id[mask].clamp(max=table.num_embeddings - 1))
-        return out
+    def forward(self, grid: torch.Tensor) -> torch.Tensor:
+        p = self.patch
+        grid = nn.functional.pad(
+            grid,
+            (
+                0,
+                self.grid_columns * p - self.columns,
+                0,
+                self.grid_rows * p - self.rows,
+            ),
+        )
+        n, c = grid.shape[:2]
+        patches = (
+            grid.reshape(n, c, self.grid_rows, p, self.grid_columns, p)
+            .permute(0, 2, 4, 1, 3, 5)
+            .reshape(n, self.grid_rows * self.grid_columns, c * p * p)
+        )
+        return nn.functional.elu(self.linear(patches)).flatten(1)
+
+
+class ConvEncoder(nn.Module):
+    def __init__(self, inputs: int, channels: int, rows: int, columns: int):
+        super().__init__()
+        c = channels
+        self.net = nn.Sequential(
+            nn.Conv2d(inputs, c, 3, stride=2, padding=1),
+            nn.ELU(),
+            nn.Conv2d(c, 2 * c, 3, stride=2, padding=1),
+            nn.ELU(),
+            nn.Conv2d(2 * c, 2 * c, 3, stride=2, padding=1),
+            nn.ELU(),
+            nn.Flatten(),
+        )
+        with torch.no_grad():
+            self.outputs = self.net(torch.zeros(1, inputs, rows, columns)).shape[1]
+
+    def forward(self, grid: torch.Tensor) -> torch.Tensor:
+        return self.net(grid)
 
 
 class ObservationEncoder(nn.Module):
     def __init__(self, vocabulary: Vocabulary, config: ModelConfig) -> None:
         super().__init__()
         self.vocabulary = vocabulary
-        self.kind_embedding = nn.Embedding(RAY_KINDS, 4)
-        self.type_embedding = RayTypeEmbedding(vocabulary, config.type_embedding)
-        channels = 4 + config.type_embedding + 1
-        c = config.conv_channels
-        self.conv = nn.Sequential(
-            nn.Conv2d(channels, c, 3, stride=2, padding=1),
-            nn.ELU(),
-            nn.Conv2d(c, 2 * c, 3, stride=2, padding=1),
-            nn.ELU(),
-            nn.Conv2d(2 * c, 2 * c, 3, stride=2, padding=1),
-            nn.ELU(),
-        )
-        with torch.no_grad():
-            conv_out = self.conv(
-                torch.zeros(1, channels, vocabulary.rows, vocabulary.columns)
-            ).numel()
-        self.item_embedding = nn.Embedding(vocabulary.item_types, config.item_embedding)
-        self.effect_embedding = nn.Embedding(
-            vocabulary.effect_types + 1, config.effect_embedding
-        )
+        v = vocabulary
+        self.ray_embedding = nn.Embedding(v.ray_classes, config.ray_embedding)
+        inputs = config.ray_embedding + 1
+        if config.ray_layer == "patch":
+            self.grid = PatchEncoder(
+                inputs, config.encoder_channels, v.rows, v.columns, config.patch
+            )
+        elif config.ray_layer == "conv":
+            self.grid = ConvEncoder(inputs, config.encoder_channels, v.rows, v.columns)
+        else:
+            raise ValueError(f"unknown ray layer {config.ray_layer!r}")
+        self.item_embedding = nn.Embedding(v.item_types, config.item_embedding)
+        self.effect_embedding = nn.Embedding(v.effect_types, config.effect_embedding)
         self.slot_embedding = nn.Embedding(HOTBAR_SLOTS, 8)
         stack = config.item_embedding + 2
-        self_size = (
+        self.self_size = (
             len(SCALARS)
             + 8
             + (INVENTORY_SLOTS + ARMOR_SLOTS + 1) * stack
             + EFFECT_SLOTS * (config.effect_embedding + 3)
         )
-        self.self_net = nn.Sequential(nn.Linear(self_size, config.embed_dim), nn.ELU())
+        self.self_net = nn.Sequential(
+            nn.Linear(self.self_size, config.embed_dim), nn.ELU()
+        )
         self.out = nn.Sequential(
-            nn.Linear(conv_out + config.embed_dim, config.embed_dim), nn.ELU()
+            nn.Linear(self.grid.outputs + config.embed_dim, config.embed_dim), nn.ELU()
         )
 
-    def forward(self, o: dict[str, torch.Tensor]) -> torch.Tensor:
-        lead = o["health"].shape
+    def rays(self, o: dict[str, torch.Tensor]) -> torch.Tensor:
         v = self.vocabulary
-        kind = o["ray_kind"].reshape(-1, v.rays)
-        rays = torch.cat(
-            [
-                self.kind_embedding(kind),
-                self.type_embedding(kind, o["ray_type"].reshape(-1, v.rays)),
-                (o["ray_distance"].reshape(-1, v.rays) / v.max_distance).unsqueeze(-1),
-            ],
-            -1,
-        )
-        grid = rays.reshape(-1, v.rows, v.columns, rays.shape[-1]).permute(0, 3, 1, 2)
-        visual = self.conv(grid).flatten(1)
+        classes = ray_class(o["ray_kind"], o["ray_type"], v).reshape(-1, v.rays)
+        distance = o["ray_distance"].reshape(-1, v.rays, 1) / v.max_distance
+        features = torch.cat([self.ray_embedding(classes), distance], -1)
+        grid = features.reshape(-1, v.rows, v.columns, features.shape[-1])
+        return self.grid(grid.permute(0, 3, 1, 2))
 
+    def self_state(self, o: dict[str, torch.Tensor]) -> torch.Tensor:
         def stacks(item, count, durability):
             return torch.cat(
                 [
@@ -261,14 +358,14 @@ class ObservationEncoder(nn.Module):
         effects = torch.cat(
             [
                 self.effect_embedding(o["effect_type"]),
-                (o["effect_amplifier"] / 4.0).unsqueeze(-1),
+                (o["effect_amplifier"] / AMPLIFIER_SCALE).unsqueeze(-1),
                 seconds.unsqueeze(-1),
                 infinite.unsqueeze(-1),
             ],
             -1,
         ).flatten(-2)
         armor_count = (o["armor_item"] > 0).float()
-        self_state = torch.cat(
+        features = torch.cat(
             [
                 normalized_scalars(o),
                 self.slot_embedding(o["selected_slot"]),
@@ -284,8 +381,12 @@ class ObservationEncoder(nn.Module):
                 effects,
             ],
             -1,
-        ).reshape(-1, self.self_net[0].in_features)
-        joint = torch.cat([visual, self.self_net(self_state)], -1)
+        )
+        return self.self_net(features.reshape(-1, self.self_size))
+
+    def forward(self, o: dict[str, torch.Tensor]) -> torch.Tensor:
+        lead = o["health"].shape
+        joint = torch.cat([self.rays(o), self.self_state(o)], -1)
         return self.out(joint).reshape(*lead, -1)
 
 
@@ -296,8 +397,8 @@ def action_tensor(
     buttons: torch.Tensor, camera: torch.Tensor, hotbar: torch.Tensor
 ) -> torch.Tensor:
     """The factorized action as a vector (..., 21): buttons, camera deltas
-    divided by 45 degrees, and a one-hot of the hotbar choice with slot 9
-    meaning keep."""
+    divided by the largest delta, and a one-hot of the hotbar choice with
+    index 9 meaning keep the current slot."""
     choice = torch.where(
         hotbar < 0, torch.full_like(hotbar, HOTBAR_SLOTS), hotbar
     ).long()
@@ -311,19 +412,46 @@ def action_tensor(
     )
 
 
-class ObservationDecoder(nn.Module):
-    """Predicts every observation field from s = [h, z]."""
+class PatchDecoder(nn.Module):
+    """features -> (N, R, W, channels): one linear layer to a patch grid,
+    then one shared linear layer that expands each patch to its rays."""
 
     def __init__(
-        self, vocabulary: Vocabulary, config: ModelConfig, features: int
-    ) -> None:
+        self, features: int, channels: int, rows: int, columns: int, patch: int
+    ):
         super().__init__()
-        self.vocabulary = vocabulary
-        c = config.conv_channels
-        self.grid_rows = math.ceil(vocabulary.rows / 8)
-        self.grid_columns = math.ceil(vocabulary.columns / 8)
+        self.rows, self.columns, self.patch, self.channels = (
+            rows,
+            columns,
+            patch,
+            channels,
+        )
+        self.grid_rows, self.grid_columns = _patch_grid(rows, columns, patch)
+        self.grid = nn.Linear(features, self.grid_rows * self.grid_columns * channels)
+        self.expand = nn.Linear(channels, patch * patch * channels)
+
+    def forward(self, s: torch.Tensor) -> torch.Tensor:
+        n, p, c = s.shape[0], self.patch, self.channels
+        cells = nn.functional.elu(self.grid(s)).reshape(
+            n, self.grid_rows * self.grid_columns, c
+        )
+        rays = nn.functional.elu(self.expand(cells))
+        rays = (
+            rays.reshape(n, self.grid_rows, self.grid_columns, p, p, c)
+            .permute(0, 1, 3, 2, 4, 5)
+            .reshape(n, self.grid_rows * p, self.grid_columns * p, c)
+        )
+        return rays[:, : self.rows, : self.columns]
+
+
+class ConvDecoder(nn.Module):
+    def __init__(self, features: int, channels: int, rows: int, columns: int):
+        super().__init__()
+        c = channels
+        self.rows, self.columns = rows, columns
+        self.grid_rows, self.grid_columns = _patch_grid(rows, columns, 8)
         self.grid = nn.Linear(features, 2 * c * self.grid_rows * self.grid_columns)
-        self.deconv = nn.Sequential(
+        self.net = nn.Sequential(
             nn.ELU(),
             nn.ConvTranspose2d(2 * c, 2 * c, 4, stride=2, padding=1),
             nn.ELU(),
@@ -332,59 +460,73 @@ class ObservationDecoder(nn.Module):
             nn.ConvTranspose2d(c, c, 4, stride=2, padding=1),
             nn.ELU(),
         )
-        self.ray_kind = nn.Conv2d(c, RAY_KINDS, 1)
-        self.ray_block = nn.Conv2d(c, vocabulary.block_types, 1)
-        self.ray_fluid = nn.Conv2d(c, vocabulary.fluid_types, 1)
-        self.ray_entity = nn.Conv2d(c, vocabulary.entity_types, 1)
-        self.ray_distance = nn.Conv2d(c, 1, 1)
+
+    def forward(self, s: torch.Tensor) -> torch.Tensor:
+        grid = self.grid(s).reshape(s.shape[0], -1, self.grid_rows, self.grid_columns)
+        out = self.net(grid)[:, :, : self.rows, : self.columns]
+        return out.permute(0, 2, 3, 1)
+
+
+class ObservationDecoder(nn.Module):
+    """Predicts every observation field from s = [h, z]."""
+
+    def __init__(
+        self, vocabulary: Vocabulary, config: ModelConfig, features: int
+    ) -> None:
+        super().__init__()
+        self.vocabulary = vocabulary
+        v, c = vocabulary, config.decoder_channels
+        if config.ray_layer == "patch":
+            self.grid = PatchDecoder(features, c, v.rows, v.columns, config.patch)
+        elif config.ray_layer == "conv":
+            self.grid = ConvDecoder(features, c, v.rows, v.columns)
+        else:
+            raise ValueError(f"unknown ray layer {config.ray_layer!r}")
+        self.ray_head = nn.Linear(c, v.ray_classes + 1)
         hidden = config.embed_dim
         self.self_trunk = nn.Sequential(nn.Linear(features, hidden), nn.ELU())
-        self.scalars = nn.Linear(hidden, len(SCALARS))
-        self.selected_slot = nn.Linear(hidden, HOTBAR_SLOTS)
-        self.inventory_item = nn.Linear(hidden, INVENTORY_SLOTS * vocabulary.item_types)
-        self.inventory_count = nn.Linear(hidden, INVENTORY_SLOTS)
-        self.armor_item = nn.Linear(hidden, ARMOR_SLOTS * vocabulary.item_types)
-        self.offhand_item = nn.Linear(hidden, vocabulary.item_types)
-        self.effect_type = nn.Linear(
-            hidden, EFFECT_SLOTS * (vocabulary.effect_types + 1)
+        self.heads = nn.ModuleDict(
+            {
+                "scalars": nn.Linear(hidden, len(SCALARS)),
+                "selected_slot": nn.Linear(hidden, HOTBAR_SLOTS),
+                "inventory_item": nn.Linear(hidden, INVENTORY_SLOTS * v.item_types),
+                "inventory_count": nn.Linear(hidden, INVENTORY_SLOTS),
+                "inventory_durability": nn.Linear(hidden, INVENTORY_SLOTS),
+                "armor_item": nn.Linear(hidden, ARMOR_SLOTS * v.item_types),
+                "armor_durability": nn.Linear(hidden, ARMOR_SLOTS),
+                "offhand_item": nn.Linear(hidden, v.item_types),
+                "offhand_count": nn.Linear(hidden, 1),
+                "offhand_durability": nn.Linear(hidden, 1),
+                "effect_type": nn.Linear(hidden, EFFECT_SLOTS * v.effect_types),
+                "effect_amplifier": nn.Linear(hidden, EFFECT_SLOTS),
+                "effect_seconds": nn.Linear(hidden, EFFECT_SLOTS),
+                "effect_infinite": nn.Linear(hidden, EFFECT_SLOTS),
+            }
         )
 
     def forward(self, s: torch.Tensor) -> dict[str, torch.Tensor]:
         lead = s.shape[:-1]
         flat = s.reshape(-1, s.shape[-1])
         v = self.vocabulary
-        grid = self.grid(flat).reshape(
-            flat.shape[0], -1, self.grid_rows, self.grid_columns
-        )
-        grid = self.deconv(grid)[:, :, : v.rows, : v.columns]
-
-        def per_ray(head):
-            out = head(grid).permute(0, 2, 3, 1).reshape(flat.shape[0], v.rays, -1)
-            return out.reshape(*lead, v.rays, -1)
-
+        rays = self.ray_head(self.grid(flat)).reshape(*lead, v.rays, -1)
         trunk = self.self_trunk(flat)
-        return {
-            "ray_kind": per_ray(self.ray_kind),
-            "ray_block": per_ray(self.ray_block),
-            "ray_fluid": per_ray(self.ray_fluid),
-            "ray_entity": per_ray(self.ray_entity),
-            "ray_distance": per_ray(self.ray_distance).squeeze(-1),
-            "scalars": self.scalars(trunk).reshape(*lead, -1),
-            "selected_slot": self.selected_slot(trunk).reshape(*lead, -1),
-            "inventory_item": self.inventory_item(trunk).reshape(
-                *lead, INVENTORY_SLOTS, v.item_types
-            ),
-            "inventory_count": self.inventory_count(trunk).reshape(
-                *lead, INVENTORY_SLOTS
-            ),
-            "armor_item": self.armor_item(trunk).reshape(
-                *lead, ARMOR_SLOTS, v.item_types
-            ),
-            "offhand_item": self.offhand_item(trunk).reshape(*lead, v.item_types),
-            "effect_type": self.effect_type(trunk).reshape(
-                *lead, EFFECT_SLOTS, v.effect_types + 1
-            ),
+        out = {
+            "ray_class": rays[..., :-1],
+            "ray_distance": rays[..., -1],
         }
+        shapes = {
+            "inventory_item": (INVENTORY_SLOTS, v.item_types),
+            "armor_item": (ARMOR_SLOTS, v.item_types),
+            "effect_type": (EFFECT_SLOTS, v.effect_types),
+        }
+        for name, head in self.heads.items():
+            value = head(trunk)
+            if name in shapes:
+                value = value.reshape(-1, *shapes[name])
+            elif name in ("offhand_count", "offhand_durability"):
+                value = value.squeeze(-1)
+            out[name] = value.reshape(*lead, *value.shape[1:])
+        return out
 
 
 def _cross_entropy(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -394,45 +536,81 @@ def _cross_entropy(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     ).reshape(target.shape)
 
 
-def reconstruction_losses(
-    prediction: dict[str, torch.Tensor], o: dict[str, torch.Tensor], max_distance: float
+def targets(
+    o: dict[str, torch.Tensor], vocabulary: Vocabulary
 ) -> dict[str, torch.Tensor]:
-    """Per-state loss of each field group, shape (...). Ray terms average over
-    rays. A hit-type loss counts only rays of that kind."""
-    kind = o["ray_kind"]
-    out = {"ray_kind": _cross_entropy(prediction["ray_kind"], kind).mean(-1)}
-    for name, value in (
-        ("ray_block", RAY_KIND_BLOCK),
-        ("ray_fluid", RAY_KIND_FLUID),
-        ("ray_entity", RAY_KIND_ENTITY),
-    ):
-        mask = (kind == value).float()
-        target = torch.where(
-            kind == value, o["ray_type"], torch.zeros_like(o["ray_type"])
-        )
-        target = target.clamp(max=prediction[name].shape[-1] - 1)
-        out[name] = (_cross_entropy(prediction[name], target) * mask).sum(
-            -1
-        ) / mask.shape[-1]
-    distance = o["ray_distance"] / max_distance
-    out["ray_distance"] = ((prediction["ray_distance"] - distance) ** 2).mean(-1)
-    out["scalars"] = ((prediction["scalars"] - normalized_scalars(o)) ** 2).mean(-1)
-    out["selected_slot"] = _cross_entropy(
-        prediction["selected_slot"], o["selected_slot"]
-    )
-    out["inventory_item"] = _cross_entropy(
-        prediction["inventory_item"], o["inventory_item"]
-    ).mean(-1)
-    out["inventory_count"] = (
-        (prediction["inventory_count"] - normalized_counts(o["inventory_count"])) ** 2
-    ).mean(-1)
-    out["armor_item"] = _cross_entropy(prediction["armor_item"], o["armor_item"]).mean(
-        -1
-    )
-    out["offhand_item"] = _cross_entropy(prediction["offhand_item"], o["offhand_item"])
-    out["effect_type"] = _cross_entropy(
-        prediction["effect_type"], o["effect_type"]
-    ).mean(-1)
+    """Loss targets and masks in model units. A mask is 1 where the field has
+    a meaning: a hit for the ray distance, a filled slot for counts and
+    durability bars, an active effect for amplifier and timer."""
+    v = vocabulary
+    seconds, infinite = normalized_effect_seconds(o["effect_seconds"])
+    filled = (o["inventory_item"] > 0).float()
+    armor = (o["armor_item"] > 0).float()
+    offhand = (o["offhand_item"] > 0).float()
+    effect = (o["effect_type"] > 0).float()
+    return {
+        "ray_class": ray_class(o["ray_kind"], o["ray_type"], v),
+        "ray_distance": o["ray_distance"] / v.max_distance,
+        "ray_distance_mask": (o["ray_kind"] != RAY_KIND_NONE).float(),
+        "scalars": normalized_scalars(o),
+        "selected_slot": o["selected_slot"],
+        "inventory_item": o["inventory_item"],
+        "inventory_count": normalized_counts(o["inventory_count"]),
+        "inventory_count_mask": filled,
+        "inventory_durability": o["inventory_durability"],
+        "inventory_durability_mask": filled,
+        "armor_item": o["armor_item"],
+        "armor_durability": o["armor_durability"],
+        "armor_durability_mask": armor,
+        "offhand_item": o["offhand_item"],
+        "offhand_count": normalized_counts(o["offhand_count"]),
+        "offhand_count_mask": offhand,
+        "offhand_durability": o["offhand_durability"],
+        "offhand_durability_mask": offhand,
+        "effect_type": o["effect_type"],
+        "effect_amplifier": o["effect_amplifier"] / AMPLIFIER_SCALE,
+        "effect_amplifier_mask": effect,
+        "effect_seconds": seconds,
+        "effect_seconds_mask": effect * (1.0 - infinite),
+        "effect_infinite": infinite,
+        "effect_infinite_mask": effect,
+    }
+
+
+CATEGORICAL_TERMS = (
+    "ray_class",
+    "selected_slot",
+    "inventory_item",
+    "armor_item",
+    "offhand_item",
+    "effect_type",
+)
+BINARY_TERMS = ("effect_infinite",)
+
+
+def reconstruction_losses(
+    prediction: dict[str, torch.Tensor],
+    o: dict[str, torch.Tensor],
+    vocabulary: Vocabulary,
+) -> dict[str, torch.Tensor]:
+    """Negative log-likelihood of each field group per state, shape (...),
+    summed over the elements of the group and over valid elements only."""
+    t = targets(o, vocabulary)
+    lead = o["health"].dim()
+    out = {}
+    for name in LOSS_TERMS:
+        if name in CATEGORICAL_TERMS:
+            element = _cross_entropy(prediction[name], t[name])
+        elif name in BINARY_TERMS:
+            element = nn.functional.binary_cross_entropy_with_logits(
+                prediction[name], t[name], reduction="none"
+            )
+        else:
+            element = (prediction[name] - t[name]) ** 2
+        mask = t.get(f"{name}_mask")
+        if mask is not None:
+            element = element * mask
+        out[name] = element.reshape(*element.shape[:lead], -1).sum(-1)
     return out
 
 
@@ -453,10 +631,12 @@ class MinecraftRSSM(nn.Module):
         self.variables = config.latent_variables
         self.classes = config.latent_classes
         self.latent_size = self.variables * self.classes
-        features = self.hidden + self.latent_size
+        self.features = self.hidden + self.latent_size
         self.encoder = ObservationEncoder(vocabulary, config)
-        self.action_net = nn.Sequential(nn.Linear(ACTION_SIZE, 64), nn.ELU())
-        self.cell = nn.GRUCell(self.latent_size + 64, self.hidden)
+        self.action_net = nn.Sequential(
+            nn.Linear(ACTION_SIZE, config.action_dim), nn.ELU()
+        )
+        self.cell = nn.GRUCell(self.latent_size + config.action_dim, self.hidden)
         self.prior_net = nn.Sequential(
             nn.Linear(self.hidden, self.hidden),
             nn.ELU(),
@@ -467,8 +647,8 @@ class MinecraftRSSM(nn.Module):
             nn.ELU(),
             nn.Linear(self.hidden, self.latent_size),
         )
-        self.decoder = ObservationDecoder(vocabulary, config, features)
-        self.continue_head = nn.Linear(features, 1)
+        self.decoder = ObservationDecoder(vocabulary, config, self.features)
+        self.continue_head = nn.Linear(self.features, 1)
         self.mode_latents = False
 
     def prior_logits(self, h: torch.Tensor) -> torch.Tensor:
@@ -493,18 +673,17 @@ class MinecraftRSSM(nn.Module):
         mode = self.mode_latents and not straight_through
         return sample_one_hot(logits, generator, straight_through, mode).flatten(-2)
 
-    def filter(
+    def filter_embedded(
         self,
-        o: dict[str, torch.Tensor],
+        embedded: torch.Tensor,
         actions: torch.Tensor,
         generator: torch.Generator | None,
         straight_through: bool = False,
     ) -> dict[str, torch.Tensor]:
-        """Posterior states for observations (batch, L + 1, ...) and actions
-        (batch, L, 21): h, z, prior and posterior logits over L + 1 states."""
-        embedded = self.encoder(o)
+        """Posterior states for encoded observations (batch, L + 1, E) and
+        actions (batch, L, 21): h, z, prior and posterior logits."""
         batch, length = embedded.shape[:2]
-        h = torch.zeros(batch, self.hidden, device=embedded.device)
+        h = torch.zeros(batch, self.hidden)
         hs, zs, priors, posteriors = [], [], [], []
         for k in range(length):
             if k > 0:
@@ -523,6 +702,17 @@ class MinecraftRSSM(nn.Module):
             "posterior": torch.stack(posteriors, 1),
         }
 
+    def filter(
+        self,
+        o: dict[str, torch.Tensor],
+        actions: torch.Tensor,
+        generator: torch.Generator | None,
+        straight_through: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        return self.filter_embedded(
+            self.encoder(o), actions, generator, straight_through
+        )
+
     def losses(
         self,
         o: dict[str, torch.Tensor],
@@ -530,11 +720,12 @@ class MinecraftRSSM(nn.Module):
         continues: torch.Tensor,
         generator: torch.Generator | None,
     ) -> dict[str, torch.Tensor]:
-        """Negative evidence lower bound per state, averaged over the batch.
-        `continues` (batch, L) is 0 for the transition that ended an episode."""
+        """Negative evidence lower bound per state, averaged over the batch
+        and the L + 1 states. `continues` (batch, L) is 0 for the transition
+        that ended an episode."""
         filtered = self.filter(o, actions, generator, straight_through=True)
         s = torch.cat([filtered["h"], filtered["z"]], -1)
-        terms = reconstruction_losses(self.decoder(s), o, self.vocabulary.max_distance)
+        terms = reconstruction_losses(self.decoder(s), o, self.vocabulary)
         continuation = nn.functional.binary_cross_entropy_with_logits(
             self.continue_head(s[:, 1:]).squeeze(-1), continues, reduction="none"
         )
@@ -549,7 +740,7 @@ class MinecraftRSSM(nn.Module):
         out = {name: value.mean() for name, value in terms.items()}
         out["continuation"] = continuation.mean()
         raw_kl = categorical_kl_per_variable(posterior, prior).sum(-1)
-        out["kl"] = raw_kl.mean()
+        out["kl"] = raw_kl.mean().detach()
         out["kl_loss"] = regularizer.mean()
         out["kl_below_free_nats"] = (
             (raw_kl < self.config.free_nats).float().mean().detach()
@@ -576,13 +767,17 @@ class MinecraftRSSM(nn.Module):
         return torch.stack(states, 1)
 
 
+def parameter_count(module: nn.Module) -> int:
+    return sum(p.numel() for p in module.parameters())
+
+
 def latent_statistics(
     filtered: dict[str, torch.Tensor], free_nats: float
 ) -> dict[str, float]:
     """Stage 2G latent diagnostics over all states of a batch."""
     posterior, prior = filtered["posterior"], filtered["prior"]
     per_variable = categorical_kl_per_variable(posterior, prior)
-    kl = per_variable.sum(-1)
+    kl = per_variable.sum(-1).flatten()
     classes = posterior.shape[-1]
     winners = (
         nn.functional.one_hot(posterior.argmax(-1), classes).flatten(0, -3).float()
@@ -590,15 +785,15 @@ def latent_statistics(
     frequency = winners.mean(0)
     perplexity = torch.exp(-(frequency * frequency.clamp(min=1e-12).log()).sum(-1))
     agreement = (prior.argmax(-1) == posterior.argmax(-1)).float()
-    regularizer = kl.clamp(min=free_nats)
+    variable_kl = per_variable.flatten(0, -2).mean(0)
     return {
         "kl_mean": kl.mean().item(),
         "kl_p50": kl.median().item(),
-        "kl_p90": kl.quantile(0.9).item() if kl.numel() < 16_000_000 else float("nan"),
-        "kl_posterior_part_effective": regularizer.mean().item(),
+        "kl_p90": kl.quantile(0.9).item(),
+        "kl_effective_posterior_part": kl.clamp(min=free_nats).mean().item(),
         "below_free_nats_fraction": (kl < free_nats).float().mean().item(),
-        "kl_per_variable": per_variable.flatten(0, -2).mean(0).tolist(),
-        "active_variables": int((per_variable.flatten(0, -2).mean(0) > 0.01).sum()),
+        "kl_per_variable": variable_kl.tolist(),
+        "active_variables": int((variable_kl > 0.01).sum()),
         "prior_entropy": categorical_entropy(prior).mean().item(),
         "posterior_entropy": categorical_entropy(posterior).mean().item(),
         "maximum_entropy": posterior.shape[-2] * math.log(classes),
@@ -607,3 +802,28 @@ def latent_statistics(
         "class_perplexity_mean": perplexity.mean().item(),
         "prior_posterior_agreement": agreement.mean().item(),
     }
+
+
+def save_checkpoint(path, model: MinecraftRSSM, extra: dict | None = None) -> None:
+    """Weights, config and vocabulary. Loads with `weights_only=True`."""
+    torch.save(
+        {
+            "format": "minecraft-rssm-checkpoint-v1",
+            "config": model.config.to_json(),
+            "vocabulary": asdict(model.vocabulary),
+            "state_dict": model.state_dict(),
+            "extra": extra or {},
+        },
+        path,
+    )
+
+
+def load_checkpoint(path) -> tuple[MinecraftRSSM, dict]:
+    data = torch.load(path, weights_only=True)
+    if data.get("format") != "minecraft-rssm-checkpoint-v1":
+        raise ValueError(f"{path} is not a Minecraft RSSM checkpoint")
+    model = MinecraftRSSM(
+        Vocabulary(**data["vocabulary"]), ModelConfig(**data["config"])
+    )
+    model.load_state_dict(data["state_dict"])
+    return model, data["extra"]
