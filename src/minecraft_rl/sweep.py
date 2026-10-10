@@ -20,6 +20,13 @@ The runner limits heat in four ways:
    resumes them when the temperature is at or below `--resume-temperature`
    and the pressure is back at the limit, or after `--max-pause` seconds.
 
+The runner reads the CPU energy counter of each seed process
+(`macos_energy.py`). A pause can only remove the heat of the seed processes.
+If the die is above the limit but the seed processes use less than
+`--min-pause-power` watts together, other programs make the heat, and a
+pause would only make the run longer. The runner then does not pause and
+counts the event. A thermal pressure above the limit always pauses.
+
 A seed whose `metrics.json` exists is skipped, so the same command resumes an
 interrupted sweep. `--rerun` disables this. With `--time-budget`, the sweep
 starts no new seed after that many seconds. A resumable experiment (imagination,
@@ -49,6 +56,7 @@ from pathlib import Path
 from types import FrameType
 from typing import IO, Any
 
+from minecraft_rl import macos_energy
 from minecraft_rl.macos_thermal import THERMAL_LEVELS, CpuTemperature, thermal_pressure
 from minecraft_rl.resumable import INCOMPLETE_EXIT_CODE
 
@@ -144,6 +152,7 @@ class Settings:
     max_thermal_level: int = 0
     cooldown_seconds: float = 0.0
     max_pause_seconds: float = 120.0
+    min_pause_watts: float = 2.0
     time_budget: float | None = None
 
 
@@ -170,13 +179,25 @@ class Thermostat:
     def read(self) -> Reading:
         return Reading(self._temperature(), self._pressure())
 
+    def pressure_too_high(self, reading: Reading) -> bool:
+        return (
+            reading.pressure is not None
+            and reading.pressure > self.settings.max_thermal_level
+        )
+
     def too_hot(self, reading: Reading) -> bool:
         return (
             reading.temperature is not None
             and reading.temperature > self.settings.max_temperature
-        ) or (
-            reading.pressure is not None
-            and reading.pressure > self.settings.max_thermal_level
+        ) or self.pressure_too_high(reading)
+
+    def pause_helps(self, reading: Reading, seed_watts: float | None) -> bool:
+        """A pause on temperature alone helps only if the seed processes make
+        a real part of the heat. Unknown power counts as a real part."""
+        return (
+            self.pressure_too_high(reading)
+            or seed_watts is None
+            or seed_watts >= self.settings.min_pause_watts
         )
 
     def cool_enough(self, reading: Reading) -> bool:
@@ -214,6 +235,26 @@ class SeedRun:
     thermostat_pause_seconds: float = 0.0
     thermostat_pause_events: int = 0
     temperatures: list[float] = field(default_factory=list)
+    energy: macos_energy.Counters | None = None
+    energy_time: float | None = None
+    recent_watts: float | None = None
+    skipped_pause_events: int = 0
+
+    def sample_energy(self) -> None:
+        """Keep the last CPU energy counters of the process, and its mean
+        power since the previous sample. macOS drops the counters when the
+        process exits, so the runner reads them every period. `taskpolicy`
+        replaces itself with the experiment, so the process ID stays the
+        same."""
+        counters = macos_energy.read(self.process.pid)
+        if counters is None:
+            return
+        now = time.monotonic()
+        if self.energy is not None and self.energy_time is not None:
+            seconds = now - self.energy_time
+            if seconds > 0:
+                self.recent_watts = (counters - self.energy).energy_joules / seconds
+        self.energy, self.energy_time = counters, now
 
 
 def cool_down(
@@ -252,16 +293,23 @@ def throttle_period(
     the rest of the period."""
     processes = [run.process for run in runs]
     time.sleep(settings.period * settings.duty_cycle)
+    for run in runs:
+        run.sample_energy()
     reading = thermostat.read()
     if reading.temperature is not None:
         for run in runs:
             run.temperatures.append(reading.temperature)
     if thermostat.too_hot(reading):
-        paused = cool_down(processes, thermostat, reading)
+        watts = [run.recent_watts for run in runs]
+        seed_watts = None if None in watts else sum(watts)
+        if thermostat.pause_helps(reading, seed_watts):
+            paused = cool_down(processes, thermostat, reading)
+            for run in runs:
+                run.thermostat_pause_seconds += paused
+                run.thermostat_pause_events += 1
+            return
         for run in runs:
-            run.thermostat_pause_seconds += paused
-            run.thermostat_pause_events += 1
-        return
+            run.skipped_pause_events += 1
     if settings.duty_cycle >= 1.0:
         return
     signal_all(processes, signal.SIGSTOP)
@@ -291,6 +339,13 @@ def sweep_record(
     experiment: str, run: SeedRun, settings: Settings, directory: Path
 ) -> dict[str, Any]:
     temperatures = run.temperatures
+    energy = run.energy
+    compute_seconds = (
+        time.monotonic()
+        - run.started
+        - run.duty_cycle_pause_seconds
+        - run.thermostat_pause_seconds
+    )
     return {
         "experiment": experiment,
         "seed": run.seed,
@@ -308,11 +363,22 @@ def sweep_record(
         "duty_cycle_pause_seconds": run.duty_cycle_pause_seconds,
         "thermostat_pause_seconds": run.thermostat_pause_seconds,
         "thermostat_pause_events": run.thermostat_pause_events,
+        "min_pause_watts": settings.min_pause_watts,
+        "skipped_pause_events": run.skipped_pause_events,
         "temperature_samples": len(temperatures),
         "temperature_mean_celsius": sum(temperatures) / len(temperatures)
         if temperatures
         else None,
         "temperature_max_celsius": max(temperatures) if temperatures else None,
+        "cpu_energy_joules": None if energy is None else energy.energy_joules,
+        "performance_core_energy_joules": (
+            None if energy is None else energy.performance_core_energy_joules
+        ),
+        "mean_cpu_power_watts_while_computing": (
+            None
+            if energy is None or compute_seconds <= 0
+            else energy.energy_joules / compute_seconds
+        ),
         "thermal_pressure_at_start": run.pressure_at_start,
         "thermal_pressure_at_end": thermal_pressure(),
         "experiment_threads": child_threads(directory / "metrics.json"),
@@ -371,6 +437,9 @@ def write_record(directory: Path, record: dict[str, Any], complete: bool) -> Non
         ),
         "total_thermostat_pause_events": sum(
             p["thermostat_pause_events"] for p in processes
+        ),
+        "total_cpu_energy_joules": sum(
+            p.get("cpu_energy_joules") or 0.0 for p in processes
         ),
     }
     path.write_text(json.dumps(total, indent=2) + "\n", encoding="utf-8")
@@ -513,6 +582,14 @@ def main() -> None:
         help="longest thermostat pause in seconds before the processes resume",
     )
     parser.add_argument(
+        "--min-pause-power",
+        type=float,
+        default=defaults.min_pause_watts,
+        help="pause on die temperature only if the seed processes use at "
+        "least this many watts together; a thermal pressure above the limit "
+        "always pauses",
+    )
+    parser.add_argument(
         "--cooldown",
         type=float,
         default=defaults.cooldown_seconds,
@@ -556,6 +633,7 @@ def main() -> None:
         max_thermal_level=args.max_thermal_level,
         cooldown_seconds=args.cooldown,
         max_pause_seconds=args.max_pause,
+        min_pause_watts=args.min_pause_power,
         time_budget=args.time_budget,
     )
     requested = parse_seeds(args.seeds)

@@ -127,14 +127,20 @@ class Session:
     def sessions(self) -> int:
         return self.sessions_before + 1
 
-    def boundary(self, state: Callable[[], dict[str, Any]]) -> None:
+    def boundary(
+        self, state: Callable[[], dict[str, Any]], force: bool = False
+    ) -> None:
         """Mark the end of one unit of work. If the time limit has passed,
-        save `state()` and raise `Incomplete`. Each process does at least one
-        unit, so a run always makes progress."""
+        or `force` is set, save `state()` and raise `Incomplete`. Each process
+        does at least one unit, so a run always makes progress. `force` is for
+        a planned stop, such as a staged training budget."""
         self.units_done += 1
-        if self.path is None or self.stop_after_seconds is None:
+        if self.path is None:
             return
-        if time.monotonic() - self.started < self.stop_after_seconds:
+        if not force and (
+            self.stop_after_seconds is None
+            or time.monotonic() - self.started < self.stop_after_seconds
+        ):
             return
         data = {
             "format": STATE_FORMAT,

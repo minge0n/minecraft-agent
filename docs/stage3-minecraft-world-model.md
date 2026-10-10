@@ -2,7 +2,9 @@
 
 Purpose: learn short-horizon dynamics from real structured Minecraft transitions with the Stage 2G RSSM (`docs/stage2g.md`), and compare the model against trivial baselines. No actor is trained. No reward exists: the reward design is a separate later milestone.
 
-Status: first held-out run complete, with a mixed result. The model predicts changed rays better than every baseline. It predicts unchanged content and pitch worse than persistence, and it uses the action only weakly. The likely cause is the scale of the loss terms (section "Diagnosis"). The model is not yet good enough for actor training.
+Status: first held-out run and the follow-up on loss balance complete. The follow-up selected and froze the objective G (section "Follow-up: balance of the loss components"). The model is still not ready for actor training: it uses the action only weakly, and pitch prediction stays far behind persistence.
+
+First held-out run: complete, with a mixed result. The model predicts changed rays better than every baseline. It predicts unchanged content and pitch worse than persistence, and it uses the action only weakly. The likely cause is the scale of the loss terms (section "Diagnosis"). The model is not yet good enough for actor training.
 
 ## Data
 
@@ -251,6 +253,159 @@ Collection throughput is separate: the collector reached 93 environment steps pe
 - Render-distance benchmark for training workers (8, 6, 4). It needs Minecraft runs and does not affect offline training. It stays open.
 - Events that the data barely contains: inventory, health, food, hotbar selection and death. Their heads train, but no metric for them has enough examples.
 
+## Follow-up: balance of the loss components
+
+Question: does the summed ray-class loss crowd out the other fields, and does a loss that weighs each field by its meaning instead of by its element count improve continuous prediction and action use? The model, data, splits, seed 0, batch, sequence length, optimizer, learning rate, clip and free nats stayed as in the held-out run. Only the objective changed.
+
+### Original imbalance
+
+Under the original objective ("sum"), each field adds the sum of its element losses per observation. The ray class adds 825 cross-entropy terms, the pitch one squared error in units of 90 degrees. `src/minecraft_rl/minecraft_gradients.py` measures the gradient of each loss group alone, with its training weight, on one fixed batch, at three shared places: the ray encoder, the RSSM core (GRU cell, action layer, prior, posterior) and the decoder input s = [h, z]. Under "sum" at 1,000 updates:
+
+| Component | Loss | Ray encoder | RSSM core | s = [h, z] |
+|---|---|---|---|---|
+| Ray class | 787 | 118.4 | 118.9 | 6.64 |
+| Ray distance | 13.3 | 7.1 | 7.7 | 0.27 |
+| Self state | 2.19 | 0.67 | 0.71 | 0.023 |
+| Pitch (part of self state) | 0.017 | 0.048 | 0.049 | 0.002 |
+| Inventory | 0.89 | 1.34 | 1.13 | 0.040 |
+| Continuation | 0.0004 | 0.001 | 0.001 | 0.0001 |
+| KL | 11.9 | 5.7 | 7.2 | 0 |
+
+The ray class moves the RSSM core 170 times more than the self state and 2,400 times more than the pitch.
+
+### Objective variants
+
+`Objective` in `src/minecraft_rl/minecraft_world_model.py` sets a reduction, a fixed weight per loss group (`LOSS_GROUPS`: ray class, ray distance, self state, inventory, plus continuation and KL) and a `component_scale` on every reconstruction component and the continuation loss. The KL keeps its Stage 2G form with free nats 1.0.
+
+| Variant | Reduction | Weights | Description |
+|---|---|---|---|
+| A | `sum` | none | The original log likelihood. Identical to the held-out run. |
+| B | `ray_mean` | none | As A, but the ray class is the mean over the rays. |
+| C | `semantic_mean` | none | Each term is the mean over its own valid elements. Each of the 9 scalars is its own component. |
+| D | `semantic_mean` | KL 1/825 | As C, with the KL scaled down by the ray count. |
+| E | `semantic_mean` | scale 825 | As C, with every component scaled up by the ray count. |
+| G | `group_mean` | scale 825 | As E, then each loss group is the mean of its valid components. |
+
+The continuous targets keep their fixed game ranges (`docs/decisions/observation.md`): ray distance / 32, health, max health and absorption / 20, food / 20, air / 10, armor / 20, pitch / 90, XP level as log1p(level) / log1p(30), XP progress as it is, stack count as log1p(count) / log1p(64), durability as the 13-step bar, effect amplifier / 4, effect seconds as log1p(seconds) / log1p(600) with a flag for an infinite effect. No new transform was needed: every field already lies in [0, 1] or [-1, 1].
+
+A component with no valid element in the batch adds nothing. An empty armor slot, for example, has no durability component.
+
+### Staged budget
+
+All variants ran 500 updates first. Only variants without an early failure continued: E and G to 1,000 updates, G to 3,000. A is the held-out run itself. A rerun of A reproduced its metrics at 1,000 updates bit for bit, so the earlier 3,000-update run of A is the baseline at 3,000 updates.
+
+`eval_episode`, one-step prior prediction:
+
+| Variant | Updates | Ray accuracy | Changed rays | Ray distance (blocks) | Pitch (degrees) | Latent KL | Active variables |
+|---|---|---|---|---|---|---|---|
+| A | 500 | 0.580 | 0.309 | 3.71 | 8.04 | 4.3 | 16 |
+| B | 500 | 0.319 | 0.250 | 2.63 | 8.18 | 1.5 | 16 |
+| C | 500 | 0.349 | 0.269 | 3.81 | 10.62 | 0.8 | 16 |
+| D | 500 | 0.326 | 0.269 | 3.82 | 9.59 | 0.2 | 4 |
+| E | 500 | 0.414 | 0.265 | 3.78 | 10.19 | 1.4 | 6 |
+| E | 1,000 | 0.421 | 0.268 | 3.66 | 10.97 | 0.8 | 6 |
+| G | 1,000 | 0.705 | 0.353 | 3.38 | 7.61 | 4.3 | 16 |
+| A | 1,000 | 0.714 | 0.357 | 3.46 | 7.64 | 4.4 | 16 |
+
+B, C and D failed early. They share a cause: once the ray class is a mean, its gradient is 825 times smaller, and the whole loss falls from about 3,600 to about 4-18. Adam divides each gradient by its running root mean square plus eps = 1e-5. With losses this small, the second-moment estimate of 15-90% of the parameters in the prior, the GRU cell, the self-state encoder and the decoder grid was below eps (measured on the optimizer state at 500 updates), so Adam stopped scaling those gradients up and the parts learned slowly. D also scaled the KL down and its latent collapsed (4 of 16 variables active, KL 0.24 nats). The ray accuracy of B, C and D at 500 updates was 0.32-0.35, the same as their posterior reconstruction, so the decoder had not learned the scene.
+
+E kept the ray class at its old scale and raised every other component by 825. It then failed in a different way. The selected-slot cross-entropy (9 slots, entropy 2.15 nats) became the largest self-state term, its training loss fell from 2.2 to 0.4 nats, and the self-state gradient on the RSSM core was 2,425 against 523 for the ray class. The latent fell to 6 active variables, and the one-step changed-ray accuracy stayed at 0.27. Negative result: per-component means give every small field the weight of the whole ray grid, and a field with many classes and almost no change then dominates.
+
+G fixed that by averaging the components inside each group. It reached the same values as A at 1,000 updates (0.353 against 0.357 on changed rays) with 16 active variables.
+
+### Gradient balance under G
+
+| Component | Update 1,000 core | Update 3,000 loss | Ray encoder | RSSM core | s = [h, z] |
+|---|---|---|---|---|---|
+| Ray class | 145.3 | 555 | 129.3 | 194.3 | 8.97 |
+| Ray distance | 7.2 | 11.6 | 9.6 | 8.1 | 0.32 |
+| Self state | 52.8 | 4.9 | 12.8 | 26.9 | 2.18 |
+| Pitch (part of self state) | 2.4 | 0.82 | 1.7 | 2.0 | 0.11 |
+| Inventory | 17.9 | 3.7 | 9.3 | 12.1 | 0.44 |
+| Continuation | 0.22 | 0.025 | 0.10 | 0.14 | 0.005 |
+| KL | 6.8 | 16.2 | 4.2 | 6.6 | 0 |
+
+The ratio of ray class to self state on the RSSM core falls from 170 under A to 7 at 3,000 updates under G, and from 2,400 to 99 for the pitch. G removes the dominance that came only from tensor size.
+
+### Result at 3,000 updates: A against G
+
+| Metric | Split | A | G | Persistence |
+|---|---|---|---|---|
+| Ray accuracy | `eval_episode` | 0.761 | 0.761 | 0.855 |
+| | `eval_seed` | 0.639 | 0.625 | 0.839 |
+| Changed rays | `eval_episode` | 0.360 | 0.360 | 0.000 |
+| | `eval_seed` | 0.279 | 0.271 | 0.000 |
+| Changed-ray NLL (nats) | `eval_episode` | 2.263 | 2.246 | |
+| | `eval_seed` | 3.419 | 3.447 | |
+| Ray distance (blocks) | `eval_episode` | 3.03 | 3.00 | 1.22 |
+| | `eval_seed` | 3.63 | 3.40 | 1.22 |
+| Pitch (degrees) | `eval_episode` | 7.25 | 7.91 | 1.46 |
+| | `eval_seed` | 12.15 | 10.08 | 1.45 |
+| Health | `eval_episode` | 1.08 | 0.80 | 0.003 |
+| | `eval_seed` | 2.02 | 1.70 | 0.004 |
+| Food | `eval_episode` | 1.38 | 1.10 | 0.000 |
+| | `eval_seed` | 1.66 | 1.37 | 0.003 |
+
+Action shuffle at one step, `eval_episode`, changed rays: A 0.360 against 0.354, G 0.360 against 0.352. Changed-ray NLL: A 2.263 against 2.299, G 2.246 against 2.289. The pitch error does not depend on the action under either objective: with shuffled actions it is 7.36 (A) and 7.87 (G) degrees.
+
+Imagination at 3,000 updates: changed-ray accuracy and pitch error (degrees), each with real / shuffled actions.
+
+`eval_episode`:
+
+| Horizon | A changed rays | G changed rays | A pitch | G pitch | Persistence pitch |
+|---|---|---|---|---|---|
+| 1 | 0.356 / 0.351 | 0.343 / 0.338 | 7.8 / 7.9 | 9.0 / 9.0 | 1.6 |
+| 5 | 0.289 / 0.273 | 0.303 / 0.276 | 9.0 / 9.8 | 9.3 / 9.9 | 6.4 |
+| 10 | 0.231 / 0.195 | 0.248 / 0.213 | 10.9 / 12.4 | 10.0 / 11.2 | 10.7 |
+| 20 | 0.206 / 0.177 | 0.217 / 0.180 | 13.5 / 15.6 | 12.5 / 14.6 | 14.7 |
+
+`eval_seed`:
+
+| Horizon | A changed rays | G changed rays | A pitch | G pitch | Persistence pitch |
+|---|---|---|---|---|---|
+| 1 | 0.302 / 0.296 | 0.274 / 0.272 | 11.4 / 11.5 | 11.3 / 11.4 | 1.6 |
+| 5 | 0.256 / 0.234 | 0.210 / 0.203 | 12.3 / 12.9 | 12.0 / 12.8 | 6.4 |
+| 10 | 0.212 / 0.201 | 0.176 / 0.163 | 13.2 / 12.9 | 12.2 / 13.1 | 10.7 |
+| 20 | 0.148 / 0.142 | 0.142 / 0.111 | 15.1 / 14.7 | 12.7 / 14.6 | 14.5 |
+
+In `eval_episode`, G is better than A on changed rays from horizon 5 on, and on pitch from horizon 10 on. Under both objectives, real actions beat shuffled actions at every horizon from 5 on. The gap on changed rays is about the same (0.027-0.037 for G, 0.016-0.036 for A). In `eval_seed`, G is worse than A on changed rays at every horizon, but better on pitch from horizon 5 on, and its action gap at horizon 20 is larger (0.031 against 0.006). Ray accuracy over all rays is 0.01-0.04 lower under G at every horizon.
+
+Latent diagnostics at 3,000 updates, `eval_episode` (`eval_seed`): A raw KL 6.93 (8.04) nats, below free nats 6.2% (9.0%), 16 active variables, prior entropy 17.9, posterior entropy 11.5, agreement 0.574, 86 classes used. G raw KL 6.72 (7.54), below free nats 0.4% (2.7%), 16 active variables, prior entropy 18.3, posterior entropy 12.5, agreement 0.556, 76 classes used. The latent stays healthy under G.
+
+Cost: G used 0.36 J per update, the same as A, and 0.78 s per update on the efficiency cores.
+
+### Why the pitch did not improve
+
+The hypothesis was that the pitch error came from its small loss weight. G raised that weight by about 50 times, and the pitch error stayed at 7-8 degrees in `eval_episode`. The weight was not the main cause.
+
+A linear probe shows where the pitch is lost. It fits pitch from features on 96 training windows and tests on 48 others. The features are those of the self-state encoder, the encoder output e, and h and z:
+
+| Model | Self-state features | Encoder output e | h | z | Mean predictor |
+|---|---|---|---|---|---|
+| Untrained | 0.15 | 10.0 | 11.5 | 10.8 | 11.0 |
+| A, 1,000 updates | 1.11 | 16.6 | 8.7 | 9.2 | 11.0 |
+| G, 1,000 updates | 1.76 | 16.5 | 8.9 | 9.5 | 11.0 |
+
+Probe error in degrees. The self-state features hold the pitch almost exactly. After the last encoder layer, which joins 1,008 ray features with 256 self-state features into 256 values with an ELU, a linear probe cannot recover the pitch anymore. The pitch then cannot reach z through the posterior, and the decoder predicts it from h, from earlier steps. Under both objectives, 60-72% of the encoder outputs sat in the flat negative part of the ELU (below -0.95). This is a hypothesis about the frozen encoder, not a proven cause. Testing it changes the architecture, which this experiment keeps fixed.
+
+### Selected objective
+
+Selected: G, `group_mean` with component scale 825 (the ray count). Reasons:
+
+1. It removes the dominance that came only from the element count (ray class to self state on the RSSM core: 7 against 170).
+2. It keeps changed-ray prediction (0.360 in `eval_episode`, as A) and the latent diagnostics.
+3. It improves ray distance, health and food in both held-out splits at one step, pitch in `eval_seed` at one step, and changed rays and pitch in `eval_episode` imagination from horizon 5 or 10 on.
+4. Each weight has one meaning: every loss group counts once, as a whole ray grid, whatever the number of its fields.
+
+Negative findings that the selection does not hide:
+
+- Pitch in `eval_episode` got worse (7.25 to 7.91 degrees), and the pitch error stays 5 times the persistence error.
+- Ray accuracy and changed rays in `eval_seed` fell by about 0.01.
+- Action use did not get clearly stronger. At one step, the gap between real and shuffled actions is small under both objectives (changed rays 0.008 under G, 0.006 under A). In imagination, the gap is about the same under G and A in `eval_episode`. The pitch error does not depend on the action at one step.
+- In `eval_seed`, G predicts changed rays in imagination worse than A at every horizon (0.176 against 0.212 at horizon 10).
+
+The objective is frozen as G for the next Minecraft world-model experiment: `--reduction group_mean --component-scale rays`. The training default stays `sum` so that the runs of this document remain reproducible.
+
 ## Commands
 
 ```
@@ -267,5 +422,16 @@ Held-out run:
     --output-root runs/stage3/train-3000 --duty-cycle 1.0 --time-budget 570 -- \
     --updates 3000 --eval-at 0,100,300,1000,2000,3000 --imagine-at 1000,3000
 ```
+
+Objective variant G (follow-up):
+
+```
+.venv/bin/python -m minecraft_rl.sweep minecraft_world_model_train --seeds 0 \
+    --output-root runs/stage3/objective-G --duty-cycle 1.0 --time-budget 540 -- \
+    --reduction group_mean --component-scale rays --updates 3000 \
+    --eval-at 0,500,1000,3000 --imagine-at 1000,3000 --pause-at 500,1000
+```
+
+`--pause-at` stops the run after the named update counts, so that a staged budget can be inspected. The same command continues it.
 
 If the time budget ends first, run the same command again. It continues from the saved state with the same results.

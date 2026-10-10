@@ -24,6 +24,7 @@ import json
 import time
 from dataclasses import asdict
 from datetime import UTC, datetime
+from fractions import Fraction
 from pathlib import Path
 
 import torch
@@ -31,6 +32,7 @@ import torch
 from minecraft_rl import macos_energy, resumable, runtime
 from minecraft_rl import minecraft_world_model_eval as evaluation
 from minecraft_rl.minecraft_dataset import load_episodes
+from minecraft_rl.minecraft_gradients import component_gradients
 from minecraft_rl.minecraft_interface import OBSERVATION_SCHEMA
 from minecraft_rl.minecraft_replay import (
     CompactVocabulary,
@@ -40,9 +42,12 @@ from minecraft_rl.minecraft_replay import (
     unknown_fractions,
 )
 from minecraft_rl.minecraft_world_model import (
+    LOSS_GROUPS,
     LOSS_TERMS,
+    REDUCTIONS,
     MinecraftRSSM,
     ModelConfig,
+    Objective,
     parameter_count,
     save_checkpoint,
 )
@@ -146,6 +151,36 @@ def main() -> None:
     parser.add_argument(
         "--decoder-channels", type=int, default=ModelConfig.decoder_channels
     )
+    parser.add_argument(
+        "--reduction",
+        choices=REDUCTIONS,
+        default="sum",
+        help="how each loss term reduces its elements (minecraft_world_model.py)",
+    )
+    parser.add_argument(
+        "--weight",
+        action="append",
+        default=[],
+        metavar="GROUP=VALUE",
+        help="fixed weight of a loss group, a number or a fraction such as "
+        "1/825: " + ", ".join([*LOSS_GROUPS, "continuation", "kl"]),
+    )
+    parser.add_argument(
+        "--component-scale",
+        default="1",
+        help="factor on every reconstruction component and the continuation "
+        "loss, a number or 'rays' for the ray count of the grid",
+    )
+    parser.add_argument(
+        "--pause-at",
+        default="",
+        help="update counts after which the run saves its state and stops, so "
+        "that a staged budget can be inspected; the same command continues",
+    )
+    parser.add_argument(
+        "--gradients-at",
+        help="update counts with the gradient diagnostic (default: evaluations)",
+    )
     parser.add_argument("--output", type=Path)
     resumable.add_arguments(parser)
     args = parser.parse_args()
@@ -162,13 +197,34 @@ def main() -> None:
         / datetime.now(UTC).strftime("stage3-%Y%m%dT%H%M%S%fZ")
         / "metrics.json"
     )
+    schema = load_schema(args.dataset)
+    component_scale = (
+        float(schema["rows"] * schema["columns"])
+        if args.component_scale == "rays"
+        else float(Fraction(args.component_scale))
+    )
+    objective = Objective(
+        reduction=args.reduction,
+        weights=tuple(
+            sorted(
+                (group, float(Fraction(value)))
+                for group, value in (item.split("=", 1) for item in args.weight)
+            )
+        ),
+        component_scale=component_scale,
+    )
+    pause_at = set(parse_counts(args.pause_at))
+    gradients_at = (
+        set(parse_counts(args.gradients_at))
+        if args.gradients_at is not None
+        else set(eval_at)
+    )
     config = ModelConfig(
         ray_layer=args.ray_layer,
         encoder_channels=args.encoder_channels,
         decoder_channels=args.decoder_channels,
     )
 
-    schema = load_schema(args.dataset)
     episodes = {split: load_episodes(args.dataset / split) for split in SPLITS}
     compact = CompactVocabulary.from_episodes(episodes["train"], raw_sizes(schema))
     vocabulary = compact.model_vocabulary(
@@ -204,13 +260,19 @@ def main() -> None:
     unknown = evaluation.unknown_classes(compact, model)
     frequency_rays = evaluation.ray_frequency_baseline(train_replay, model, unknown)
     frequency_slot = evaluation.slot_frequency_baseline(train_replay)
+    gradient_batch = train_replay.sample(
+        args.batch, torch.Generator().manual_seed(4321)
+    )
 
     identity = {
         "experiment": "minecraft_world_model",
         "seed": args.seed,
         "config": config.to_json(),
+        "objective": objective.to_json(),
         "arguments": {
-            k: str(v) for k, v in vars(args).items() if k not in ("state", "stop_after")
+            k: str(v)
+            for k, v in vars(args).items()
+            if k not in ("state", "stop_after", "pause_at")
         },
         "vocabulary": compact.identifier(),
     }
@@ -219,6 +281,8 @@ def main() -> None:
     update = 0
     history: list[dict] = []
     evaluations: dict[str, dict] = {}
+    gradients: dict[str, dict] = {}
+    paused: list[int] = []
     train_seconds = 0.0
     energy_before = 0.0
     session_counters = macos_energy.read()
@@ -229,6 +293,9 @@ def main() -> None:
         update = saved["update"]
         history = json.loads(saved["history"])
         evaluations = json.loads(saved["evaluations"])
+        gradients = json.loads(saved["gradients"])
+        paused = json.loads(saved["paused"])
+        pause_at -= set(paused)
         train_seconds = saved["train_seconds"]
         energy_before = saved["energy_joules"]
         session.restore_global_random_state()
@@ -248,12 +315,18 @@ def main() -> None:
             "update": update,
             "history": json.dumps(history),
             "evaluations": json.dumps(evaluations),
+            "gradients": json.dumps(gradients),
+            "paused": json.dumps(paused),
             "train_seconds": train_seconds,
             "energy_joules": energy_joules() or 0.0,
         }
 
     try:
         while True:
+            if update in gradients_at and str(update) not in gradients:
+                gradients[str(update)] = component_gradients(
+                    model, gradient_batch, objective
+                )
             if update in eval_at and str(update) not in evaluations:
                 results = evaluate(
                     model,
@@ -271,6 +344,10 @@ def main() -> None:
                     flush=True,
                 )
                 session.boundary(state)
+            if update in pause_at and 0 < update < args.updates:
+                pause_at.discard(update)
+                paused.append(update)
+                session.boundary(state, force=True)
             if update >= args.updates:
                 break
             started = time.perf_counter()
@@ -281,7 +358,7 @@ def main() -> None:
                 batch = train_replay.batch([tiny[i] for i in picks.tolist()])
             model.train()
             terms = model.losses(
-                batch.observations, batch.actions, batch.continues, generator
+                batch.observations, batch.actions, batch.continues, generator, objective
             )
             optimizer.zero_grad()
             terms["total"].backward()
@@ -336,6 +413,8 @@ def main() -> None:
             "parameters_encoder": parameter_count(model.encoder),
             "parameters_decoder": parameter_count(model.decoder),
         },
+        "objective": objective.to_json(),
+        "gradients": gradients,
         "training": {
             "updates": update,
             "batch": args.batch,

@@ -28,6 +28,18 @@ def test_a_session_saves_at_the_first_boundary_after_its_limit(tmp_path):
     assert not path.exists()
 
 
+def test_a_forced_boundary_saves_without_a_time_limit(tmp_path):
+    path = tmp_path / "state.pt"
+    session = Session(path, None, {"run": 1})
+    session.boundary(lambda: {"units": 1})
+    assert not path.exists()
+    with pytest.raises(Incomplete):
+        session.boundary(lambda: {"units": 2}, force=True)
+    assert Session(path, None, {"run": 1}).load() == {"units": 2}
+    no_state = Session(None, None, {"run": 1})
+    no_state.boundary(lambda: {"never": "saved"}, force=True)
+
+
 def test_a_state_file_of_another_run_is_refused(tmp_path):
     path = tmp_path / "state.pt"
     with pytest.raises(Incomplete):

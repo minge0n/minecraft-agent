@@ -1,6 +1,7 @@
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -85,7 +86,52 @@ def patch_signals(monkeypatch) -> list[tuple[int, int]]:
     sent: list[tuple[int, int]] = []
     monkeypatch.setattr(sweep.os, "killpg", lambda pid, n: sent.append((pid, n)))
     monkeypatch.setattr(sweep.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(sweep.macos_energy, "read", lambda pid=None: None)
     return sent
+
+
+def hot_settings() -> Settings:
+    return Settings(duty_cycle=1.0, max_temperature=60.0, resume_temperature=57.0)
+
+
+def test_a_hot_die_does_not_pause_seeds_that_make_little_heat(monkeypatch):
+    sent = patch_signals(monkeypatch)
+    run = fake_run(5)
+    run.recent_watts = 0.7
+    settings = hot_settings()
+    thermostat = Thermostat(settings, temperature=lambda: 70.0, pressure=lambda: 0)
+    sweep.throttle_period([run], settings, thermostat)
+    assert sent == []
+    assert run.skipped_pause_events == 1
+    assert run.thermostat_pause_events == 0
+
+
+def test_a_hot_die_pauses_seeds_that_make_real_heat(monkeypatch):
+    sent = patch_signals(monkeypatch)
+    temperatures = iter([70.0, 56.0])
+    run = fake_run(5)
+    run.recent_watts = 6.4
+    settings = hot_settings()
+    thermostat = Thermostat(
+        settings, temperature=lambda: next(temperatures), pressure=lambda: 0
+    )
+    sweep.throttle_period([run], settings, thermostat)
+    assert [n for _, n in sent] == [signal.SIGSTOP, signal.SIGCONT]
+    assert run.thermostat_pause_events == 1
+
+
+def test_high_thermal_pressure_pauses_even_cool_seeds(monkeypatch):
+    sent = patch_signals(monkeypatch)
+    pressures = iter([2, 0])
+    run = fake_run(5)
+    run.recent_watts = 0.1
+    settings = hot_settings()
+    thermostat = Thermostat(
+        settings, temperature=lambda: 50.0, pressure=lambda: next(pressures)
+    )
+    sweep.throttle_period([run], settings, thermostat)
+    assert [n for _, n in sent] == [signal.SIGSTOP, signal.SIGCONT]
+    assert run.skipped_pause_events == 0
 
 
 def test_cool_period_stops_then_resumes_for_the_duty_cycle(monkeypatch):
@@ -154,3 +200,24 @@ def test_unfinished_processes_are_resumed_before_they_are_terminated():
     sweep.signal_all([process], signal.SIGSTOP)
     sweep.stop_processes([process])
     assert process.returncode == -signal.SIGTERM
+
+
+@pytest.mark.skipif(not sweep.TASKPOLICY.exists(), reason="macOS only")
+def test_the_record_keeps_the_cpu_energy_of_a_finished_seed(tmp_path):
+    command = [
+        str(sweep.TASKPOLICY),
+        "-b",
+        sys.executable,
+        "-c",
+        "s = 0\nfor i in range(3_000_000): s += i",
+    ]
+    process = subprocess.Popen(command, start_new_session=True)
+    run = sweep.SeedRun(0, command, process, None, time.monotonic(), None)
+    while process.poll() is None:
+        run.sample_energy()
+        time.sleep(0.05)
+    record = sweep.sweep_record("parity", run, sweep.Settings(), tmp_path)
+    assert record["cpu_energy_joules"] > 0
+    assert record["mean_cpu_power_watts_while_computing"] > 0
+    # Background QoS keeps the work on the efficiency cores.
+    assert record["performance_core_energy_joules"] < 0.5 * record["cpu_energy_joules"]

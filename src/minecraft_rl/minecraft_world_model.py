@@ -587,14 +587,108 @@ CATEGORICAL_TERMS = (
 )
 BINARY_TERMS = ("effect_infinite",)
 
+# Loss groups for component weights and the gradient diagnostics.
+LOSS_GROUPS = {
+    "ray_class": ("ray_class",),
+    "ray_distance": ("ray_distance",),
+    "self": (
+        "scalars",
+        "selected_slot",
+        "effect_type",
+        "effect_amplifier",
+        "effect_seconds",
+        "effect_infinite",
+    ),
+    "inventory": (
+        "inventory_item",
+        "inventory_count",
+        "inventory_durability",
+        "armor_item",
+        "armor_durability",
+        "offhand_item",
+        "offhand_count",
+        "offhand_durability",
+    ),
+}
+GROUP_OF_TERM = {term: group for group, terms in LOSS_GROUPS.items() for term in terms}
+PITCH_INDEX = SCALARS.index("pitch")
 
-def reconstruction_losses(
+# How each loss term turns its element losses into one number.
+# - "sum": sum over the valid elements of one state, then the mean over the
+#   states. This is the log likelihood of the whole observation. A field
+#   with more elements gets a larger weight: 825 ray-class terms against one
+#   pitch value.
+# - "ray_mean": as "sum", but the ray-class term is the mean over the rays.
+# - "semantic_mean": every term is the mean over its own valid elements in
+#   the batch. The size of a field then no longer sets its weight. The 9
+#   scalars are 9 different quantities (health, food, pitch, ...), so each
+#   scalar is its own component: the "scalars" term is the sum of 9 means.
+# - "group_mean": as "semantic_mean", then each loss group of `LOSS_GROUPS`
+#   becomes the mean of its components instead of their sum. A component
+#   counts only if it has a valid element in the batch, so an empty armor
+#   slot adds no durability component. Each group is then one normalized
+#   loss: the number of fields in a group no longer sets its weight either.
+REDUCTIONS = ("sum", "ray_mean", "semantic_mean", "group_mean")
+SEPARATE_COMPONENT_TERMS = ("scalars",)
+
+
+@dataclass(frozen=True)
+class Objective:
+    """The training objective: a reduction and fixed weights per loss group
+    (`LOSS_GROUPS`, "continuation" and "kl"). A group without a weight gets
+    1. The KL term keeps its Stage 2G form (prior and posterior parts, free
+    nats); its weight only scales the whole term.
+
+    The weight of "kl" sets the trade-off between reconstruction and the
+    information in z. Under "sum", reconstruction counts in nats per
+    observation, as the KL does. A mean over elements counts in nats per
+    element, so the same KL weighs about as much as a whole grid of rays.
+
+    `component_scale` multiplies every reconstruction component and the
+    continuation loss, not the KL. With "semantic_mean" and the ray count as
+    the scale, the ray-class component equals the summed ray-class term of
+    "sum", the KL keeps its weight relative to it, and every other
+    component weighs as much as the ray grid. The overall loss scale then
+    also stays that of "sum". That matters for Adam: Adam ignores the scale
+    of a gradient only where the gradient is much larger than its eps.
+    """
+
+    reduction: str = "sum"
+    weights: tuple[tuple[str, float], ...] = ()
+    component_scale: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.reduction not in REDUCTIONS:
+            raise ValueError(f"unknown reduction {self.reduction!r}")
+        for group, _ in self.weights:
+            if group not in (*LOSS_GROUPS, "continuation", "kl"):
+                raise ValueError(f"unknown loss group {group!r}")
+
+    def weight(self, group: str) -> float:
+        return dict(self.weights).get(group, 1.0)
+
+    def to_json(self) -> dict:
+        return {
+            "reduction": self.reduction,
+            "weights": dict(self.weights),
+            "component_scale": self.component_scale,
+        }
+
+
+# The objective of the first Stage 3 runs: the plain log likelihood.
+SUM_OBJECTIVE = Objective()
+
+
+def element_losses(
     prediction: dict[str, torch.Tensor],
     o: dict[str, torch.Tensor],
     vocabulary: Vocabulary,
-) -> dict[str, torch.Tensor]:
-    """Negative log-likelihood of each field group per state, shape (...),
-    summed over the elements of the group and over valid elements only."""
+) -> dict[str, tuple[torch.Tensor, torch.Tensor | None]]:
+    """Per term: the loss of every element, shape (..., elements of the
+    term), and its mask of valid elements, or None if all are valid.
+    Categorical terms use cross-entropy, binary terms binary cross-entropy,
+    and continuous terms the squared error of values that `targets` divides
+    by their fixed game range."""
     t = targets(o, vocabulary)
     lead = o["health"].dim()
     out = {}
@@ -608,10 +702,81 @@ def reconstruction_losses(
         else:
             element = (prediction[name] - t[name]) ** 2
         mask = t.get(f"{name}_mask")
+        shape = (*element.shape[:lead], -1)
+        out[name] = (
+            element.reshape(shape),
+            None if mask is None else mask.reshape(shape),
+        )
+    return out
+
+
+def reconstruction_losses(
+    prediction: dict[str, torch.Tensor],
+    o: dict[str, torch.Tensor],
+    vocabulary: Vocabulary,
+) -> dict[str, torch.Tensor]:
+    """Negative log-likelihood of each field group per state, shape (...),
+    summed over the elements of the group and over valid elements only."""
+    out = {}
+    for name, (element, mask) in element_losses(prediction, o, vocabulary).items():
         if mask is not None:
             element = element * mask
-        out[name] = element.reshape(*element.shape[:lead], -1).sum(-1)
+        out[name] = element.sum(-1)
     return out
+
+
+def reduce_term(
+    name: str, element: torch.Tensor, mask: torch.Tensor | None, reduction: str
+) -> torch.Tensor:
+    """The loss of one term as one number. `element` has the shape
+    (..., elements of the term)."""
+    if mask is not None:
+        element = element * mask
+    if (
+        reduction in ("semantic_mean", "group_mean")
+        and name not in SEPARATE_COMPONENT_TERMS
+    ):
+        count = (
+            element.new_tensor(float(element.numel())) if mask is None else mask.sum()
+        )
+        return element.sum() / count.clamp(min=1.0)
+    per_state = element.sum(-1)
+    if reduction == "ray_mean" and name == "ray_class":
+        per_state = per_state / element.shape[-1]
+    return per_state.mean()
+
+
+def objective_terms(
+    prediction: dict[str, torch.Tensor],
+    o: dict[str, torch.Tensor],
+    vocabulary: Vocabulary,
+    reduction: str,
+) -> dict[str, torch.Tensor]:
+    """Every reconstruction term reduced as `reduction` says, plus
+    "pitch_component": the part of the "scalars" term that comes from the
+    pitch. It is already part of "scalars" and is only for diagnostics."""
+    elements = element_losses(prediction, o, vocabulary)
+    out = {}
+    for name, (element, mask) in elements.items():
+        out[name] = reduce_term(name, element, mask, reduction)
+        if name == "scalars":
+            out["pitch_component"] = element[..., PITCH_INDEX].mean()
+    if reduction == "group_mean":
+        for terms in LOSS_GROUPS.values():
+            count = max(1, sum(_components(name, *elements[name]) for name in terms))
+            for name in terms:
+                out[name] = out[name] / count
+            if "scalars" in terms:
+                out["pitch_component"] = out["pitch_component"] / count
+    return out
+
+
+def _components(name: str, element: torch.Tensor, mask: torch.Tensor | None) -> int:
+    """The number of loss components in a term: one per scalar for the
+    scalars, else one if the term has a valid element in the batch."""
+    if name in SEPARATE_COMPONENT_TERMS:
+        return element.shape[-1]
+    return int(mask is None or bool(mask.sum() > 0))
 
 
 class MinecraftRSSM(nn.Module):
@@ -719,13 +884,27 @@ class MinecraftRSSM(nn.Module):
         actions: torch.Tensor,
         continues: torch.Tensor,
         generator: torch.Generator | None,
+        objective: Objective = SUM_OBJECTIVE,
     ) -> dict[str, torch.Tensor]:
-        """Negative evidence lower bound per state, averaged over the batch
-        and the L + 1 states. `continues` (batch, L) is 0 for the transition
-        that ended an episode."""
+        """The training loss of a batch of windows: reconstruction terms
+        reduced and weighted by `objective`, the continuation loss and the KL
+        loss. `continues` (batch, L) is 0 for the transition that ended an
+        episode."""
+        return self.loss_graph(o, actions, continues, generator, objective)[0]
+
+    def loss_graph(
+        self,
+        o: dict[str, torch.Tensor],
+        actions: torch.Tensor,
+        continues: torch.Tensor,
+        generator: torch.Generator | None,
+        objective: Objective = SUM_OBJECTIVE,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """As `losses`, and also the decoder input s = [h, z], for gradient
+        diagnostics."""
         filtered = self.filter(o, actions, generator, straight_through=True)
         s = torch.cat([filtered["h"], filtered["z"]], -1)
-        terms = reconstruction_losses(self.decoder(s), o, self.vocabulary)
+        out = objective_terms(self.decoder(s), o, self.vocabulary, objective.reduction)
         continuation = nn.functional.binary_cross_entropy_with_logits(
             self.continue_head(s[:, 1:]).squeeze(-1), continues, reduction="none"
         )
@@ -737,7 +916,6 @@ class MinecraftRSSM(nn.Module):
             self.config.kl_posterior_scale,
             self.config.free_nats,
         )
-        out = {name: value.mean() for name, value in terms.items()}
         out["continuation"] = continuation.mean()
         raw_kl = categorical_kl_per_variable(posterior, prior).sum(-1)
         out["kl"] = raw_kl.mean().detach()
@@ -745,9 +923,16 @@ class MinecraftRSSM(nn.Module):
         out["kl_below_free_nats"] = (
             (raw_kl < self.config.free_nats).float().mean().detach()
         )
-        out["reconstruction"] = sum(out[name] for name in terms)
-        out["total"] = out["reconstruction"] + out["continuation"] + out["kl_loss"]
-        return out
+        scale = objective.component_scale
+        out["reconstruction"] = scale * sum(
+            objective.weight(GROUP_OF_TERM[name]) * out[name] for name in LOSS_TERMS
+        )
+        out["total"] = (
+            out["reconstruction"]
+            + scale * objective.weight("continuation") * out["continuation"]
+            + objective.weight("kl") * out["kl_loss"]
+        )
+        return out, s
 
     def imagine(
         self,
