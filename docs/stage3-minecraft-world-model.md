@@ -2,7 +2,7 @@
 
 Purpose: learn short-horizon dynamics from real structured Minecraft transitions with the Stage 2G RSSM (`docs/stage2g.md`), and compare the model against trivial baselines. No actor is trained. No reward exists: the reward design is a separate later milestone.
 
-Status: first held-out run and the follow-up on loss balance complete. The follow-up selected and froze the objective G (section "Follow-up: balance of the loss components"). The model is still not ready for actor training: it uses the action only weakly, and pitch prediction stays far behind persistence.
+Status: first held-out run, the follow-up on loss balance and the follow-up on the encoder complete. Objective G is selected and frozen (section "Follow-up: balance of the loss components"). The encoder stays `shared` and is frozen again: late fusion keeps the pitch through the encoder, but z still does not keep it (section "Follow-up: where the pitch is lost in the encoder"). The model is not ready for actor training: it predicts the pitch far worse than persistence, and at one step it barely uses the camera action.
 
 First held-out run: complete, with a mixed result. The model predicts changed rays better than every baseline. It predicts unchanged content and pitch worse than persistence, and it uses the action only weakly. The likely cause is the scale of the loss terms (section "Diagnosis"). The model is not yet good enough for actor training.
 
@@ -406,6 +406,182 @@ Negative findings that the selection does not hide:
 
 The objective is frozen as G for the next Minecraft world-model experiment: `--reduction group_mean --component-scale rays`. The training default stays `sum` so that the runs of this document remain reproducible.
 
+## Follow-up: where the pitch is lost in the encoder
+
+Question: the self-state features hold the pitch, but the model predicts it with an error of 7.9 degrees in `eval_episode`, 5 times the persistence error. Does the shared last layer of the encoder destroy the pitch, and does a different path from the encoder to the posterior fix it? This follow-up keeps objective G, the RSSM core, the ray patch encoder, the decoder, the data, the vocabulary, seed 0, batch, sequence length and optimizer. It opens only the path from the encoder to the posterior, as one measured exception to the architecture freeze.
+
+### Probe at every stage
+
+`src/minecraft_rl/minecraft_probes.py` fits a ridge regression from the features of one stage to the pitch of the same state. It fits on 96 fixed `train` windows and tests on 96 fixed `eval_episode` windows (3,168 states each). It standardizes each feature and chooses the ridge strength by a 4-fold split of the fit set. The stages, in order:
+
+1. `self_input`: the normalized self-state input of the self encoder.
+2. `self_output`: the output of the self encoder (Linear 843 -> 256, ELU).
+3. `fusion_input`: the ray features (1,008) and the self features (256), side by side.
+4. `fusion_preactivation`: the shared layer Linear(1,264 -> 256), before its ELU.
+5. `fusion_output`: the shared layer after the ELU.
+6. `encoder_output`: e, what the posterior gets.
+7. `posterior_input`: [h, e].
+8. `posterior_hidden`: the hidden layer of the posterior.
+9. `z`: the most likely posterior state.
+
+Pitch error of the probe in degrees. A probe that predicts the mean pitch has an error of 9.89.
+
+| Model | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+|---|---|---|---|---|---|---|---|---|---|
+| Shared, untrained | 0.00 | 0.12 | 0.16 | 8.82 | 8.80 | 8.80 | 9.39 | 8.79 | 9.11 |
+| Shared, objective A, 3,000 updates | 0.00 | 3.01 | 2.90 | 8.17 | 9.60 | 9.60 | 10.25 | 8.97 | 8.96 |
+| Shared, objective G, 3,000 updates | 0.00 | 1.47 | 2.08 | 8.18 | 14.55 | 14.55 | 14.67 | 9.07 | 9.43 |
+| Self skip (H), 500 updates | 0.00 | 0.11 | 0.13 | 8.86 | 13.55 | 0.43 | 0.43 | 11.60 | 9.89 |
+| Late fusion (I), 500 updates | 0.00 | 0.21 | 0.17 | 0.17 | 0.17 | 0.17 | 0.21 | 9.43 | 8.97 |
+| Late fusion (I), 1,000 updates | 0.00 | 1.64 | 1.86 | 1.86 | 1.86 | 1.86 | 1.95 | 10.91 | 9.62 |
+| Late fusion (I), 3,000 updates | 0.00 | 2.57 | 2.52 | 2.52 | 2.52 | 2.52 | 2.47 | 8.45 | 9.42 |
+
+Late fusion has no shared layer, so stages 3 to 6 are the same features.
+
+The pitch is lost in two places:
+
+1. The shared layer Linear(1,264 -> 256) loses most of the pitch before its activation, even untrained (0.16 to 8.82 degrees). The layer compresses 1,264 features into 256, and the 1,008 ray features have most of the variance. So the first cause is the compression, not the ELU.
+2. After training, the ELU loses more under objective G (8.18 to 14.55 degrees). 72% of its outputs are in the flat part below -0.95. This loss comes after the compression and is the second cause.
+
+With late fusion, the pitch reaches the posterior input (2.47 degrees at 3,000 updates). The first posterior layer, Linear(512 + 1,264 -> 256), then loses it again: 7.38 degrees before its ELU, 8.45 after, and z holds almost none (9.42 against 9.89 for the mean). The bottleneck moves from the encoder into the posterior.
+
+No activation-only variant ran. The probe shows that the pitch is lost before the activation (stage 4), so a non-saturating activation alone could not keep it. Late fusion removes both the compression and the activation and is the stronger test.
+
+### Variants
+
+| Variant | Fusion | Parameters | Encoder | Posterior | Update (s) |
+|---|---|---|---|---|---|
+| G (baseline) | `shared` | 2,101,421 | 543,048 | 197,120 | 0.200 |
+| H | `self_skip`: shared layer, plus Linear(256 -> 32) of the self features next to e | 2,117,837 | 551,272 | 205,312 | 0.202 |
+| I | `late`: no shared layer, e = [ray features, self features] | 2,035,629 | 219,208 | 455,168 | 0.205 |
+
+Update times come from the benchmark on one fixed batch, one thread, default priority. Encoder 0.027 s, RSSM core 0.013-0.015 s and decoder 0.152-0.155 s for all three. Peak memory of the benchmark process was 2.2 GB. Late fusion has fewer parameters than the baseline: it drops the 323,840 parameters of the shared layer and adds 258,048 to the first posterior layer.
+
+Checkpoints now name their fusion (`minecraft-rssm-checkpoint-v2`). A v1 checkpoint loads as `shared`, the only encoder before v2. A v2 checkpoint without a fusion is refused.
+
+### Pitch baselines
+
+The environment changes the pitch as pitch' = clamp(pitch + pitch_delta, -90, 90) (`McBotClient.java`). On the whole dataset, this rule predicts the next pitch with an error below 1e-6 degrees. The evaluation uses it as an action-aware baseline, for diagnostics only. The world model and the policy never get it.
+
+| Predictor | `eval_episode` | `eval_seed` |
+|---|---|---|
+| Action-aware rule, real actions | 0.000 | 0.000 |
+| Action-aware rule, shuffled actions | 2.05 | 2.04 |
+| Persistence | 1.46 | 1.45 |
+| G, one step | 7.91 | 10.08 |
+| I, one step | 7.48 | 10.56 |
+
+One-step pitch error in degrees, 3,000 updates. A model that reads the pitch and applies the camera action would be exact. Both models are 3.6-7 times worse than plain persistence.
+
+### Staged results
+
+`eval_episode`, one-step prior prediction:
+
+| Variant | Updates | Ray accuracy | Changed rays | Ray distance | Pitch | Raw KL | Active variables |
+|---|---|---|---|---|---|---|---|
+| G | 500 | 0.490 | 0.301 | 3.73 | 8.27 | 2.60 | 13 |
+| H | 500 | 0.304 | 0.268 | 3.67 | 9.51 | 0.00 | 0 |
+| I | 500 | 0.539 | 0.293 | 4.16 | 7.82 | 4.98 | 16 |
+| G | 1,000 | 0.705 | 0.353 | 3.38 | 7.61 | 4.28 | 16 |
+| I | 1,000 | 0.733 | 0.354 | 3.16 | 7.21 | 5.94 | 16 |
+| G | 3,000 | 0.761 | 0.360 | 3.00 | 7.91 | 6.72 | 16 |
+| I | 3,000 | 0.765 | 0.350 | 2.86 | 7.48 | 8.47 | 16 |
+
+H failed at 500 updates: its latent collapsed. The raw KL fell from 22 nats at update 10 to 0.03 at update 500, no variable was active, and prior and posterior entropy were 0. The ray-class gradient on the RSSM core fell to 26 against 187 for G at the same update. The run stopped there. The cause is not proven. The skip path reached the posterior (stage 7: 0.43 degrees), but z did not use it.
+
+G is the existing objective-G run at the same configuration and was not run again. Its 3,000-update checkpoint gave the same metrics with the new evaluation code (pitch 7.91 degrees, changed rays 0.360).
+
+### Held-out results at 3,000 updates
+
+| Metric | `eval_episode` G | `eval_episode` I | `eval_seed` G | `eval_seed` I |
+|---|---|---|---|---|
+| Ray accuracy | 0.761 | 0.765 | 0.625 | 0.637 |
+| Changed rays | 0.360 | 0.350 | 0.271 | 0.273 |
+| Ray distance (blocks) | 3.00 | 2.86 | 3.40 | 3.17 |
+| Pitch (degrees) | 7.91 | 7.48 | 10.08 | 10.56 |
+| Health | 0.80 | 0.96 | 1.70 | 2.05 |
+| Food | 1.10 | 1.17 | 1.37 | 1.50 |
+
+Unknown targets in `eval_seed` stay at 10.6% of the scored rays, and neither model predicts the unknown class on them.
+
+### Camera actions
+
+A camera event is a real transition whose camera action turns the pitch, or the yaw, by at least 3 degrees (`CAMERA_EVENT_DEGREES`). One step, real / shuffled actions:
+
+| Subset | Transitions | Model | Pitch | Changed rays | Ray distance |
+|---|---|---|---|---|---|
+| `eval_episode`, pitch turn | 268 | G | 6.80 / 7.13 | 0.366 / 0.344 | 3.06 / 3.08 |
+| | | I | 6.79 / 6.92 | 0.361 / 0.339 | 2.92 / 2.93 |
+| `eval_episode`, yaw turn | 1,210 | G | 7.94 / 7.78 | 0.356 / 0.350 | 3.02 / 3.02 |
+| | | I | 7.36 / 7.43 | 0.342 / 0.336 | 2.91 / 2.92 |
+| `eval_seed`, pitch turn | 276 | G | 10.67 / 10.33 | 0.286 / 0.273 | 3.48 / 3.51 |
+| | | I | 10.72 / 10.55 | 0.285 / 0.276 | 3.31 / 3.34 |
+| `eval_seed`, yaw turn | 1,224 | G | 10.05 / 10.02 | 0.267 / 0.264 | 3.35 / 3.37 |
+| | | I | 10.27 / 10.29 | 0.271 / 0.268 | 3.14 / 3.14 |
+
+On pitch turns, persistence has a pitch error of 3.73 (`eval_episode`) and 3.76 (`eval_seed`) degrees, the action rule 0.000. Changed rays depend on the action under both models (0.02 more with real actions on pitch turns). The pitch at one step barely does.
+
+A camera window is an imagination window in which at least half of the 20 future steps turn the camera by 3 degrees or more: 74 of 128 windows in `eval_episode`, 71 of 128 in `eval_seed`. Pitch error real / shuffled and persistence, in degrees:
+
+| Horizon | `eval_episode` G | `eval_episode` I | Persistence | `eval_seed` G | `eval_seed` I | Persistence |
+|---|---|---|---|---|---|---|
+| 1 | 8.62 / 8.81 | 7.43 / 7.03 | 1.70 | 11.64 / 11.30 | 10.97 / 11.05 | 1.77 |
+| 5 | 9.27 / 9.71 | 8.65 / 9.28 | 7.49 | 12.13 / 12.26 | 12.48 / 13.82 | 6.86 |
+| 10 | 9.70 / 11.64 | 11.04 / 12.63 | 12.17 | 12.85 / 14.09 | 13.23 / 14.69 | 12.39 |
+| 20 | 14.19 / 16.74 | 14.37 / 17.32 | 16.28 | 13.66 / 15.42 | 15.98 / 17.03 | 17.50 |
+
+### Imagination, all windows
+
+Real / shuffled actions. `eval_episode`:
+
+| Horizon | G changed rays | I changed rays | G pitch | I pitch | Persistence pitch | G distance | I distance |
+|---|---|---|---|---|---|---|---|
+| 1 | 0.343 / 0.338 | 0.351 / 0.341 | 8.95 / 8.99 | 8.00 / 7.75 | 1.59 | 2.98 / 3.00 | 2.86 / 2.88 |
+| 5 | 0.303 / 0.276 | 0.279 / 0.257 | 9.28 / 9.93 | 9.35 / 10.13 | 6.42 | 3.42 / 3.52 | 3.41 / 3.55 |
+| 10 | 0.248 / 0.213 | 0.211 / 0.187 | 10.01 / 11.23 | 11.60 / 12.77 | 10.71 | 3.99 / 4.13 | 4.16 / 4.27 |
+| 20 | 0.217 / 0.180 | 0.190 / 0.151 | 12.46 / 14.60 | 14.48 / 16.97 | 14.74 | 4.53 / 4.64 | 4.74 / 5.03 |
+
+`eval_seed`:
+
+| Horizon | G changed rays | I changed rays | G pitch | I pitch | Persistence pitch | G distance | I distance |
+|---|---|---|---|---|---|---|---|
+| 1 | 0.274 / 0.272 | 0.297 / 0.291 | 11.28 / 11.36 | 10.93 / 11.02 | 1.59 | 3.30 / 3.34 | 3.12 / 3.12 |
+| 5 | 0.210 / 0.203 | 0.218 / 0.206 | 12.03 / 12.82 | 12.00 / 13.07 | 6.41 | 3.79 / 3.85 | 3.78 / 3.88 |
+| 10 | 0.176 / 0.163 | 0.176 / 0.162 | 12.19 / 13.10 | 12.48 / 13.75 | 10.68 | 4.08 / 4.21 | 4.41 / 4.44 |
+| 20 | 0.142 / 0.111 | 0.148 / 0.129 | 12.73 / 14.64 | 14.16 / 15.26 | 14.48 | 4.67 / 4.79 | 4.98 / 5.02 |
+
+The action-aware rule with shuffled actions has a pitch error of 2.2, 8.9, 15.2 and 21.2 degrees at horizons 1, 5, 10 and 20 in `eval_episode`. So a model that ignored the pitch action entirely would be far worse than both models at horizon 20. Both models use the camera action over many steps, but neither predicts the pitch well.
+
+### Latent diagnostics at 3,000 updates
+
+| Model | Split | Raw KL | Below free nats | Active | Prior entropy | Posterior entropy | Agreement |
+|---|---|---|---|---|---|---|---|
+| G | `eval_episode` | 6.72 | 0.4% | 16 | 18.3 | 12.5 | 0.556 |
+| I | `eval_episode` | 8.47 | 0.1% | 16 | 20.6 | 13.6 | 0.515 |
+| G | `eval_seed` | 7.54 | 2.7% | 16 | 18.0 | 12.1 | 0.541 |
+| I | `eval_seed` | 10.74 | 0.0% | 16 | 20.1 | 12.1 | 0.522 |
+
+### Why late fusion does not fix the pitch
+
+The probe shows that the posterior can read the pitch under late fusion, yet z does not keep it. The objective explains why. Under objective G at 3,000 updates, 11 self-state components have a valid element, so the pitch component weighs 825 / 11 = 75 per squared range unit. A pitch error of 1 degree then costs 0.009 and an error of 7.5 degrees 0.52. A Gaussian estimate from the probe on h (8.8 degrees) says that z needs at least 1.8 nats more per step to reach an error of 1.5 degrees, and the reconstruction gains about 0.55 for it. The KL has no weight below 1. So storing the pitch in z costs more than it brings. This is a trade-off in the objective, not an encoder failure, and it is a hypothesis: the estimate is rough.
+
+### Result
+
+Neither variant meets the selection criteria:
+
+- H collapses the latent at 500 updates.
+- I keeps the pitch through the encoder and keeps the ray results (changed rays 0.350 against 0.360 in `eval_episode`, 0.273 against 0.271 in `eval_seed`), improves ray distance in both splits, and keeps the latent healthy. But it does not substantially improve the pitch (7.48 against 7.91 in `eval_episode`, 10.56 against 10.08 in `eval_seed`), it does not make the model clearly more sensitive to camera actions, and health and food get worse.
+
+Decision: the encoder stays `shared`, the architecture of the objective-G run, and is frozen again. The fusion options `self_skip` and `late` stay in the code as measured alternatives, and the probes, pitch baselines and camera subsets stay in the evaluation.
+
+Negative findings:
+
+- Removing the encoder bottleneck moves it into the first posterior layer. The architecture cannot fix a loss that the objective makes worth taking.
+- A self-state skip path to the posterior collapsed the latent.
+- At one step, the pitch error does not depend on the action under any variant.
+
+Next targeted hypothesis, not tested here because objective G is fixed in this task: the pitch is dropped by the trade-off between reconstruction and KL. A test would change only the weight of the pitch, or the KL balance, and check with the probe whether z then keeps it.
+
 ## Commands
 
 ```
@@ -431,6 +607,18 @@ Objective variant G (follow-up):
     --reduction group_mean --component-scale rays --updates 3000 \
     --eval-at 0,500,1000,3000 --imagine-at 1000,3000 --pause-at 500,1000
 ```
+
+Encoder follow-up, variant I:
+
+```
+.venv/bin/python -m minecraft_rl.sweep minecraft_world_model_train --seeds 0 \
+    --output-root runs/stage3/encoder-I --duty-cycle 1.0 --time-budget 540 -- \
+    --reduction group_mean --component-scale rays --fusion late --updates 3000 \
+    --eval-at 0,500,1000,3000 --imagine-at 1000,3000 --pause-at 500,1000 \
+    --probes-at 0,500,1000,3000
+```
+
+The training runner moves itself to the efficiency cores of a Mac (`macos_qos.py`), also when it runs outside the sweep runner. `--foreground` keeps the default priority.
 
 `--pause-at` stops the run after the named update counts, so that a staged budget can be inspected. The same command continues it.
 

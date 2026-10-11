@@ -308,5 +308,8 @@ def test_evaluation_reports_baselines_and_horizons(setup):
     rollouts = imagination(
         model, replay, index, 1, unknown, torch.Generator().manual_seed(0)
     )
-    assert set(rollouts) == {"horizon_1", "horizon_5"}
+    assert {k for k in rollouts if k.startswith("horizon_")} == {
+        "horizon_1",
+        "horizon_5",
+    }
     assert rollouts["horizon_5"]["persistence"]["ray_accuracy"]["count"] > 0

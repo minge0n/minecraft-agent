@@ -29,11 +29,12 @@ from pathlib import Path
 
 import torch
 
-from minecraft_rl import macos_energy, resumable, runtime
+from minecraft_rl import macos_energy, macos_qos, resumable, runtime
 from minecraft_rl import minecraft_world_model_eval as evaluation
 from minecraft_rl.minecraft_dataset import load_episodes
 from minecraft_rl.minecraft_gradients import component_gradients
 from minecraft_rl.minecraft_interface import OBSERVATION_SCHEMA
+from minecraft_rl.minecraft_probes import saturation, stage_probes
 from minecraft_rl.minecraft_replay import (
     CompactVocabulary,
     SequenceReplay,
@@ -42,6 +43,7 @@ from minecraft_rl.minecraft_replay import (
     unknown_fractions,
 )
 from minecraft_rl.minecraft_world_model import (
+    FUSIONS,
     LOSS_GROUPS,
     LOSS_TERMS,
     REDUCTIONS,
@@ -181,9 +183,23 @@ def main() -> None:
         "--gradients-at",
         help="update counts with the gradient diagnostic (default: evaluations)",
     )
+    parser.add_argument("--fusion", choices=FUSIONS, default=ModelConfig.fusion)
+    parser.add_argument("--self-skip", type=int, default=ModelConfig.self_skip)
+    parser.add_argument(
+        "--probes-at",
+        default="",
+        help="update counts with the encoder-stage pitch probes",
+    )
+    parser.add_argument(
+        "--foreground",
+        action="store_true",
+        help="keep the default priority; otherwise the run moves itself to "
+        "the efficiency cores on macOS (macos_qos.py)",
+    )
     parser.add_argument("--output", type=Path)
     resumable.add_arguments(parser)
     args = parser.parse_args()
+    background = None if args.foreground else macos_qos.run_in_background()
     runtime.configure(args.seed)
     eval_at = [u for u in parse_counts(args.eval_at) if u <= args.updates]
     if args.updates not in eval_at:
@@ -223,7 +239,10 @@ def main() -> None:
         ray_layer=args.ray_layer,
         encoder_channels=args.encoder_channels,
         decoder_channels=args.decoder_channels,
+        fusion=args.fusion,
+        self_skip=args.self_skip,
     )
+    probes_at = set(parse_counts(args.probes_at))
 
     episodes = {split: load_episodes(args.dataset / split) for split in SPLITS}
     compact = CompactVocabulary.from_episodes(episodes["train"], raw_sizes(schema))
@@ -263,6 +282,16 @@ def main() -> None:
     gradient_batch = train_replay.sample(
         args.batch, torch.Generator().manual_seed(4321)
     )
+    # Fixed probe windows: training windows to fit, eval_episode to test.
+    probe_fit = train_replay.batch(
+        train_replay.evaluation_windows(args.length)[::9][:96]
+    )
+    episode_replay = replays.get("eval_episode", {}).get("one_step")
+    probe_test = (
+        episode_replay.batch(episode_replay.evaluation_windows(args.length)[::2][:96])
+        if episode_replay is not None
+        else None
+    )
 
     identity = {
         "experiment": "minecraft_world_model",
@@ -272,7 +301,7 @@ def main() -> None:
         "arguments": {
             k: str(v)
             for k, v in vars(args).items()
-            if k not in ("state", "stop_after", "pause_at")
+            if k not in ("state", "stop_after", "pause_at", "foreground")
         },
         "vocabulary": compact.identifier(),
     }
@@ -282,6 +311,7 @@ def main() -> None:
     history: list[dict] = []
     evaluations: dict[str, dict] = {}
     gradients: dict[str, dict] = {}
+    probes: dict[str, dict] = {}
     paused: list[int] = []
     train_seconds = 0.0
     energy_before = 0.0
@@ -295,6 +325,7 @@ def main() -> None:
         evaluations = json.loads(saved["evaluations"])
         gradients = json.loads(saved["gradients"])
         paused = json.loads(saved["paused"])
+        probes = json.loads(saved["probes"])
         pause_at -= set(paused)
         train_seconds = saved["train_seconds"]
         energy_before = saved["energy_joules"]
@@ -317,6 +348,7 @@ def main() -> None:
             "evaluations": json.dumps(evaluations),
             "gradients": json.dumps(gradients),
             "paused": json.dumps(paused),
+            "probes": json.dumps(probes),
             "train_seconds": train_seconds,
             "energy_joules": energy_joules() or 0.0,
         }
@@ -327,6 +359,12 @@ def main() -> None:
                 gradients[str(update)] = component_gradients(
                     model, gradient_batch, objective
                 )
+            if update in probes_at and str(update) not in probes and probe_test:
+                probes[str(update)] = {
+                    "pitch": stage_probes(model, probe_fit, probe_test),
+                    "saturation": saturation(model, probe_test),
+                }
+                model.train()
             if update in eval_at and str(update) not in evaluations:
                 results = evaluate(
                     model,
@@ -385,7 +423,8 @@ def main() -> None:
     result = {
         "experiment": "minecraft_world_model",
         "git_commit": git_commit(),
-        "runtime": runtime.metadata(torch.device("cpu")),
+        "runtime": runtime.metadata(torch.device("cpu"))
+        | {"macos_background_policy": background},
         "seed": args.seed,
         "dataset": {
             "path": str(args.dataset),
@@ -415,6 +454,7 @@ def main() -> None:
         },
         "objective": objective.to_json(),
         "gradients": gradients,
+        "probes": probes,
         "training": {
             "updates": update,
             "batch": args.batch,

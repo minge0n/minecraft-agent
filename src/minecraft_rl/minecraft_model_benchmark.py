@@ -36,8 +36,9 @@ from minecraft_rl.minecraft_replay import (
 from minecraft_rl.minecraft_world_model import (
     MinecraftRSSM,
     ModelConfig,
+    Objective,
+    objective_terms,
     parameter_count,
-    reconstruction_losses,
 )
 from minecraft_rl.provenance import git_commit
 
@@ -57,6 +58,9 @@ CANDIDATES = {
     "E_patch_32_32": ModelConfig(
         ray_layer="patch", encoder_channels=32, decoder_channels=32
     ),
+    # Encoder follow-up: model D with another path to the posterior.
+    "D_fusion_self_skip": ModelConfig(fusion="self_skip"),
+    "D_fusion_late": ModelConfig(fusion="late"),
 }
 
 
@@ -86,12 +90,16 @@ def benchmark(
 ) -> dict:
     torch.manual_seed(0)
     model = MinecraftRSSM(vocabulary, config)
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, eps=1e-5)
     generator = torch.Generator().manual_seed(0)
     o, actions, continues = batch.observations, batch.actions, batch.continues
 
+    objective = Objective(
+        reduction="group_mean", component_scale=float(vocabulary.rays)
+    )
+
     def update():
-        terms = model.losses(o, actions, continues, generator)
+        terms = model.losses(o, actions, continues, generator, objective)
         optimizer.zero_grad()
         terms["total"].backward()
         optimizer.step()
@@ -116,8 +124,10 @@ def benchmark(
 
     def decoder_step():
         model.zero_grad()
-        terms = reconstruction_losses(model.decoder(s), o, model.vocabulary)
-        sum(t.mean() for t in terms.values()).backward()
+        terms = objective_terms(
+            model.decoder(s), o, model.vocabulary, objective.reduction
+        )
+        sum(v for k, v in terms.items() if k != "pitch_component").backward()
 
     parts = {
         part: timed(step, updates)[0]
@@ -133,6 +143,7 @@ def benchmark(
         "parameters": parameter_count(model),
         "parameters_encoder": parameter_count(model.encoder),
         "parameters_decoder": parameter_count(model.decoder),
+        "parameters_posterior": parameter_count(model.posterior_net),
         "update_wall_seconds_median": wall,
         "update_cpu_seconds_median": cpu,
         "part_wall_seconds_median": parts,

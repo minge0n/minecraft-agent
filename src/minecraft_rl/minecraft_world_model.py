@@ -158,6 +158,18 @@ def ray_class(
     return out
 
 
+# How the encoder gives the observation to the posterior q(z | h, e):
+# - "shared": the ray features and the self-state features pass one shared
+#   layer, Linear(1264 -> 256) and ELU, and e is its output. The first
+#   Stage 3 models use it.
+# - "self_skip": as "shared", plus a small linear projection of the
+#   self-encoder output (`self_skip` values) next to e. The shared layer
+#   then no longer has to carry the self state alone.
+# - "late": no shared layer. e is the ray features and the self-encoder
+#   output side by side, and the first posterior layer mixes them.
+FUSIONS = ("shared", "self_skip", "late")
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     """Stage 2G core sizes, scaled moderately for the larger observation."""
@@ -174,6 +186,9 @@ class ModelConfig:
     encoder_channels: int = 16
     decoder_channels: int = 16
     patch: int = 4
+    # How the observation reaches the posterior (`FUSIONS`).
+    fusion: str = "shared"
+    self_skip: int = 32
     kl_prior_scale: float = 1.0
     kl_posterior_scale: float = 1.0
     free_nats: float = 1.0
@@ -331,9 +346,22 @@ class ObservationEncoder(nn.Module):
         self.self_net = nn.Sequential(
             nn.Linear(self.self_size, config.embed_dim), nn.ELU()
         )
-        self.out = nn.Sequential(
-            nn.Linear(self.grid.outputs + config.embed_dim, config.embed_dim), nn.ELU()
-        )
+        if config.fusion not in FUSIONS:
+            raise ValueError(f"unknown fusion {config.fusion!r}")
+        self.fusion = config.fusion
+        if config.fusion == "late":
+            self.out = None
+            self.outputs = self.grid.outputs + config.embed_dim
+        else:
+            self.out = nn.Sequential(
+                nn.Linear(self.grid.outputs + config.embed_dim, config.embed_dim),
+                nn.ELU(),
+            )
+            self.outputs = config.embed_dim
+        self.skip = None
+        if config.fusion == "self_skip":
+            self.skip = nn.Linear(config.embed_dim, config.self_skip)
+            self.outputs += config.self_skip
 
     def rays(self, o: dict[str, torch.Tensor]) -> torch.Tensor:
         v = self.vocabulary
@@ -343,7 +371,9 @@ class ObservationEncoder(nn.Module):
         grid = features.reshape(-1, v.rows, v.columns, features.shape[-1])
         return self.grid(grid.permute(0, 3, 1, 2))
 
-    def self_state(self, o: dict[str, torch.Tensor]) -> torch.Tensor:
+    def self_input(self, o: dict[str, torch.Tensor]) -> torch.Tensor:
+        """The self-state input of the self encoder (N, self_size)."""
+
         def stacks(item, count, durability):
             return torch.cat(
                 [
@@ -382,12 +412,44 @@ class ObservationEncoder(nn.Module):
             ],
             -1,
         )
-        return self.self_net(features.reshape(-1, self.self_size))
+        return features.reshape(-1, self.self_size)
+
+    def self_state(self, o: dict[str, torch.Tensor]) -> torch.Tensor:
+        return self.self_net(self.self_input(o))
+
+    def taps(self, o: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """The intermediate values of one forward pass, flat over the leading
+        axes, for diagnostics. Without a shared layer ("late"), the shared
+        stages repeat the joint features. `encoder_output` equals
+        `forward`."""
+        self_input = self.self_input(o)
+        self_output = self.self_net(self_input)
+        joint = torch.cat([self.rays(o), self_output], -1)
+        if self.out is None:
+            preactivation = fused = joint
+        else:
+            preactivation = self.out[0](joint)
+            fused = self.out[1](preactivation)
+        output = fused
+        if self.skip is not None:
+            output = torch.cat([fused, self.skip(self_output)], -1)
+        return {
+            "self_input": self_input,
+            "self_output": self_output,
+            "fusion_input": joint,
+            "fusion_preactivation": preactivation,
+            "fusion_output": fused,
+            "encoder_output": output,
+        }
 
     def forward(self, o: dict[str, torch.Tensor]) -> torch.Tensor:
         lead = o["health"].shape
-        joint = torch.cat([self.rays(o), self.self_state(o)], -1)
-        return self.out(joint).reshape(*lead, -1)
+        self_output = self.self_state(o)
+        joint = torch.cat([self.rays(o), self_output], -1)
+        out = joint if self.out is None else self.out(joint)
+        if self.skip is not None:
+            out = torch.cat([out, self.skip(self_output)], -1)
+        return out.reshape(*lead, -1)
 
 
 ACTION_SIZE = len(ACTION_BUTTONS) + 2 + HOTBAR_SLOTS + 1
@@ -808,7 +870,7 @@ class MinecraftRSSM(nn.Module):
             nn.Linear(self.hidden, self.latent_size),
         )
         self.posterior_net = nn.Sequential(
-            nn.Linear(self.hidden + config.embed_dim, self.hidden),
+            nn.Linear(self.hidden + self.encoder.outputs, self.hidden),
             nn.ELU(),
             nn.Linear(self.hidden, self.latent_size),
         )
@@ -865,6 +927,7 @@ class MinecraftRSSM(nn.Module):
             "z": torch.stack(zs, 1),
             "prior": torch.stack(priors, 1),
             "posterior": torch.stack(posteriors, 1),
+            "embedded": embedded,
         }
 
     def filter(
@@ -989,11 +1052,14 @@ def latent_statistics(
     }
 
 
+CHECKPOINT_FORMAT = "minecraft-rssm-checkpoint-v2"
+
+
 def save_checkpoint(path, model: MinecraftRSSM, extra: dict | None = None) -> None:
     """Weights, config and vocabulary. Loads with `weights_only=True`."""
     torch.save(
         {
-            "format": "minecraft-rssm-checkpoint-v1",
+            "format": CHECKPOINT_FORMAT,
             "config": model.config.to_json(),
             "vocabulary": asdict(model.vocabulary),
             "state_dict": model.state_dict(),
@@ -1004,11 +1070,20 @@ def save_checkpoint(path, model: MinecraftRSSM, extra: dict | None = None) -> No
 
 
 def load_checkpoint(path) -> tuple[MinecraftRSSM, dict]:
+    """Load a checkpoint. A v1 checkpoint has no fusion field: it comes from
+    the "shared" encoder, the only encoder before v2. A v2 checkpoint must
+    name its fusion, so a config never falls back to a default silently."""
     data = torch.load(path, weights_only=True)
-    if data.get("format") != "minecraft-rssm-checkpoint-v1":
+    config = dict(data.get("config", {}))
+    if data.get("format") == "minecraft-rssm-checkpoint-v1":
+        if "fusion" in config:
+            raise ValueError(f"{path}: a v1 checkpoint cannot name a fusion")
+        config["fusion"] = "shared"
+    elif data.get("format") == CHECKPOINT_FORMAT:
+        if "fusion" not in config:
+            raise ValueError(f"{path}: a {CHECKPOINT_FORMAT} checkpoint needs a fusion")
+    else:
         raise ValueError(f"{path} is not a Minecraft RSSM checkpoint")
-    model = MinecraftRSSM(
-        Vocabulary(**data["vocabulary"]), ModelConfig(**data["config"])
-    )
+    model = MinecraftRSSM(Vocabulary(**data["vocabulary"]), ModelConfig(**config))
     model.load_state_dict(data["state_dict"])
     return model, data["extra"]

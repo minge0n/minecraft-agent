@@ -15,7 +15,13 @@ Two evaluations exist (docs/stage3-minecraft-world-model.md):
 Baselines: persistence predicts that the last real observation stays the
 same. The frequency baseline predicts, for each ray position, the most
 frequent known ray class of the training split, and the most frequent
-selected slot.
+selected slot. The action-aware pitch baseline applies the camera rule of
+the environment, pitch' = clamp(pitch + pitch_delta, -90, 90)
+(`McBotClient.java`), to the last real pitch. It is an evaluation
+diagnostic: the world model and the policy never get it.
+
+Camera subsets: transitions whose camera action turns the pitch or the yaw
+by at least `CAMERA_EVENT_DEGREES` degrees. They use only real transitions.
 
 Metrics are sums and counts, so every number is a mean over the elements
 it names. "Changed" metrics use only elements whose target differs from the
@@ -32,7 +38,11 @@ import torch
 from torch import nn
 
 from minecraft_rl.minecraft_dataset import ACTION_BUTTONS
-from minecraft_rl.minecraft_interface import RAY_KIND_ENTITY, RAY_KIND_NONE
+from minecraft_rl.minecraft_interface import (
+    MAX_CAMERA_DELTA_DEGREES,
+    RAY_KIND_ENTITY,
+    RAY_KIND_NONE,
+)
 from minecraft_rl.minecraft_replay import CompactVocabulary, SequenceReplay
 from minecraft_rl.minecraft_world_model import (
     COUNT_LOG_SCALE,
@@ -45,6 +55,11 @@ from minecraft_rl.minecraft_world_model import (
 )
 
 HORIZONS = (1, 5, 10, 20)
+CAMERA_EVENT_DEGREES = 3.0
+# An imagination window counts as a camera window if at least this share of
+# its future steps turns the yaw or the pitch by CAMERA_EVENT_DEGREES.
+CAMERA_WINDOW_SHARE = 0.5
+MAX_PITCH_DEGREES = 90.0
 MIN_EVENT_EXAMPLES = 20
 BUTTON = {name: index for index, name in enumerate(ACTION_BUTTONS)}
 MOVEMENT_BUTTONS = ("forward", "back", "left", "right", "jump")
@@ -78,6 +93,31 @@ def ray_frequency_baseline(
 def slot_frequency_baseline(replay: SequenceReplay) -> int:
     slots = torch.cat([o["selected_slot"] for o in replay.observations])
     return int(torch.bincount(slots).argmax())
+
+
+def action_pitch(pitch: torch.Tensor, camera: torch.Tensor) -> torch.Tensor:
+    """The pitch after the camera actions (..., K, 2) from the pitch (...,):
+    the environment rule, applied once per step, for k = 1..K."""
+    steps = []
+    for k in range(camera.shape[-2]):
+        pitch = (pitch + camera[..., k, 1]).clamp(-MAX_PITCH_DEGREES, MAX_PITCH_DEGREES)
+        steps.append(pitch)
+    return torch.stack(steps, -1)
+
+
+CAMERA = slice(len(ACTION_BUTTONS), len(ACTION_BUTTONS) + 2)
+
+
+def camera_of(actions: torch.Tensor) -> torch.Tensor:
+    """The camera deltas in degrees (..., 2: yaw, pitch) of action vectors."""
+    return actions[..., CAMERA] * MAX_CAMERA_DELTA_DEGREES
+
+
+def pitch_baseline(
+    predicted: torch.Tensor, target: torch.Tensor
+) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    error = (predicted - target).abs()
+    return {"pitch_mae": (error, torch.ones_like(error))}
 
 
 def point_prediction(prediction: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -220,6 +260,8 @@ def event_masks(
     entities = lambda o: (o["ray_kind"] == RAY_KIND_ENTITY).sum(-1)  # noqa: E731
     events = {
         "camera_turn": camera,
+        "camera_pitch_event": actions_camera[..., 1].abs() >= CAMERA_EVENT_DEGREES,
+        "camera_yaw_event": actions_camera[..., 0].abs() >= CAMERA_EVENT_DEGREES,
         "forward": actions_buttons[..., BUTTON["forward"]],
         "jump": actions_buttons[..., BUTTON["jump"]],
         "sneak": actions_buttons[..., BUTTON["sneak"]],
@@ -378,6 +420,14 @@ def one_step(
                     p[continues == 1].sum()
                 )
         persistence = point_metrics(reference, target, reference, unknown, max_distance)
+        for name, action in (("action_pitch", a), ("action_pitch_shuffled", rolled)):
+            rule = action_pitch(reference["pitch"], camera_of(action).unsqueeze(-2))
+            for subset, mask in subsets.items():
+                acc.add(
+                    (subset, name),
+                    pitch_baseline(rule.squeeze(-1), target["pitch"]),
+                    mask,
+                )
         frequency = dict(reference)
         frequency["ray_class"] = frequency_rays.expand_as(reference["ray_class"])
         frequency["selected_slot"] = torch.full_like(
@@ -455,6 +505,7 @@ def imagination(
     max_distance = model.vocabulary.max_distance
     horizon = replay.length - context
     acc = Accumulator()
+    windows = defaultdict(int)
     for batch in _windows(replay, index, batch_size):
         o, actions = batch.observations, batch.actions
         known = _slice(o, (slice(None), slice(0, context + 1)))
@@ -470,9 +521,28 @@ def imagination(
         reference = {
             name: value.expand_as(target[name]) for name, value in last.items()
         }
+        shuffled = torch.roll(future, 1, 0)
+        start_pitch = last["pitch"][:, 0]
+        for name, action in (
+            ("action_pitch", future),
+            ("action_pitch_shuffled", shuffled),
+        ):
+            rule = pitch_baseline(
+                action_pitch(start_pitch, camera_of(action)), target["pitch"]
+            )
+            for k in HORIZONS:
+                if k <= horizon:
+                    acc.add(
+                        (f"horizon_{k}", name),
+                        {m: (t[:, k - 1], c[:, k - 1]) for m, (t, c) in rule.items()},
+                    )
+        # Windows whose future actions turn the camera a lot.
+        turning = (camera_of(future).abs() >= CAMERA_EVENT_DEGREES).any(
+            -1
+        ).float().mean(-1) >= CAMERA_WINDOW_SHARE
         for name, action in (
             ("model", future),
-            ("model_shuffled_actions", torch.roll(future, 1, 0)),
+            ("model_shuffled_actions", shuffled),
         ):
             s = model.imagine(h, z, action, generator)
             prediction = model.decoder(s)
@@ -482,22 +552,34 @@ def imagination(
             metrics |= model_ray_metrics(prediction, target, reference, unknown)
             for k in HORIZONS:
                 if k <= horizon:
-                    acc.add(
-                        (f"horizon_{k}", name),
-                        {
-                            m: (t[:, k - 1], c[:, k - 1])
-                            for m, (t, c) in metrics.items()
-                        },
-                    )
+                    at_k = {
+                        m: (t[:, k - 1], c[:, k - 1]) for m, (t, c) in metrics.items()
+                    }
+                    acc.add((f"horizon_{k}", name), at_k)
+                    acc.add((f"camera_horizon_{k}", name), at_k, turning.float())
         persistence = point_metrics(reference, target, reference, unknown, max_distance)
         for k in HORIZONS:
             if k <= horizon:
-                acc.add(
-                    (f"horizon_{k}", "persistence"),
-                    {
-                        m: (t[:, k - 1], c[:, k - 1])
-                        for m, (t, c) in persistence.items()
-                    },
-                )
+                at_k = {
+                    m: (t[:, k - 1], c[:, k - 1]) for m, (t, c) in persistence.items()
+                }
+                acc.add((f"horizon_{k}", "persistence"), at_k)
+                acc.add((f"camera_horizon_{k}", "persistence"), at_k, turning.float())
+                for name, action in (
+                    ("action_pitch", future),
+                    ("action_pitch_shuffled", shuffled),
+                ):
+                    rule = pitch_baseline(
+                        action_pitch(start_pitch, camera_of(action)), target["pitch"]
+                    )
+                    acc.add(
+                        (f"camera_horizon_{k}", name),
+                        {m: (t[:, k - 1], c[:, k - 1]) for m, (t, c) in rule.items()},
+                        turning.float(),
+                    )
+        windows["all"] += len(turning)
+        windows["camera"] += int(turning.sum())
     model.mode_latents = False
-    return acc.result()
+    result = acc.result()
+    result["windows"] = dict(windows)
+    return result
