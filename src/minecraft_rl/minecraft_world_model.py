@@ -713,11 +713,24 @@ class Objective:
     component weighs as much as the ray grid. The overall loss scale then
     also stays that of "sum". That matters for Adam: Adam ignores the scale
     of a gradient only where the gradient is much larger than its eps.
+
+    Two diagnostic factors test the trade-off between the KL cost of keeping
+    the pitch in z and the reconstruction value of the pitch:
+
+    - `pitch_loss_scale` multiplies the squared pitch error of every state
+      before the reduction, so only the pitch component of the "scalars"
+      term changes.
+    - `kl_loss_scale` multiplies the KL term after free nats, on top of the
+      weight of "kl". Free nats work as before.
+
+    Both are 1 for every run before they existed.
     """
 
     reduction: str = "sum"
     weights: tuple[tuple[str, float], ...] = ()
     component_scale: float = 1.0
+    pitch_loss_scale: float = 1.0
+    kl_loss_scale: float = 1.0
 
     def __post_init__(self) -> None:
         if self.reduction not in REDUCTIONS:
@@ -725,16 +738,39 @@ class Objective:
         for group, _ in self.weights:
             if group not in (*LOSS_GROUPS, "continuation", "kl"):
                 raise ValueError(f"unknown loss group {group!r}")
+        for name in ("pitch_loss_scale", "kl_loss_scale"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be a positive number, not {value}")
 
     def weight(self, group: str) -> float:
         return dict(self.weights).get(group, 1.0)
+
+    @property
+    def kl_coefficient(self) -> float:
+        """The factor on the KL term after free nats."""
+        return self.weight("kl") * self.kl_loss_scale
 
     def to_json(self) -> dict:
         return {
             "reduction": self.reduction,
             "weights": dict(self.weights),
             "component_scale": self.component_scale,
+            "pitch_loss_scale": self.pitch_loss_scale,
+            "kl_loss_scale": self.kl_loss_scale,
         }
+
+    @classmethod
+    def from_json(cls, data: dict) -> "Objective":
+        """An objective from `to_json`. A record from before the two scales
+        existed means both are 1."""
+        return cls(
+            reduction=data["reduction"],
+            weights=tuple(sorted(data.get("weights", {}).items())),
+            component_scale=data.get("component_scale", 1.0),
+            pitch_loss_scale=data.get("pitch_loss_scale", 1.0),
+            kl_loss_scale=data.get("kl_loss_scale", 1.0),
+        )
 
 
 # The objective of the first Stage 3 runs: the plain log likelihood.
@@ -813,11 +849,18 @@ def objective_terms(
     o: dict[str, torch.Tensor],
     vocabulary: Vocabulary,
     reduction: str,
+    pitch_loss_scale: float = 1.0,
 ) -> dict[str, torch.Tensor]:
     """Every reconstruction term reduced as `reduction` says, plus
     "pitch_component": the part of the "scalars" term that comes from the
-    pitch. It is already part of "scalars" and is only for diagnostics."""
+    pitch. It is already part of "scalars" and is only for diagnostics.
+    `pitch_loss_scale` multiplies the pitch error of every state."""
     elements = element_losses(prediction, o, vocabulary)
+    if pitch_loss_scale != 1.0:
+        element, mask = elements["scalars"]
+        factor = torch.ones(element.shape[-1])
+        factor[PITCH_INDEX] = pitch_loss_scale
+        elements["scalars"] = (element * factor, mask)
     out = {}
     for name, (element, mask) in elements.items():
         out[name] = reduce_term(name, element, mask, reduction)
@@ -967,7 +1010,13 @@ class MinecraftRSSM(nn.Module):
         diagnostics."""
         filtered = self.filter(o, actions, generator, straight_through=True)
         s = torch.cat([filtered["h"], filtered["z"]], -1)
-        out = objective_terms(self.decoder(s), o, self.vocabulary, objective.reduction)
+        out = objective_terms(
+            self.decoder(s),
+            o,
+            self.vocabulary,
+            objective.reduction,
+            objective.pitch_loss_scale,
+        )
         continuation = nn.functional.binary_cross_entropy_with_logits(
             self.continue_head(s[:, 1:]).squeeze(-1), continues, reduction="none"
         )
@@ -993,7 +1042,7 @@ class MinecraftRSSM(nn.Module):
         out["total"] = (
             out["reconstruction"]
             + scale * objective.weight("continuation") * out["continuation"]
-            + objective.weight("kl") * out["kl_loss"]
+            + objective.kl_coefficient * out["kl_loss"]
         )
         return out, s
 

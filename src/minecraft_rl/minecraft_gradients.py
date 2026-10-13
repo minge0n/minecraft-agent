@@ -64,7 +64,7 @@ def component_gradients(
     components["continuation"] = (
         scale * objective.weight("continuation") * terms["continuation"]
     )
-    components["kl"] = objective.weight("kl") * terms["kl_loss"]
+    components["kl"] = objective.kl_coefficient * terms["kl_loss"]
     places = {
         "ray_encoder": _parameters(model, RAY_ENCODER_PREFIXES),
         "rssm_core": _parameters(model, CORE_PREFIXES),

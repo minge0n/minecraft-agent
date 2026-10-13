@@ -2,7 +2,7 @@
 
 Purpose: learn short-horizon dynamics from real structured Minecraft transitions with the Stage 2G RSSM (`docs/stage2g.md`), and compare the model against trivial baselines. No actor is trained. No reward exists: the reward design is a separate later milestone.
 
-Status: first held-out run, the follow-up on loss balance and the follow-up on the encoder complete. Objective G is selected and frozen (section "Follow-up: balance of the loss components"). The encoder stays `shared` and is frozen again: late fusion keeps the pitch through the encoder, but z still does not keep it (section "Follow-up: where the pitch is lost in the encoder"). The model is not ready for actor training: it predicts the pitch far worse than persistence, and at one step it barely uses the camera action.
+Status: first held-out run and three follow-ups complete: loss balance, encoder and objective trade-off. The canonical objective is now G with the pitch component weighted 128 times (section "Follow-up: the trade-off between KL cost and pitch value"). With it, the pitch error halves, the latent keeps more pitch, and the model uses the camera action over several steps. The ray metrics stay at the level of G. The encoder, the RSSM, the reconstruction objective and the KL objective are frozen. Pitch at one step is still worse than persistence (3.7 against 1.5 degrees).
 
 First held-out run: complete, with a mixed result. The model predicts changed rays better than every baseline. It predicts unchanged content and pitch worse than persistence, and it uses the action only weakly. The likely cause is the scale of the loss terms (section "Diagnosis"). The model is not yet good enough for actor training.
 
@@ -582,6 +582,192 @@ Negative findings:
 
 Next targeted hypothesis, not tested here because objective G is fixed in this task: the pitch is dropped by the trade-off between reconstruction and KL. A test would change only the weight of the pitch, or the KL balance, and check with the probe whether z then keeps it.
 
+## Follow-up: the trade-off between KL cost and pitch value
+
+Hypothesis: the model drops the pitch from z because storing it costs more KL than the pitch reconstruction gives back. The encoder follow-up estimated about 1.8 nats per step of extra KL to reach a pitch error of 1.5 degrees, against a reconstruction gain of about 0.55 under objective G. If the hypothesis is right, a larger pitch weight or a smaller KL weight must make z keep the pitch and make the model use `pitch_delta`.
+
+Everything else stays fixed: the `shared` encoder, the ray patch encoder and decoder, the RSSM, 16 x 16 latent, free nats 1.0, data, vocabulary, splits, batch 16, length 32, Adam 1e-3, seed 0, canonical runtime and the reduction of objective G.
+
+### Two explicit factors
+
+`Objective` has two new fields. Both are recorded in `metrics.json`, in the run identity of the resumable state and in the `extra` of the checkpoint.
+
+- `pitch_loss_scale` (`--pitch-loss-scale`) multiplies the squared pitch error of every state before the reduction. Only the pitch component of the "scalars" term changes.
+- `kl_loss_scale` (`--kl-loss-scale`) multiplies the KL term after free nats, on top of the "kl" weight. Free nats work as before.
+
+Both are 1 by default. A record from before they existed (`Objective.from_json`) means 1. With both at 1, training is bit-identical to objective G: the rerun of G gave the same metrics as the earlier objective-G run at 500 and 1,000 updates (pitch 8.264 and 7.607 degrees, changed rays 0.301 and 0.353). Tests are in `tests/test_minecraft_tradeoff.py`.
+
+### Variants
+
+| Name | Change on top of G |
+|---|---|
+| G | none |
+| P128 | `pitch_loss_scale` 128 |
+| P256 | `pitch_loss_scale` 256 |
+| K0.5 | `kl_loss_scale` 0.5 |
+
+The pitch factors are diagnostic interventions. Their order of magnitude comes from the estimate above: the gain must grow by about 1.8 / 0.55 times the share of the pitch that z does not yet hold. No other value was tried.
+
+The probe now also reads h and the most likely prior state (`prior_z`).
+
+### 500 updates
+
+`eval_episode`, one step. Pitch in degrees, "gap" is the error with shuffled actions minus the error with real actions. Persistence: 1.46 degrees. The action-aware rule: 0.000 with real actions, 2.05 with shuffled actions.
+
+| Run | Pitch | Gap | Ray acc. | Changed rays | Distance | Raw KL | Below FN | Active | Prior H | Posterior H | Agreement |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| G | 8.26 | 0.00 | 0.490 | 0.301 | 3.73 | 2.60 | 0.199 | 13 | 3.1 | 1.5 | 0.907 |
+| P128 | 6.40 | 0.08 | 0.470 | 0.302 | 3.83 | 3.98 | 0.080 | 16 | 9.3 | 6.4 | 0.857 |
+| P256 | 7.25 | 0.02 | 0.531 | 0.305 | 3.67 | 4.14 | 0.084 | 16 | 13.0 | 10.3 | 0.827 |
+| K0.5 | 9.57 | 0.19 | 0.303 | 0.268 | 3.67 | 0.00 | 1.000 | 0 | 0.0 | 0.0 | 1.000 |
+
+Effective KL (posterior part after free nats): G 2.66, P128 4.00, P256 4.17, K0.5 1.00.
+
+Pitch probe at 500 updates, degrees (mean predictor 9.89):
+
+| Run | Self output | Encoder output | Posterior hidden | z | h | Prior z |
+|---|---|---|---|---|---|---|
+| G | 0.58 | 12.71 | 12.93 | 8.63 | 9.76 | 9.18 |
+| P128 | 0.26 | 9.33 | 9.05 | 7.82 | 7.72 | 7.89 |
+| P256 | 0.31 | 8.46 | 7.67 | 7.55 | 8.02 | 7.93 |
+| K0.5 | 0.05 | 9.19 | 40.12 | 9.89 | 9.94 | 9.89 |
+
+K0.5 failed: the latent collapsed. The raw KL fell from 1.0 at update 100 to 0.04 at update 500, no variable was active, and prior and posterior entropy were 0, so z was the same constant everywhere. Ray accuracy fell to 0.303 and z held no pitch. K0.5 stopped at 500 updates. The cause is not proven. `kl_loss_scale` scales both parts of the KL: the posterior part, which charges z for information, and the prior part, which trains the prior to follow the posterior. A hypothesis is that the weaker prior training let the prior fall behind early, so every bit in z cost more, and the posterior gave up z. So K0.5 does not test the cost side of the hypothesis on this setup.
+
+P128 and P256 kept a healthy latent (16 active variables, more entropy than G), kept changed rays, and lowered the pitch error. Both continued.
+
+### 1,000 updates
+
+| Split | Run | Pitch | Gap | Ray acc. | Changed rays | Distance | Health | Food | Raw KL | Active |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `eval_episode` | G | 7.61 | -0.09 | 0.705 | 0.353 | 3.38 | 0.96 | 1.00 | 4.28 | 16 |
+| | P128 | 6.70 | -0.06 | 0.702 | 0.348 | 3.48 | 0.70 | 1.40 | 5.20 | 16 |
+| | P256 | 6.76 | 0.00 | 0.677 | 0.340 | 3.70 | 1.20 | 1.44 | 5.14 | 16 |
+| `eval_seed` | G | 10.29 | -0.07 | 0.563 | 0.251 | 3.87 | 1.95 | 1.34 | 5.76 | 16 |
+| | P128 | 10.55 | 0.02 | 0.570 | 0.267 | 3.82 | 1.78 | 1.55 | 7.32 | 16 |
+| | P256 | 10.62 | -0.03 | 0.560 | 0.248 | 3.93 | 1.90 | 1.71 | 6.72 | 16 |
+
+Imagination in `eval_episode` at 1,000 updates, pitch error with real / shuffled actions (persistence 6.42, 10.71, 14.74 at horizons 5, 10, 20):
+
+| Run | H5 | H10 | H20 |
+|---|---|---|---|
+| G | 10.26 / 10.33 | 11.18 / 11.51 | 15.01 / 15.19 |
+| P128 | 7.35 / 8.46 | 8.37 / 10.66 | 11.23 / 13.41 |
+| P256 | 8.17 / 8.62 | 9.75 / 11.18 | 12.05 / 14.72 |
+
+Pitch probe at 1,000 updates: z 9.10 (G), 7.71 (P128), 7.26 (P256); h 9.32, 7.25, 7.55.
+
+P128 was selected for 3,000 updates. P256 gave the same one-step pitch, but it was worse in ray accuracy, changed rays, ray distance, health and food in both splits, and it showed a smaller action effect over several steps. The smaller of the two interventions was also the simpler choice.
+
+### 3,000 updates: P128 against G
+
+G is the existing objective-G checkpoint, evaluated again with the current evaluation code and probe windows.
+
+One step:
+
+| Metric | `eval_episode` G | `eval_episode` P128 | `eval_seed` G | `eval_seed` P128 |
+|---|---|---|---|---|
+| Pitch, real actions | 7.91 | 3.74 | 10.08 | 5.69 |
+| Pitch, shuffled actions | 7.87 | 3.87 | 10.03 | 5.80 |
+| Persistence pitch | 1.46 | 1.46 | 1.45 | 1.45 |
+| Action-aware rule (real / shuffled) | 0.000 / 2.05 | 0.000 / 2.05 | 0.000 / 2.04 | 0.000 / 2.04 |
+| Ray accuracy | 0.761 | 0.750 | 0.625 | 0.630 |
+| Changed rays | 0.360 | 0.358 | 0.271 | 0.279 |
+| Ray distance (blocks) | 3.00 | 2.85 | 3.40 | 3.40 |
+| Health | 0.80 | 1.26 | 1.70 | 2.16 |
+| Health, changed states (13) | 1.90 | 1.62 | | |
+| Food | 1.10 | 1.07 | 1.37 | 1.38 |
+
+Camera pitch events (a camera action that turns the pitch by at least 3 degrees), real / shuffled actions:
+
+| Split | Run | Transitions | Pitch | Changed rays | Distance |
+|---|---|---|---|---|---|
+| `eval_episode` | G | 268 | 6.80 / 7.13 | 0.366 / 0.344 | 3.06 / 3.08 |
+| | P128 | 268 | 3.49 / 4.02 | 0.380 / 0.353 | 2.77 / 2.82 |
+| `eval_seed` | G | 276 | 10.67 / 10.33 | 0.286 / 0.273 | 3.48 / 3.51 |
+| | P128 | 276 | 5.74 / 5.86 | 0.297 / 0.285 | 3.45 / 3.47 |
+
+Pitch probe, degrees (mean predictor 9.89):
+
+| Run | Self output | Encoder output | Posterior hidden | z | h | Prior z |
+|---|---|---|---|---|---|---|
+| G | 1.47 | 14.55 | 9.07 | 9.43 | 8.62 | 8.67 |
+| P128 | 0.12 | 3.48 | 4.24 | 6.53 | 3.95 | 6.00 |
+
+Under P128 the encoder keeps the pitch (3.48 against 14.55 degrees) without a change of architecture. The pitch then reaches h (3.95), which the prior and the decoder read. z keeps part of it (6.53).
+
+Gradient norm on the RSSM core at 3,000 updates (fixed gradient batch): the pitch component 175 (G: 2.0), the self group 179 (G: 27), the ray class 167 (G: 194), the KL 6.6 (G: 6.6). The pitch now pulls on the core about as much as the ray grid.
+
+Latent at 3,000 updates:
+
+| Split | Run | Raw KL | Effective KL | Below FN | Active | Prior H | Posterior H | Agreement |
+|---|---|---|---|---|---|---|---|---|
+| `eval_episode` | G | 6.72 | 6.72 | 0.004 | 16 | 18.3 | 12.5 | 0.556 |
+| | P128 | 8.20 | 8.20 | 0.000 | 16 | 20.5 | 15.2 | 0.580 |
+| `eval_seed` | G | 7.54 | 7.54 | 0.027 | 16 | 18.0 | 12.1 | 0.541 |
+| | P128 | 10.05 | 10.05 | 0.000 | 16 | 21.4 | 15.8 | 0.549 |
+
+The KL rises by 1.5 nats in `eval_episode` and 2.5 nats in `eval_seed`, the order of the 1.8 nats estimated for keeping the pitch.
+
+### Imagination at 3,000 updates
+
+Real / shuffled actions. Persistence pitch in `eval_episode`: 1.59, 6.42, 10.71, 14.74; in `eval_seed`: 1.59, 6.41, 10.68, 14.48.
+
+`eval_episode`, all 128 windows:
+
+| Horizon | G pitch | P128 pitch | G changed rays | P128 changed rays | G distance | P128 distance |
+|---|---|---|---|---|---|---|
+| 1 | 8.95 / 8.99 | 3.85 / 3.94 | 0.343 / 0.338 | 0.356 / 0.348 | 2.98 / 3.00 | 2.82 / 2.85 |
+| 5 | 9.28 / 9.93 | 4.87 / 8.06 | 0.303 / 0.276 | 0.307 / 0.276 | 3.42 / 3.52 | 3.23 / 3.44 |
+| 10 | 10.01 / 11.23 | 6.24 / 12.85 | 0.248 / 0.213 | 0.244 / 0.204 | 3.99 / 4.13 | 3.76 / 4.13 |
+| 20 | 12.46 / 14.60 | 9.91 / 17.86 | 0.217 / 0.180 | 0.213 / 0.168 | 4.53 / 4.64 | 4.16 / 4.55 |
+
+`eval_seed`, all 128 windows:
+
+| Horizon | G pitch | P128 pitch | G changed rays | P128 changed rays | G distance | P128 distance |
+|---|---|---|---|---|---|---|
+| 1 | 11.28 / 11.36 | 6.11 / 6.48 | 0.274 / 0.272 | 0.305 / 0.299 | 3.30 / 3.34 | 3.49 / 3.53 |
+| 5 | 12.03 / 12.82 | 6.87 / 9.85 | 0.210 / 0.203 | 0.251 / 0.229 | 3.79 / 3.85 | 3.68 / 3.87 |
+| 10 | 12.19 / 13.10 | 7.62 / 12.54 | 0.176 / 0.163 | 0.220 / 0.204 | 4.08 / 4.21 | 3.97 / 4.25 |
+| 20 | 12.73 / 14.64 | 9.23 / 15.42 | 0.142 / 0.111 | 0.171 / 0.157 | 4.67 / 4.79 | 4.44 / 4.65 |
+
+Camera windows (74 in `eval_episode`, 71 in `eval_seed`), pitch real / shuffled:
+
+| Horizon | `eval_episode` G | `eval_episode` P128 | `eval_seed` G | `eval_seed` P128 |
+|---|---|---|---|---|
+| 1 | 8.62 / 8.81 | 3.77 / 3.86 | 11.64 / 11.30 | 5.58 / 5.98 |
+| 5 | 9.27 / 9.71 | 4.79 / 8.28 | 12.13 / 12.26 | 6.45 / 9.41 |
+| 10 | 9.70 / 11.64 | 5.97 / 13.09 | 12.85 / 14.09 | 7.59 / 12.72 |
+| 20 | 14.19 / 16.74 | 10.55 / 18.02 | 13.66 / 15.42 | 9.70 / 17.45 |
+
+The action effect on the pitch (shuffled minus real) at horizon 10 in `eval_episode` is 6.6 degrees under P128 against 1.2 under G. P128 beats persistence from horizon 5 in `eval_episode` and from horizon 10 in `eval_seed`. G beats it from horizon 10 in `eval_episode` and only at horizon 20 in `eval_seed`.
+
+### Result
+
+The hypothesis is supported on the side of the reconstruction value. P128 shows all three expected effects:
+
+1. Lower pitch error: 7.91 to 3.74 degrees in `eval_episode`, 10.08 to 5.69 in `eval_seed`.
+2. More pitch in the RSSM state: probe on h 8.62 to 3.95 degrees, on z 9.43 to 6.53.
+3. A larger effect of the pitch action: over several imagined steps the effect grows about fivefold, and at one step on camera pitch events from 0.33 to 0.53 degrees.
+
+The side of the KL cost is not shown: K0.5 collapsed the latent. So the result supports "the pitch was not worth enough" and leaves open whether a cheaper KL would do the same.
+
+Trade-offs: ray accuracy in `eval_episode` 0.750 against 0.761, changed rays at horizons 10 and 20 in `eval_episode` 0.01 lower, health error higher (0.80 to 1.26 in `eval_episode`). Changed rays and ray distance in `eval_seed` are better at every horizon. Health in the 13 states where it changes is better (1.90 to 1.62). These are small next to the pitch gain.
+
+Decision: P128 (objective G plus `--pitch-loss-scale 128`) becomes the canonical Stage 3 objective. The objective stays understandable: every loss group counts once as in G, and the pitch component counts 128 times. Evidence limits: one seed, one dataset. Pitch at one step is still worse than persistence (3.74 against 1.46 degrees) and far from the action-aware rule.
+
+Freeze: the encoder (`shared`), the RSSM, the reconstruction objective (G with pitch weight 128) and the KL objective (Stage 2G form, free nats 1.0, scale 1) are frozen. No further pitch tuning follows unless a later actor experiment shows that the pitch blocks it.
+
+Why architecture tuning stopped: the encoder follow-up showed that a new path moves the loss to the next layer, because the objective makes dropping the pitch worth it. This follow-up confirms it: an objective change alone keeps the pitch through the unchanged encoder.
+
+Negative findings:
+
+- K0.5 collapsed the latent by 500 updates. A smaller KL weight is not a safe way to make information cheaper on this setup.
+- P256 kept a healthy latent, but it cost ray accuracy, ray distance, health and food at 1,000 updates and gave no pitch gain over P128.
+- Even under P128 the one-step pitch error barely depends on the action (gap 0.14 degrees). The model uses the action mostly through h over several steps.
+
+Compute: P128 at 3,000 updates took 0.73 s and 0.33 J per update on the efficiency cores, 2,356 s over 3 processes.
+
 ## Commands
 
 ```
@@ -619,6 +805,17 @@ Encoder follow-up, variant I:
 ```
 
 The training runner moves itself to the efficiency cores of a Mac (`macos_qos.py`), also when it runs outside the sweep runner. `--foreground` keeps the default priority.
+
+Objective trade-off follow-up (one directory per variant; `--kl-loss-scale 1/2` for K0.5, no factor for G):
+
+```
+.venv/bin/python -m minecraft_rl.minecraft_world_model_train --seed 0 \
+    --output runs/stage3/tradeoff-P128/seed0/metrics.json \
+    --reduction group_mean --component-scale rays --pitch-loss-scale 128 \
+    --updates 3000 --eval-at 0,500,1000,3000 --imagine-at 1000,3000 \
+    --pause-at 500,1000 --probes-at 0,500,1000,3000 \
+    --state runs/stage3/tradeoff-P128/seed0/state.pt
+```
 
 `--pause-at` stops the run after the named update counts, so that a staged budget can be inspected. The same command continues it.
 

@@ -21,6 +21,10 @@ Minecraft RSSM at these stages, in order:
 - `posterior_input`: [h, e], the input of the posterior network.
 - `posterior_hidden`: the hidden layer of the posterior network.
 - `z`: the most likely posterior state.
+- `h`: the deterministic RSSM state, which carries what the model
+  remembers from earlier steps and the last action.
+- `prior_z`: the most likely prior state, the model's guess of z before it
+  sees the observation.
 
 The probe standardizes each feature on the fit set, drops features without
 variance, and selects the ridge strength by a fixed 4-fold split of the fit
@@ -41,6 +45,8 @@ STAGES = (
     "posterior_input",
     "posterior_hidden",
     "z",
+    "h",
+    "prior_z",
 )
 RIDGE_STRENGTHS = (1e-2, 1e-1, 1.0, 10.0, 100.0, 1000.0)
 FOLDS = 4
@@ -65,6 +71,13 @@ def stage_features(model: MinecraftRSSM, batch) -> dict[str, torch.Tensor]:
     out["posterior_input"] = posterior_input
     out["posterior_hidden"] = hidden
     out["z"] = filtered["z"]
+    out["h"] = filtered["h"]
+    prior = filtered["prior"]
+    out["prior_z"] = (
+        torch.nn.functional.one_hot(prior.argmax(-1), prior.shape[-1])
+        .flatten(-2)
+        .float()
+    )
     return out
 
 

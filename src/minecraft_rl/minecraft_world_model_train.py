@@ -174,6 +174,17 @@ def main() -> None:
         "loss, a number or 'rays' for the ray count of the grid",
     )
     parser.add_argument(
+        "--pitch-loss-scale",
+        default="1",
+        help="diagnostic factor on the squared pitch error only, a number or "
+        "a fraction",
+    )
+    parser.add_argument(
+        "--kl-loss-scale",
+        default="1",
+        help="diagnostic factor on the KL term after free nats, a number or a fraction",
+    )
+    parser.add_argument(
         "--pause-at",
         default="",
         help="update counts after which the run saves its state and stops, so "
@@ -228,6 +239,8 @@ def main() -> None:
             )
         ),
         component_scale=component_scale,
+        pitch_loss_scale=float(Fraction(args.pitch_loss_scale)),
+        kl_loss_scale=float(Fraction(args.kl_loss_scale)),
     )
     pause_at = set(parse_counts(args.pause_at))
     gradients_at = (
@@ -418,7 +431,13 @@ def main() -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = output.parent / "world_model.pt"
     save_checkpoint(
-        checkpoint, model, {"vocabulary": compact.to_json(), "updates": update}
+        checkpoint,
+        model,
+        {
+            "vocabulary": compact.to_json(),
+            "updates": update,
+            "objective": objective.to_json(),
+        },
     )
     result = {
         "experiment": "minecraft_world_model",
