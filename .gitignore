@@ -2,6 +2,8 @@
 .tools/
 .runtime/
 runs/
+runs
+runs.noindex/
 .pytest_cache/
 .ruff_cache/
 __pycache__/

@@ -5,6 +5,24 @@ cd "$(dirname "$0")/.."
 root=$(pwd)
 mkdir -p .tools .runtime/minecraft .runtime/gradle
 
+# On macOS, Spotlight indexes every new file and rewrites its index each time
+# a run saves a checkpoint or metrics. Measured: mds_stores used up to 190% CPU
+# while runs/ held 920 indexed files, far more than a Stage 3 trainer (0.45 W).
+# Spotlight skips a directory whose name ends in .noindex, so the run data
+# lives in runs.noindex and runs is a symbolic link to it. All paths stay the
+# same. The hidden directories .tools, .runtime and .venv are not indexed.
+if [ "$(uname -s)" = Darwin ]; then
+  if [ -d runs ] && [ ! -L runs ]; then
+    if [ -e runs.noindex ]; then
+      echo "Both runs/ and runs.noindex/ exist; merge them by hand" >&2
+      exit 1
+    fi
+    mv runs runs.noindex
+  fi
+  mkdir -p runs.noindex
+  [ -L runs ] || ln -s runs.noindex runs
+fi
+
 for tool in curl tar python3; do
   command -v "$tool" >/dev/null 2>&1 || { echo "Missing bootstrap prerequisite: $tool" >&2; exit 1; }
 done
