@@ -123,3 +123,26 @@ Limitations: one host, one run per distance, one seed. The throughput numbers co
 
 After the change, the observation, paced/unpaced equivalence and v1 tick-gate probes pass with render distance 6.
 
+### Worker regression at render distance 6
+
+`scripts/minecraft-worker-probe.py` passes with the default render distance 6 (`runs/minecraft-workers/20261013-211912`): two concurrent workers keep their own identities, directories and ports, stepping one worker never advances the other, the concurrent controlled replay of 243 steps is identical on both workers apart from the known `tick_count` offset, and each worker records its own video with no dropped frame. Concurrent replay throughput was 136 and 138 steps/s.
+
+Decision: render distance 6 is the training default. Evaluation, showcase and benchmark runs can set another value with `MCBOT_RENDER_DISTANCE`. Keep it at least the simulation distance (6).
+
+### The game process on the efficiency cores
+
+`launched_client(..., background=True)` starts Gradle and the game under `taskpolicy -b`, so the game inherits the macOS background policy. The render-distance probe takes `--background`. Measured at render distance 6, one process, same walk:
+
+| | Default priority | Background policy |
+|---|---|---|
+| Steps/s, rendering, no recording | 191.6 | 38.8 |
+| Steps/s, rendering and recording | 142.4 | 45.2 |
+| Game energy per step, recording (J) | 0.076 | 0.036 |
+| Game mean power, recording (W) | 10.8 | 1.6 |
+| Game energy on performance cores | - | 0 J |
+| Controlled replay against render distance 8 | identical | identical |
+
+The background policy cuts the game power by a factor of about 7 and the energy per step by half, at a quarter of the speed.
+
+Negative finding: chunk generation then falls behind lockstep. In the first walk after a reset, no chunk inside the simulation distance was entity-ticking at the end and 320 of 420 steps had an unloaded chunk in sensor range; the second walk had 17 steps with a non-ticking chunk in sensor range. With default priority no step had an unloaded or non-ticking sensor chunk. Chunks keep loading while the world is frozen (a separate check: 9 to 169 ticking chunks in 10 s of idle time after a reset on the efficiency cores). The background policy is therefore not a training default until a reset waits for its chunks and a new measurement shows that sensor-range chunks stay ready during movement.
+

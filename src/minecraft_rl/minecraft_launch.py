@@ -6,6 +6,7 @@ Integration tooling only; nothing here is part of the policy or environment API.
 import os
 import signal
 import subprocess
+import sys
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -51,6 +52,7 @@ def launched_client(
     startup_timeout: float,
     extra_environment: Mapping[str, str] | None = None,
     worker: int | None = None,
+    background: bool = False,
 ) -> Iterator[MinecraftClient]:
     """Run `./scripts/gradle runClient` in observer mode and yield a connection.
 
@@ -58,6 +60,11 @@ def launched_client(
     and the offline development identity AgentNNNN
     (docs/decisions/parallel-workers.md). On exit the client is asked to quit; a
     client that does not stop is killed.
+
+    With `background` on macOS, the game starts under `taskpolicy -b`: Gradle
+    and the game process it starts inherit the background policy and run on
+    the efficiency cores. It changes where and how fast the game computes,
+    never what a step does.
     """
     environment = (
         os.environ
@@ -67,6 +74,8 @@ def launched_client(
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8") as log:
         command = [str(REPOSITORY_ROOT / "scripts" / "gradle"), "runClient"]
+        if background and sys.platform == "darwin":
+            command = ["taskpolicy", "-b", *command]
         if worker is not None:
             command.append(f"-Pmcbot.worker={worker:04d}")
         game = subprocess.Popen(

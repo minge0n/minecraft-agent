@@ -92,13 +92,14 @@ def process_usage(pid: int | None) -> dict[str, Any]:
     energy = macos_energy.read(pid)
     if energy is not None:
         out["energy_joules"] = energy.energy_joules
+        out["performance_core_energy_joules"] = energy.performance_core_energy_joules
     return out
 
 
 def usage_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
     out = {
         key: after[key] - before[key]
-        for key in ("cpu_seconds", "energy_joules")
+        for key in ("cpu_seconds", "energy_joules", "performance_core_energy_joules")
         if key in before and key in after
     }
     if "resident_mib" in after:
@@ -195,12 +196,14 @@ def run_throughput(
 
 
 def measure(args: argparse.Namespace) -> None:
-    output = args.output / f"render-{args.render_distance}"
+    name = f"render-{args.render_distance}"
+    output = args.output / (name + "-background" if args.background else name)
     output.mkdir(parents=True, exist_ok=True)
     result: dict[str, Any] = {
         "tool": "minecraft-render-distance-probe",
         "commit": git_commit(),
         "render_distance": args.render_distance,
+        "background_policy": args.background,
         "seed": args.seed,
         "walk_seed": WALK_SEED,
         "host": {"system": platform.system(), "machine": platform.machine()},
@@ -215,6 +218,7 @@ def measure(args: argparse.Namespace) -> None:
             output / "workers" / WORKER / "minecraft.log",
             args.startup_timeout,
             extra_environment={"MCBOT_RENDER_DISTANCE": str(args.render_distance)},
+            background=args.background,
         ) as client:
             result["startup_seconds"] = time.perf_counter() - launched
             status = client.status_json()
@@ -262,7 +266,9 @@ def measure(args: argparse.Namespace) -> None:
 
 def compare(args: argparse.Namespace) -> None:
     distances = sorted(
-        int(path.name.split("-")[1]) for path in args.output.glob("render-*")
+        int(path.name.split("-")[1])
+        for path in args.output.glob("render-*")
+        if path.name.count("-") == 1
     )
     reference = args.reference
     if reference not in distances:
@@ -313,6 +319,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--render-distance", type=int)
     parser.add_argument("--compare", action="store_true")
+    parser.add_argument(
+        "--background",
+        action="store_true",
+        help="start the game under taskpolicy -b (efficiency cores, macOS)",
+    )
     parser.add_argument("--reference", type=int, default=8)
     parser.add_argument("--port", type=int, default=47130)
     parser.add_argument("--seed", type=int, default=12345)
