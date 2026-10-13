@@ -23,7 +23,7 @@ Every training, evaluation, debugging and integration session that meaningfully 
 
 ## Low-cost rendering
 
-Optimize for observability, not visual quality. Initial defaults: render distance 8 chunks, VSync off, fast/minimal graphics, reduced particles and effects, windowed/offscreen-compatible, and the lowest resolution among candidates such as 320x180, 426x240 and 640x360 at which navigation, combat, falls, camera behavior, inventory interactions, crafting attempts, deaths and obvious policy failures stay easy to follow; choose it experimentally. Raise quality only for a concrete debugging or presentation need.
+Optimize for observability, not visual quality. Initial defaults: render distance 8 chunks (superseded by 6 chunks, measured in `docs/decisions/simulation-throughput.md`, "Render distance"), VSync off, fast/minimal graphics, reduced particles and effects, windowed/offscreen-compatible, and the lowest resolution among candidates such as 320x180, 426x240 and 640x360 at which navigation, combat, falls, camera behavior, inventory interactions, crafting attempts, deaths and obvious policy failures stay easy to follow; choose it experimentally. Raise quality only for a concrete debugging or presentation need.
 
 Simulation distance is configured independently and recorded; video cost never reduces simulation semantics. The integrated server derives its view distance from the client render distance, so render distance must stay well above the 32-block sensor reach (8 chunks = 128 blocks) and is recorded as an environment parameter. The mod applies these settings per worker instead of relying on hand-edited shared options.
 

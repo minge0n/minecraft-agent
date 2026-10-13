@@ -166,5 +166,5 @@ The scripted player trajectory repeated to within 1e-15 blocks and physics was i
 - Replay characterization covers one flat scene and 243 steps; see `docs/replay-characterization.md`.
 - Both runtime probes are non-recording infrastructure tests under `docs/decisions/recording.md`; `scripts/minecraft-recording-probe.py` records and validates session recording for one worker.
 - Probes without `worker` get a random development username (`PlayerNNN`, the 26.3 `--username` default); workers launched with `-Pmcbot.worker=NNNN` use the deterministic `AgentNNNN` identity (`docs/decisions/parallel-workers.md`).
-- Low-cost client settings (fast graphics, render distance 8, simulation distance 6, VSync off) are applied in observer mode and reported by `STATUS`.
+- Low-cost client settings (fast graphics, render distance 8 at the time, now 6, simulation distance 6, VSync off) are applied in observer mode and reported by `STATUS`.
 - Worker isolation is proven for two workers only; scaling, per-worker resource use, orchestration and restart handling are open (`docs/decisions/parallel-workers.md`). Recording uses the macOS `h264_videotoolbox` encoder; Linux needs another encoder.

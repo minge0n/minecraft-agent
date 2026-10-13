@@ -6,6 +6,7 @@ import java.util.Map;
 import java.util.TreeMap;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Registry;
+import net.minecraft.core.SectionPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.server.level.ServerLevel;
@@ -22,6 +23,7 @@ import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
@@ -66,6 +68,7 @@ final class DebugScene {
             case "DEBUG_KILL" -> kill(player);
             case "DEBUG_NEARBY" -> nearby(player, payload.get("radius").getAsInt());
             case "DEBUG_REGISTRY" -> registry();
+            case "DEBUG_CHUNKS" -> chunks(player);
             default -> throw new IllegalArgumentException("unknown_request");
         };
     }
@@ -434,6 +437,73 @@ final class DebugScene {
         reply.add("fluids", counts(fluids));
         reply.add("entities", entities);
         return reply;
+    }
+
+    // Chunk availability around the player, for the render-distance benchmark. The
+    // sensor reads blocks only where the server has the chunk (VisibleFieldSensor),
+    // so every chunk that a 32-block ray can reach must be loaded. Entities move and
+    // natural spawning works only in entity-ticking chunks, so every chunk inside the
+    // simulation distance must also tick. Privileged and read-only.
+    private static JsonObject chunks(ServerPlayer player) {
+        ServerLevel level = player.level();
+        Vec3 eye = player.getEyePosition();
+        int playerChunkX = SectionPos.blockToSectionCoord(eye.x);
+        int playerChunkZ = SectionPos.blockToSectionCoord(eye.z);
+        int reach = (int) Math.ceil(CameraRays.MAX_DISTANCE / 16.0) + 1;
+        int sensorChunks = 0;
+        int sensorLoaded = 0;
+        int sensorTicking = 0;
+        for (int x = playerChunkX - reach; x <= playerChunkX + reach; x++) {
+            for (int z = playerChunkZ - reach; z <= playerChunkZ + reach; z++) {
+                if (!withinBlocks(eye, x, z, CameraRays.MAX_DISTANCE)) {
+                    continue;
+                }
+                sensorChunks++;
+                if (level.hasChunk(x, z)) {
+                    sensorLoaded++;
+                }
+                if (level.areEntitiesActuallyLoadedAndTicking(new ChunkPos(x, z))) {
+                    sensorTicking++;
+                }
+            }
+        }
+        int simulation = level.getServer().getPlayerList().getSimulationDistance();
+        int simulationChunks = 0;
+        int simulationTicking = 0;
+        for (int x = playerChunkX - simulation; x <= playerChunkX + simulation; x++) {
+            for (int z = playerChunkZ - simulation; z <= playerChunkZ + simulation; z++) {
+                simulationChunks++;
+                if (level.areEntitiesActuallyLoadedAndTicking(new ChunkPos(x, z))) {
+                    simulationTicking++;
+                }
+            }
+        }
+        JsonObject reply = new JsonObject();
+        reply.addProperty("view_distance", level.getServer().getPlayerList().getViewDistance());
+        reply.addProperty("simulation_distance", simulation);
+        reply.addProperty("server_loaded_chunks", level.getChunkSource().getLoadedChunksCount());
+        reply.addProperty("sensor_range_blocks", CameraRays.MAX_DISTANCE);
+        reply.addProperty("sensor_chunks", sensorChunks);
+        reply.addProperty("sensor_chunks_loaded", sensorLoaded);
+        reply.addProperty("sensor_chunks_entity_ticking", sensorTicking);
+        reply.addProperty("simulation_chunks", simulationChunks);
+        reply.addProperty("simulation_chunks_entity_ticking", simulationTicking);
+        int entities = 0;
+        for (Entity ignored : level.getAllEntities()) {
+            entities++;
+        }
+        reply.addProperty("entities_loaded", entities);
+        return reply;
+    }
+
+    // True if some point of chunk (x, z) is within `blocks` of the eye in the
+    // horizontal plane.
+    static boolean withinBlocks(Vec3 eye, int chunkX, int chunkZ, double blocks) {
+        double nearestX = Math.clamp(eye.x, chunkX * 16.0, chunkX * 16.0 + 16.0);
+        double nearestZ = Math.clamp(eye.z, chunkZ * 16.0, chunkZ * 16.0 + 16.0);
+        double dx = eye.x - nearestX;
+        double dz = eye.z - nearestZ;
+        return dx * dx + dz * dz <= blocks * blocks;
     }
 
     private static JsonObject registry() {

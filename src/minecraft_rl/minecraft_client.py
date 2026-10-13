@@ -274,3 +274,8 @@ class PrivilegedProbe:
 
     def registry(self) -> dict[str, list[str]]:
         return self.client.request("DEBUG_REGISTRY")
+
+    def chunks(self) -> dict[str, Any]:
+        """Server chunk availability around the player: the chunks that a
+        sensor ray can reach and the chunks inside the simulation distance."""
+        return self.client.request("DEBUG_CHUNKS")

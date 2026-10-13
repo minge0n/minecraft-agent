@@ -41,7 +41,7 @@ The policy observation is built on the server from post-step state. The training
 - **Ordering barrier (both modes).** After a completed step, and after a world-mutating `DEBUG_*` command, the server sends a `ClientboundPingPacket` marker at the end of an iteration that has already broadcast the relevant changes: the stepped iteration itself for a step, the next iteration for a privileged edit. The client starts its next granted tick only once that marker is queued on its side. Without the second rule, paced mode missed privileged edits in the next client tick (0/12) while unpaced mode saw them (12/12); with it, both modes see 12/12.
 - **No sound.** In observer mode the client sets the master volume to 0 at start and before each world (`EnvironmentSettings.mute`). The policy never hears sound. `MCBOT_SOUND=on` keeps the volumes of the options file. `SCHEMA` reports `client_settings.master_volume`.
 - **Optional no-render stepping.** `MCBOT_RENDER=off` (or `render_frames=false`) skips `renderFrame` between steps in unpaced mode. Client ticks still run. This is only for non-recording infrastructure benchmarks; recorded sessions render.
-- **Low-cost client settings** (`EnvironmentSettings`, applied in observer mode and reported by `STATUS`): fast graphics preset, render distance 8, simulation distance 6, VSync off, frame limit 260, minimal particles, clouds and entity shadows off, no pause on lost focus.
+- **Low-cost client settings** (`EnvironmentSettings`, applied in observer mode and reported by `STATUS`): fast graphics preset, render distance 6 (was 8, see "Render distance"; `MCBOT_RENDER_DISTANCE` overrides it for a benchmark), simulation distance 6, VSync off, frame limit 260, minimal particles, clouds and entity shadows off, no pause on lost focus.
 
 ## Results (macOS arm64, seed 12345)
 
@@ -75,3 +75,51 @@ Measure before optimizing; no target rate is predetermined. Per-step latency is 
 ## Equivalence tests
 
 Repeatable tests start paced and accelerated runs from identical conditions (fresh world from a fixed seed and preset, the same scripted scene and player state) and replay a predetermined action sequence. They compare per tick: player position, rotation, health and inventory, the structured observation, and scripted-scene entity state. Differences must be zero or explained by characterized nondeterminism; mob AI already diverged between same-seed paced runs, so determinism characterization comes first. The v1 and v2 probes must keep passing in both modes.
+
+## Render distance
+
+Decision: render distance 6 chunks, the lowest value that keeps environment semantics. It supersedes 8.
+
+The integrated server takes its view distance from the client render distance, so this setting also decides which chunks the server keeps loaded and how far chunk-ticking reaches. It is therefore a simulation setting, not only a rendering setting. Two conditions must hold:
+
+1. Every chunk that a 32-block sensor ray can reach is loaded on the server. Otherwise `VisibleFieldSensor` returns a miss for blocks that exist.
+2. Every chunk inside the simulation distance (6) becomes entity-ticking. Otherwise mobs, items and natural spawning stop near the player, and the world changes.
+
+Method: `scripts/minecraft-render-distance-probe.py`, one fresh client process per render distance, macOS arm64, seed 12345. The privileged command `DEBUG_CHUNKS` reports the chunks within 32 blocks of the eye and the chunks inside the simulation distance, with their load and entity-ticking state. It is read-only and never part of a policy observation.
+
+- Controlled replay scene (flat world, 243 fixed steps, unpaced): the trace of every render distance is compared with that of render distance 8.
+- Walk (`normal` world, seed 12345, 420 fixed steps of sprinting with turns and jumps, unpaced, twice per process): chunk state after every step.
+- Throughput: the same walk with rendering, once without and once with recording (426 x 240, every tick), timed. CPU time and resident memory of the game process come from `ps`, its energy from `proc_pid_rusage`.
+
+| Render distance | 8 | 6 | 4 |
+|---|---|---|---|
+| Controlled replay: policy steps differing from 8 | 0 | 0 | 0 |
+| Controlled replay: unexplained trace fields | none | none | none |
+| Walk: steps with an unloaded chunk in sensor range | 0, 0 | 0, 0 | 0, 0 |
+| Walk: steps with a non-ticking chunk in sensor range | 0, 0 | 0, 0 | 0, 0 |
+| Walk: simulation chunks entity-ticking at the end | 169 / 169 | 169 / 169 | 81 / 169 |
+| Walk: mean server loaded chunks | 1,699, 1,634 | 1,466, 1,472 | 1,220, 1,218 |
+| Walk: loaded entities at the end | 303, 423 | 249, 412 | 177, 178 |
+| Steps/s, rendering, no recording | 119.0 | 191.6 | 120.8 |
+| Steps/s, rendering and recording | 118.1 | 142.4 | 116.7 |
+| Median step, recording (ms) | 8.16 | 7.50 | 8.21 |
+| Game CPU per step, recording (ms) | 34.4 | 20.9 | 25.5 |
+| Game energy per step, recording (J) | 0.117 | 0.076 | 0.072 |
+| Game resident memory (MiB) | 3,132 | 2,736 | 2,179 |
+| Recording: frames written / due, dropped | 421 / 421, 0 | 421 / 421, 0 | 421 / 421, 0 |
+| Client start to first world (s) | 32.2 | 14.1 | 14.1 |
+
+Every step advanced exactly one tick at every distance.
+
+Interpretation:
+
+- The sensor range is always loaded: 32 blocks is two chunks, and even render distance 4 keeps them.
+- At render distance 4 the view distance (4) is smaller than the simulation distance (6). Only 81 of the 169 simulation chunks (a 9 x 9 square) became entity-ticking, so fewer entities loaded (177 against 303-423). That changes the simulated world near the player, so render distance 4 is rejected even though the sensor itself was unaffected.
+- At render distance 6 all 169 simulation chunks tick, as at 8.
+- Throughput is noisy between processes: one rendering pass at distance 6 reached 191.6 steps/s. Game CPU per step and energy per step are lower at 6 and 4 than at 8 (20.9 and 25.5 against 34.4 ms; 0.076 and 0.072 against 0.117 J), and memory falls by 400 MiB at 6. The first measurement at 8 also started more slowly (32.2 against 14.1 s), probably a cold cache, so the startup times are not compared.
+- Walk ray grids are not compared between render distances: two resets of the same `normal` seed already differ from the first step in one process, because the spawn point varies. The controlled replay is the exact comparison.
+
+Limitations: one host, one run per distance, one seed. The throughput numbers come from one 420-step walk each.
+
+After the change, the observation, paced/unpaced equivalence and v1 tick-gate probes pass with render distance 6.
+
