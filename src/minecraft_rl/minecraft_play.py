@@ -49,6 +49,11 @@ from minecraft_rl.minecraft_reward import (
     Registries,
 )
 from minecraft_rl.minecraft_reward_control import episode_task
+from minecraft_rl.minecraft_reward_pitch import (
+    PITCH_FACTOR,
+    PitchOnlyAgent,
+    pitch_metrics,
+)
 from minecraft_rl.provenance import git_commit
 from minecraft_rl.recording import WorkerRecorder
 
@@ -68,11 +73,13 @@ def observation_arrays(
 
 
 class ActorPolicy:
-    def __init__(self, agent_path: Path, world_model: Path, seed: int) -> None:
+    def __init__(
+        self, agent_path: Path, world_model: Path, seed: int, pitch_only: bool = False
+    ) -> None:
         self.model, extra = load_world_model(world_model)
         self.vocabulary = CompactVocabulary.from_json(extra["vocabulary"])
         data = torch.load(agent_path, weights_only=True)
-        self.agent = Agent(self.model.features)
+        self.agent = (PitchOnlyAgent if pitch_only else Agent)(self.model.features)
         self.agent.load_state_dict(data["agent"])
         self.agent.eval()
         self.generator = torch.Generator().manual_seed(seed)
@@ -91,6 +98,27 @@ class ActorPolicy:
         self.state = self.filter.step(
             torch.tensor(choice), observation_arrays(observation, self.vocabulary)
         )
+
+
+class RandomPitchPolicy:
+    """The random baseline of the pitch diagnostic: a uniform pitch choice
+    every step, every other factor at its no-op value."""
+
+    def __init__(self, seed: int) -> None:
+        self.generator = torch.Generator().manual_seed(seed)
+
+    def reset(self, observation: PolicyObservation) -> None:
+        pass
+
+    def act(self, observation: PolicyObservation) -> tuple[Any, list[int]]:
+        choice = list(ActionSpace.NOOP)
+        choice[PITCH_FACTOR] = int(
+            torch.randint(ActionSpace.SIZES[PITCH_FACTOR], (), generator=self.generator)
+        )
+        return ActionSpace.to_player_action(choice), choice
+
+    def observe(self, choice: list[int], observation: PolicyObservation) -> None:
+        pass
 
 
 def run_episode(
@@ -113,7 +141,7 @@ def run_episode(
         writer.add_privileged("yaw", server["yaw"])
 
     record_position()
-    if isinstance(policy, ActorPolicy):
+    if isinstance(policy, (ActorPolicy, RandomPitchPolicy)):
         policy.reset(observation)
     else:
         policy.reset()
@@ -125,7 +153,7 @@ def run_episode(
     choices: Counter[str] = Counter()
     steps_alive = 0
     while writer.steps < args.max_steps and not terminated:
-        if isinstance(policy, ActorPolicy):
+        if isinstance(policy, (ActorPolicy, RandomPitchPolicy)):
             action, choice = policy.act(observation)
             for name, value in zip(ActionSpace.NAMES, choice, strict=True):
                 choices[f"{name}={value}"] += 1
@@ -146,7 +174,7 @@ def run_episode(
         )
         if not math.isfinite(step_reward.total):
             raise RuntimeError(f"non-finite reward {step_reward.components}")
-        if isinstance(policy, ActorPolicy):
+        if isinstance(policy, (ActorPolicy, RandomPitchPolicy)):
             policy.observe(choice, observation)
         writer.add(
             action.executed(),
@@ -190,8 +218,10 @@ def run_episode(
         episode_return=summary["total"],
     )
     writer.write(directory, meta)
-    control = episode_task(writer.arrays())
+    arrays = writer.arrays()
+    control = episode_task(arrays)
     stats = {
+        "pitch": pitch_metrics(arrays["obs_pitch"]),
         "control": {k: v for k, v in control.items() if k not in ("target", "rewards")},
         "episode": episode,
         "steps": writer.steps,
@@ -215,7 +245,13 @@ def main() -> None:
     parser.add_argument("--first-episode", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--world-seed", type=int, default=100_000)
-    parser.add_argument("--policy", choices=("random", "actor"), default="random")
+    parser.add_argument(
+        "--policy",
+        choices=("random", "actor", "random-pitch", "pitch-actor"),
+        default="random",
+        help="random-pitch and pitch-actor: the pitch diagnostic, only the "
+        "pitch factor is chosen (docs/stage4-pitch-control.md)",
+    )
     parser.add_argument("--policy-seed", type=int, default=5_000_000)
     parser.add_argument("--agent", type=Path)
     parser.add_argument(
@@ -286,10 +322,15 @@ def main() -> None:
             for episode in todo:
                 if time.monotonic() - started > args.time_budget:
                     break
-                if args.policy == "actor":
+                if args.policy in ("actor", "pitch-actor"):
                     policy = ActorPolicy(
-                        args.agent, args.world_model, args.policy_seed + episode
+                        args.agent,
+                        args.world_model,
+                        args.policy_seed + episode,
+                        pitch_only=args.policy == "pitch-actor",
                     )
+                elif args.policy == "random-pitch":
+                    policy = RandomPitchPolicy(args.policy_seed + episode)
                 else:
                     policy = ExplorationPolicy(
                         ExplorationConfig(), args.policy_seed + episode
@@ -315,6 +356,7 @@ def main() -> None:
                                 "return",
                                 "counts",
                                 "control",
+                                "pitch",
                             )
                         }
                     ),
