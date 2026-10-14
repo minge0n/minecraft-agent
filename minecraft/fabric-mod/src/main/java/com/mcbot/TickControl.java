@@ -382,8 +382,10 @@ final class TickControl {
     private String reset(JsonObject payload) {
         long seed;
         WorldRequest.Preset preset;
+        boolean fixedSpawn;
         try {
             seed = payload.get("seed").getAsLong();
+            fixedSpawn = payload.has("fixed_spawn") && payload.get("fixed_spawn").getAsBoolean();
             preset = WorldRequest.Preset.valueOf(payload.get("preset").getAsString().toUpperCase(Locale.ROOT));
         } catch (RuntimeException e) {
             return "v2 ERROR invalid_reset";
@@ -398,6 +400,9 @@ final class TickControl {
             IntegratedServer current = server;
             if (current != null && current != previous && Lockstep.armCount() > armedBefore) {
                 return onServerThread("v2", reply -> {
+                    if (fixedSpawn) {
+                        fixSpawn(current, firstPlayer(current));
+                    }
                     StepEvents.clear();
                     JsonObject result = observationReply(firstPlayer(current));
                     JsonObject info = result.getAsJsonObject("info");
@@ -416,6 +421,20 @@ final class TickControl {
             }
         }
         return "v2 ERROR reset_timeout";
+    }
+
+    // A deterministic start for a fixed-world experiment: vanilla places a new player
+    // at a random point within the spawn radius. This moves it to the top of the
+    // world spawn column, facing south and level, before the first observation.
+    private void fixSpawn(IntegratedServer current, ServerPlayer player) {
+        ServerLevel level = player.level();
+        BlockPos spawn = level.getRespawnData().pos();
+        BlockPos top = level.getHeightmapPos(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, spawn);
+        player.connection.teleport(top.getX() + 0.5, top.getY(), top.getZ() + 0.5, 0.0F, 0.0F);
+        player.setDeltaMovement(net.minecraft.world.phys.Vec3.ZERO);
+        player.resetFallDistance();
+        // The move reaches the client before its first granted tick.
+        requestServerMarker(current.getTickCount() + 1L);
     }
 
     private static String v2(String command, JsonObject payload) {

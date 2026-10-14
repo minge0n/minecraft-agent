@@ -233,12 +233,18 @@ class MinecraftClient:
         return self.request("RECORD_STOP")
 
     def reset(
-        self, seed: int, preset: str = "flat"
+        self, seed: int, preset: str = "flat", fixed_spawn: bool = False
     ) -> tuple[PolicyObservation, ResetInfo]:
+        """A fresh world. With `fixed_spawn` the player starts at the top of
+        the world spawn column facing south, not at a random point within the
+        spawn radius."""
         if preset not in WORLD_PRESETS:
             raise ValueError(f"unknown world preset {preset!r}")
         schema = self.schema()
-        reply = self.request("RESET", {"seed": seed, "preset": preset})
+        payload: dict[str, Any] = {"seed": seed, "preset": preset}
+        if fixed_spawn:
+            payload["fixed_spawn"] = True
+        reply = self.request("RESET", payload)
         info = reply["info"]
         return PolicyObservation.from_json(reply["observation"], schema), ResetInfo(
             seed=info["seed"],

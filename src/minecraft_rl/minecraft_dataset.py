@@ -10,7 +10,11 @@ observations and T actions, and an `episode.json` with its metadata:
   `tick_after[t]` and `client_tick[t]` come from the environment for that
   step. The video frames of the episode (`frames.jsonl`) use the same client
   tick, so a frame maps to its step.
-- No reward array exists: the environment has no task reward yet.
+- Format v1 has no reward. Format v2 adds `reward[t]` (the scalar of the
+  step of action t), `reward_components[t]` in the order of
+  `minecraft_reward.COMPONENTS`, and the privileged events in
+  `events.jsonl` (one line per step). Both formats load; a v1 episode has no
+  reward arrays.
 
 Arrays use small dtypes: categorical ids as int16 or int32, distances as
 float16 in blocks, counts as uint8. The format is versioned with
@@ -32,7 +36,8 @@ from minecraft_rl.minecraft_interface import (
     PolicyObservation,
 )
 
-DATASET_FORMAT = "minecraft-episodes-v1"
+DATASET_FORMAT = "minecraft-episodes-v2"
+READABLE_FORMATS = ("minecraft-episodes-v1", DATASET_FORMAT)
 
 ACTION_BUTTONS = (
     "forward",
@@ -90,6 +95,10 @@ class EpisodeMeta:
     last_tick: int
     observation_schema: str = OBSERVATION_SCHEMA
     format: str = DATASET_FORMAT
+    action_schema: str | None = None
+    reward_version: str | None = None
+    policy: str | None = None
+    episode_return: float | None = None
 
 
 class EpisodeWriter:
@@ -105,6 +114,9 @@ class EpisodeWriter:
         self.tick_before: list[int] = []
         self.tick_after: list[int] = []
         self.client_tick: list[int] = []
+        self.reward: list[float] = []
+        self.reward_components: list[list[float]] = []
+        self.events: list[dict[str, Any]] = []
         self._add_observation(first)
 
     def _add_observation(self, observation: PolicyObservation) -> None:
@@ -120,7 +132,14 @@ class EpisodeWriter:
         tick_before: int,
         tick_after: int,
         client_tick: int,
+        reward: float | None = None,
+        components: list[float] | None = None,
+        events: dict[str, Any] | None = None,
     ) -> None:
+        if reward is not None:
+            self.reward.append(reward)
+            self.reward_components.append(list(components or []))
+            self.events.append(events or {})
         self.buttons.append([getattr(action, name) for name in ACTION_BUTTONS])
         self.camera.append([action.yaw_delta, action.pitch_delta])
         self.hotbar.append(action.hotbar)
@@ -154,6 +173,13 @@ class EpisodeWriter:
             "tick_after": numpy.asarray(self.tick_after, dtype=numpy.int64),
             "client_tick": numpy.asarray(self.client_tick, dtype=numpy.int64),
         }
+        if self.reward:
+            if len(self.reward) != len(self.terminated):
+                raise ValueError("every step needs a reward once one step has one")
+            out["reward"] = numpy.asarray(self.reward, dtype=numpy.float32)
+            out["reward_components"] = numpy.asarray(
+                self.reward_components, dtype=numpy.float32
+            )
         return out
 
     def write(self, directory: Path, meta: EpisodeMeta) -> None:
@@ -162,6 +188,9 @@ class EpisodeWriter:
         with partial.open("wb") as file:
             numpy.savez_compressed(file, **self.arrays())
         os.replace(partial, directory / "episode.npz")
+        if self.events:
+            lines = "".join(json.dumps(e, sort_keys=True) + "\n" for e in self.events)
+            (directory / "events.jsonl").write_text(lines, encoding="utf-8")
         write_json(directory / "episode.json", asdict(meta))
 
 
@@ -193,8 +222,8 @@ def episode_directories(root: Path) -> list[Path]:
 
 def load_episode(directory: Path) -> Episode:
     raw = json.loads((directory / "episode.json").read_text(encoding="utf-8"))
-    if raw.get("format") != DATASET_FORMAT:
-        raise ValueError(f"{directory} is not a {DATASET_FORMAT} episode")
+    if raw.get("format") not in READABLE_FORMATS:
+        raise ValueError(f"{directory} is not a minecraft-episodes episode")
     names = {field.name for field in fields(EpisodeMeta)}
     meta = EpisodeMeta(**{key: value for key, value in raw.items() if key in names})
     with numpy.load(directory / "episode.npz") as data:
