@@ -5,6 +5,7 @@ from minecraft_rl.minecraft_interface import (
     RAY_KIND_BLOCK,
     RAY_KIND_ENTITY,
     RAY_KIND_NONE,
+    AbstractAction,
     ObservationSchema,
     PlayerAction,
     PolicyObservation,
@@ -185,3 +186,42 @@ def test_player_action_serializes_every_factor() -> None:
 def test_player_action_rejects_invalid_values(kwargs) -> None:
     with pytest.raises(ValueError):
         PlayerAction(**kwargs)
+
+
+def test_an_abstract_action_serializes_next_to_the_physical_factors() -> None:
+    move = PlayerAction(abstract=AbstractAction("move_item", source=3, destination=40))
+    assert move.to_json()["abstract"] == {
+        "kind": "move_item",
+        "source": 3,
+        "destination": 40,
+    }
+    craft = PlayerAction(abstract=AbstractAction("craft", item=17))
+    assert craft.to_json()["abstract"] == {"kind": "craft", "item": 17}
+    assert "abstract" not in PlayerAction(forward=True).to_json()
+
+
+def test_an_abstract_action_replaces_the_physical_part_of_its_step() -> None:
+    action = PlayerAction(
+        forward=True, attack=True, abstract=AbstractAction("craft", item=5)
+    )
+    executed = action.executed()
+    assert executed.physical() == PlayerAction().physical()
+    assert executed.abstract == action.abstract
+    plain = PlayerAction(forward=True)
+    assert plain.executed() is plain
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"kind": "smelt"},
+        {"kind": "move_item", "source": 41, "destination": 0},
+        {"kind": "move_item", "source": 0},
+        {"kind": "craft"},
+        {"kind": "craft", "item": 3, "source": 1},
+        {"kind": "none", "item": 1},
+    ],
+)
+def test_abstract_actions_reject_invalid_arguments(kwargs) -> None:
+    with pytest.raises(ValueError):
+        AbstractAction(**kwargs)

@@ -71,6 +71,8 @@ final class VisibleFieldSensor {
         schema.addProperty("air_bubbles", AIR_BUBBLES);
         schema.addProperty("durability_steps", DURABILITY_BAR_WIDTH);
         schema.addProperty("max_camera_delta_degrees", PlayerAction.MAX_CAMERA_DELTA_DEGREES);
+        schema.addProperty("action_schema", PlayerAction.SCHEMA);
+        schema.addProperty("logical_slots", AbstractAction.LOGICAL_SLOTS);
         return schema;
     }
 

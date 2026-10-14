@@ -19,6 +19,13 @@ DURABILITY_STEPS = 13
 INFINITE_EFFECT_SECONDS = -1
 KEEP_HOTBAR_SLOT = -1
 MAX_CAMERA_DELTA_DEGREES = 45.0
+# docs/decisions/actions.md. Logical slots: 0-8 hotbar, 9-35 main inventory,
+# 36-39 armor (feet, legs, chest, head), 40 offhand.
+ACTION_SCHEMA = "player-action-v3"
+LOGICAL_SLOTS = 41
+ARMOR_LOGICAL_SLOTS = (36, 37, 38, 39)
+OFFHAND_LOGICAL_SLOT = 40
+ABSTRACT_KINDS = ("none", "move_item", "craft")
 
 OBSERVATION_FIELDS = frozenset(
     {
@@ -307,6 +314,52 @@ def _numbers(values: list[Any], length: int, name: str) -> tuple[float, ...]:
 
 
 @dataclass(frozen=True)
+class AbstractAction:
+    """The abstract factor of a step: GUI mouse work only. `kind` is one of
+    `ABSTRACT_KINDS`; `move_item` uses `source` and `destination` (logical
+    slots), `craft` uses `item` (an item registry index)."""
+
+    kind: str = "none"
+    source: int = -1
+    destination: int = -1
+    item: int = -1
+
+    def __post_init__(self) -> None:
+        if self.kind not in ABSTRACT_KINDS:
+            raise ValueError(f"unknown abstract action kind {self.kind!r}")
+        for name in ("source", "destination", "item"):
+            if type(getattr(self, name)) is not int:
+                raise ValueError(f"{name} must be an integer")
+        slots = (self.source, self.destination)
+        if self.kind == "move_item":
+            if not all(0 <= slot < LOGICAL_SLOTS for slot in slots) or self.item != -1:
+                raise ValueError("move_item needs two logical slots 0..40")
+        elif self.kind == "craft":
+            if self.item < 0 or slots != (-1, -1):
+                raise ValueError("craft needs an item index")
+        elif (self.source, self.destination, self.item) != (-1, -1, -1):
+            raise ValueError("the none action takes no arguments")
+
+    @property
+    def is_none(self) -> bool:
+        return self.kind == "none"
+
+    def to_json(self) -> dict[str, Any]:
+        if self.kind == "move_item":
+            return {
+                "kind": self.kind,
+                "source": self.source,
+                "destination": self.destination,
+            }
+        if self.kind == "craft":
+            return {"kind": self.kind, "item": self.item}
+        return {"kind": self.kind}
+
+
+NO_ABSTRACT_ACTION = AbstractAction()
+
+
+@dataclass(frozen=True)
 class PlayerAction:
     forward: bool = False
     back: bool = False
@@ -320,9 +373,14 @@ class PlayerAction:
     yaw_delta: float = 0.0
     pitch_delta: float = 0.0
     hotbar: int = KEEP_HOTBAR_SLOT
+    abstract: AbstractAction = NO_ABSTRACT_ACTION
 
     def __post_init__(self) -> None:
+        if not isinstance(self.abstract, AbstractAction):
+            raise ValueError("abstract must be an AbstractAction")
         for name, value in asdict(self).items():
+            if name == "abstract":
+                continue
             if name in ("yaw_delta", "pitch_delta"):
                 if type(value) not in (int, float) or not math.isfinite(value):
                     raise ValueError(f"{name} must be a finite number")
@@ -339,5 +397,19 @@ class PlayerAction:
             elif type(value) is not bool:
                 raise ValueError(f"{name} must be a boolean")
 
-    def to_json(self) -> dict[str, bool | float | int]:
-        return asdict(self)
+    def physical(self) -> dict[str, bool | float | int]:
+        """The physical factors, without the abstract factor."""
+        return {
+            name: value for name, value in asdict(self).items() if name != "abstract"
+        }
+
+    def executed(self) -> "PlayerAction":
+        """The physical action that the environment runs: the no-op when an
+        abstract action replaces the physical part of the step."""
+        return self if self.abstract.is_none else PlayerAction(abstract=self.abstract)
+
+    def to_json(self) -> dict[str, Any]:
+        out: dict[str, Any] = self.physical()
+        if not self.abstract.is_none:
+            out["abstract"] = self.abstract.to_json()
+        return out

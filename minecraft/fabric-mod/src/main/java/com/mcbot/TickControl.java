@@ -23,6 +23,7 @@ import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.server.IntegratedServer;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.protocol.common.ClientboundPingPacket;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -41,7 +42,8 @@ final class TickControl {
     private static final long REQUEST_TIMEOUT_SECONDS = 5;
     private static final long RESET_TIMEOUT_MILLIS = 180_000;
 
-    private record PendingStep(CompletableFuture<String> reply, Function<TickGate.StepOutcome, String> finish) {}
+    private record PendingStep(
+            CompletableFuture<String> reply, Function<TickGate.StepOutcome, String> finish, AbstractAction abstractAction) {}
 
     private final TickGate gate = new TickGate();
     private volatile IntegratedServer server;
@@ -84,6 +86,9 @@ final class TickControl {
             if (pendingStep != null && Lockstep.serverStepGranted()) {
                 gate.observeTickEnd(ticked.overworld().getGameTime(), Lockstep.clientTicks()).ifPresent(outcome -> {
                     Lockstep.setServerStepGranted(false);
+                    if (!pendingStep.abstractAction().isNone() && outcome instanceof TickGate.Step) {
+                        StepEvents.abstractAction(AbstractActions.run(firstPlayer(server), pendingStep.abstractAction()));
+                    }
                     requestServerMarker(ticked.getTickCount());
                     PendingStep finished = pendingStep;
                     pendingStep = null;
@@ -260,8 +265,8 @@ final class TickControl {
         long gameTime = current.overworld().getGameTime();
         switch (request) {
             case "v1 STATUS" -> reply.complete(TickGate.encode(status(current)));
-            case "v1 STEP NOOP" -> requestStep(current, PlayerAction.NOOP, reply, TickGate::encode);
-            case "v1 STEP FORWARD" -> requestStep(current, PlayerAction.FORWARD, reply, TickGate::encode);
+            case "v1 STEP NOOP" -> requestStep(current, PlayerAction.NOOP, AbstractAction.NONE, reply, TickGate::encode);
+            case "v1 STEP FORWARD" -> requestStep(current, PlayerAction.FORWARD, AbstractAction.NONE, reply, TickGate::encode);
             case "v1 DEBUG_SPAWN" -> reply.complete(spawnProbeEntities(current));
             case "v1 DEBUG_PROBE" -> reply.complete(probeEntities(current));
             case "v1 DEBUG_PLAYER" -> reply.complete(probePlayer(current, gameTime));
@@ -287,8 +292,16 @@ final class TickControl {
             case "STEP" -> {
                 long receivedNanos = requestReceivedNanos;
                 long acceptedNanos = System.nanoTime();
+                AbstractAction abstractAction = AbstractAction.fromJson(
+                        payload.remove("abstract"), BuiltInRegistries.ITEM.size());
+                // An abstract action replaces the physical part of its step by the no-op
+                // (docs/decisions/actions.md): the player stands still while it acts.
                 PlayerAction action = PlayerAction.fromJson(payload);
-                requestStep(current, action, reply, outcome -> finishV2Step(current, outcome, receivedNanos, acceptedNanos));
+                if (!abstractAction.isNone()) {
+                    action = PlayerAction.NOOP;
+                }
+                requestStep(current, action, abstractAction, reply,
+                        outcome -> finishV2Step(current, outcome, receivedNanos, acceptedNanos));
             }
             default -> {
                 if (!command.startsWith("DEBUG_")) {
@@ -352,7 +365,8 @@ final class TickControl {
         info.add("timing", timing);
         return "v2 STEP {\"observation\":" + encodedObservation
                 + ",\"terminated\":" + player.isDeadOrDying()
-                + ",\"info\":" + info + "}";
+                + ",\"info\":" + info
+                + ",\"events\":" + StepEvents.drain() + "}";
     }
 
     private static JsonObject observationReply(ServerPlayer player) {
@@ -384,6 +398,7 @@ final class TickControl {
             IntegratedServer current = server;
             if (current != null && current != previous && Lockstep.armCount() > armedBefore) {
                 return onServerThread("v2", reply -> {
+                    StepEvents.clear();
                     JsonObject result = observationReply(firstPlayer(current));
                     JsonObject info = result.getAsJsonObject("info");
                     info.addProperty("seed", seed);
@@ -452,6 +467,7 @@ final class TickControl {
     private void requestStep(
             IntegratedServer current,
             PlayerAction action,
+            AbstractAction abstractAction,
             CompletableFuture<String> reply,
             Function<TickGate.StepOutcome, String> finish) {
         var rejected = gate.requestStep(
@@ -461,7 +477,7 @@ final class TickControl {
             reply.complete(finish.apply(rejected.get()));
             return;
         }
-        pendingStep = new PendingStep(reply, finish);
+        pendingStep = new PendingStep(reply, finish, abstractAction);
         Lockstep.grantClientTick(action);
     }
 

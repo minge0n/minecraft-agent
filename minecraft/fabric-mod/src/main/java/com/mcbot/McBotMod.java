@@ -15,6 +15,7 @@ public class McBotMod implements ModInitializer {
     @Override
     public void onInitialize() {
         LOGGER.info("mcbot initialized; no policy bridge is active");
+        StepEvents.register();
         if (!"1".equals(System.getenv("MCBOT_TICK_TRACE"))) {
             return;
         }

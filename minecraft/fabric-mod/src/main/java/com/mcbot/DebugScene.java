@@ -102,9 +102,24 @@ final class DebugScene {
             }
             case "replay" -> buildReplay(player, level, origin, scene, ai, flag(payload, "controlled"));
             case "self_state" -> buildSelfState(player, scene);
+            case "crafting" -> buildCrafting(player, level, origin, scene);
             default -> throw new IllegalArgumentException("unknown_scene");
         }
         return scene;
+    }
+
+    // Abstract action probe: logs, cobblestone, a helmet and dirt in known slots, and a
+    // crafting table two blocks ahead at eye level, so the player looks at it.
+    private static void buildCrafting(ServerPlayer player, ServerLevel level, BlockPos origin, JsonObject scene) {
+        Inventory inventory = player.getInventory();
+        inventory.setItem(0, new ItemStack(Items.OAK_LOG, 4));
+        inventory.setItem(1, new ItemStack(Items.COBBLESTONE, 8));
+        inventory.setItem(2, new ItemStack(Items.IRON_HELMET));
+        inventory.setItem(9, new ItemStack(Items.DIRT, 40));
+        inventory.setItem(10, new ItemStack(Items.DIRT, 50));
+        BlockPos table = origin.offset(0, 1, 2);
+        level.setBlock(table, Blocks.CRAFTING_TABLE.defaultBlockState(), Block.UPDATE_ALL);
+        scene.add("crafting_table", position(table));
     }
 
     private static boolean flag(JsonObject payload, String name) {

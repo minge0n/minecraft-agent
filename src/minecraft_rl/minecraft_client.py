@@ -81,10 +81,33 @@ class StepInfo:
 
 
 @dataclass(frozen=True)
+class StepEvents:
+    """Privileged events of one step, for the reward and diagnostics only; never
+    a policy input. `blocks_broken` holds block registry indices in break order,
+    `advancements` the ids of completed advancements that have a display, and
+    `abstract` the outcome of the step's abstract action, if any."""
+
+    blocks_broken: tuple[int, ...] = ()
+    advancements: tuple[str, ...] = ()
+    abstract: dict[str, Any] | None = None
+
+    @classmethod
+    def from_json(cls, payload: dict[str, Any] | None) -> "StepEvents":
+        if not payload:
+            return cls()
+        return cls(
+            tuple(payload.get("blocks_broken", ())),
+            tuple(payload.get("advancements", ())),
+            payload.get("abstract"),
+        )
+
+
+@dataclass(frozen=True)
 class StepResult:
     observation: PolicyObservation
     terminated: bool
     info: StepInfo
+    events: StepEvents = StepEvents()
 
 
 @dataclass(frozen=True)
@@ -170,6 +193,7 @@ class MinecraftClient:
                 pacing=info["pacing"],
                 timing=StepTiming(**info["timing"], round_trip_ms=round_trip_ms),
             ),
+            events=StepEvents.from_json(reply.get("events")),
         )
 
     def set_pacing(self, mode: str, render_frames: bool = True) -> dict[str, Any]:

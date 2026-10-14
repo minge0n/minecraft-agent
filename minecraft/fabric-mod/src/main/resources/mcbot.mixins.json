@@ -5,6 +5,7 @@
   "mixins": [
     "MinecraftServerMixin",
     "PacketProcessorMixin",
+    "PlayerAdvancementsMixin",
     "ServerGamePacketListenerImplMixin",
     "TickRateManagerMixin"
   ],

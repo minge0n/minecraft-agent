@@ -18,6 +18,8 @@ public record PlayerAction(
         float yawDelta,
         float pitchDelta,
         int hotbar) {
+    // The physical factors; the optional abstract factor is AbstractAction.
+    public static final String SCHEMA = "player-action-v3";
     public static final float MAX_CAMERA_DELTA_DEGREES = 45.0F;
     public static final int KEEP_HOTBAR_SLOT = -1;
     public static final int HOTBAR_SLOTS = 9;
