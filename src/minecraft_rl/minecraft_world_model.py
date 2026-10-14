@@ -949,11 +949,14 @@ class MinecraftRSSM(nn.Module):
         actions: torch.Tensor,
         generator: torch.Generator | None,
         straight_through: bool = False,
+        initial_h: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Posterior states for encoded observations (batch, L + 1, E) and
-        actions (batch, L, 21): h, z, prior and posterior logits."""
+        actions (batch, L, 21): h, z, prior and posterior logits.
+        `initial_h` is h of the first observation; the default 0 is the state
+        at the start of an episode."""
         batch, length = embedded.shape[:2]
-        h = torch.zeros(batch, self.hidden)
+        h = torch.zeros(batch, self.hidden) if initial_h is None else initial_h
         hs, zs, priors, posteriors = [], [], [], []
         for k in range(length):
             if k > 0:
@@ -1005,10 +1008,17 @@ class MinecraftRSSM(nn.Module):
         continues: torch.Tensor,
         generator: torch.Generator | None,
         objective: Objective = SUM_OBJECTIVE,
+        embedded: torch.Tensor | None = None,
+        initial_h: torch.Tensor | None = None,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         """As `losses`, and also the decoder input s = [h, z], for gradient
-        diagnostics."""
-        filtered = self.filter(o, actions, generator, straight_through=True)
+        diagnostics. `embedded` replaces encoder(o) when the caller already
+        has it; `initial_h` is as in `filter_embedded`."""
+        if embedded is None:
+            embedded = self.encoder(o)
+        filtered = self.filter_embedded(
+            embedded, actions, generator, straight_through=True, initial_h=initial_h
+        )
         s = torch.cat([filtered["h"], filtered["z"]], -1)
         out = objective_terms(
             self.decoder(s),
