@@ -117,6 +117,9 @@ class EpisodeWriter:
         self.reward: list[float] = []
         self.reward_components: list[list[float]] = []
         self.events: list[dict[str, Any]] = []
+        # Privileged per-observation values for reward calculation and
+        # evaluation only (`privileged_*` arrays, never model input).
+        self.privileged: dict[str, list] = {}
         self._add_observation(first)
 
     def _add_observation(self, observation: PolicyObservation) -> None:
@@ -150,6 +153,10 @@ class EpisodeWriter:
         self.client_tick.append(client_tick)
         self._add_observation(observation)
 
+    def add_privileged(self, name: str, value: Any) -> None:
+        """One value per observation, the first one included."""
+        self.privileged.setdefault(name, []).append(value)
+
     @property
     def steps(self) -> int:
         return len(self.terminated)
@@ -180,6 +187,10 @@ class EpisodeWriter:
             out["reward_components"] = numpy.asarray(
                 self.reward_components, dtype=numpy.float32
             )
+        for name, values in self.privileged.items():
+            if len(values) != self.steps + 1:
+                raise ValueError(f"privileged {name} needs one value per observation")
+            out[f"privileged_{name}"] = numpy.asarray(values, dtype=numpy.float64)
         return out
 
     def write(self, directory: Path, meta: EpisodeMeta) -> None:

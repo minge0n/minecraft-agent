@@ -48,6 +48,7 @@ from minecraft_rl.minecraft_reward import (
     EpisodeReward,
     Registries,
 )
+from minecraft_rl.minecraft_reward_control import episode_task
 from minecraft_rl.provenance import git_commit
 from minecraft_rl.recording import WorkerRecorder
 
@@ -104,6 +105,14 @@ def run_episode(
     reward = EpisodeReward(REWARD_V1, registries)
     reward.reset(observation)
     writer = EpisodeWriter(observation)
+    probe = client.privileged()
+
+    def record_position() -> None:
+        server = probe.player()["server"]
+        writer.add_privileged("position", [server["x"], server["z"]])
+        writer.add_privileged("yaw", server["yaw"])
+
+    record_position()
     if isinstance(policy, ActorPolicy):
         policy.reset(observation)
     else:
@@ -151,6 +160,7 @@ def run_episode(
             components=[step_reward.components[name] for name in COMPONENTS],
             events=step_reward.events,
         )
+        record_position()
         steps_alive += 1
     wall = time.perf_counter() - started
     video = None
@@ -180,7 +190,9 @@ def run_episode(
         episode_return=summary["total"],
     )
     writer.write(directory, meta)
+    control = episode_task(writer.arrays())
     stats = {
+        "control": {k: v for k, v in control.items() if k not in ("target", "rewards")},
         "episode": episode,
         "steps": writer.steps,
         "died": terminated,
@@ -296,7 +308,14 @@ def main() -> None:
                     json.dumps(
                         {
                             k: stats[k]
-                            for k in ("episode", "steps", "died", "return", "counts")
+                            for k in (
+                                "episode",
+                                "steps",
+                                "died",
+                                "return",
+                                "counts",
+                                "control",
+                            )
                         }
                     ),
                     flush=True,
