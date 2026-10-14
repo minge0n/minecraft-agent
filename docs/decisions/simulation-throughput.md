@@ -146,3 +146,9 @@ The background policy cuts the game power by a factor of about 7 and the energy 
 
 Negative finding: chunk generation then falls behind lockstep. In the first walk after a reset, no chunk inside the simulation distance was entity-ticking at the end and 320 of 420 steps had an unloaded chunk in sensor range; the second walk had 17 steps with a non-ticking chunk in sensor range. With default priority no step had an unloaded or non-ticking sensor chunk. Chunks keep loading while the world is frozen (a separate check: 9 to 169 ticking chunks in 10 s of idle time after a reset on the efficiency cores). The background policy is therefore not a training default until a reset waits for its chunks and a new measurement shows that sensor-range chunks stay ready during movement.
 
+### Chunk gate for the background policy
+
+`src/minecraft_rl/chunk_gate.py` and `minecraft_play --background-game` (macOS) address the negative finding above. The game runs with the background policy. Before the first observation of an episode and before every step, a privileged `DEBUG_CHUNKS` query checks that every sensor-range chunk is loaded and entity-ticking and every simulation chunk is entity-ticking. If not, the gate waits while the world is frozen (no tick runs, chunk loading continues); after 0.5 s it moves the game to default priority until the chunks are ready, then back. The policy never sees the query, and a step only runs once its chunks are ready, so the gate never changes what a step does.
+
+Measured once, on the Stage 4 actor-retry evaluation (`docs/stage4-reward-actor-data.md`, 4 episodes, 4,000 steps, recording on): 73 waits in 4,004 checks, 42 s waiting, longest 6.4 s, 11 boosts for 22 s; game energy 153 J (0.038 J per step, 0.1 J on the performance cores) in 195 s (20.5 steps per second). Not yet compared with a default-priority run of the same episodes, and not yet a training default.
+

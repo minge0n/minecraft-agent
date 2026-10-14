@@ -24,7 +24,8 @@ from typing import Any
 import numpy
 import torch
 
-from minecraft_rl import macos_qos, runtime
+from minecraft_rl import macos_energy, macos_qos, runtime
+from minecraft_rl.chunk_gate import ChunkGate, listening_pid, set_background
 from minecraft_rl.exploration import ExplorationConfig, ExplorationPolicy
 from minecraft_rl.minecraft_actor import (
     ActionSpace,
@@ -92,9 +93,14 @@ class ActorPolicy:
 
 
 def run_episode(
-    client, args, episode: int, policy, recorder, registries, directory: Path
+    client, args, episode: int, policy, recorder, registries, directory: Path, gate
 ) -> dict:
     observation, reset = client.reset(args.world_seed, "normal", fixed_spawn=True)
+    if gate is not None:
+        # The world is frozen after RESET, so no tick passes while the gate
+        # waits. Read the first observation again once the chunks are ready.
+        gate.wait()
+        observation = client.observe()
     reward = EpisodeReward(REWARD_V1, registries)
     reward.reset(observation)
     writer = EpisodeWriter(observation)
@@ -116,6 +122,8 @@ def run_episode(
                 choices[f"{name}={value}"] += 1
         else:
             action = policy.act(pitch=observation.pitch)
+        if gate is not None:
+            gate.wait()
         result = client.step(action)
         if result.info.tick_after != result.info.tick_before + 1:
             raise RuntimeError("a step did not advance exactly one tick")
@@ -206,6 +214,11 @@ def main() -> None:
     parser.add_argument("--no-video", action="store_true")
     parser.add_argument("--time-budget", type=float, default=480.0)
     parser.add_argument("--port", type=int, default=47140)
+    parser.add_argument(
+        "--background-game",
+        action="store_true",
+        help="macOS: run the game on the efficiency cores behind a chunk gate",
+    )
     args = parser.parse_args()
     macos_qos.run_in_background()
     runtime.configure(0)
@@ -238,6 +251,12 @@ def main() -> None:
         write_json(args.dataset / "schema.json", client.request("SCHEMA"))
         registries = Registries.from_json(client.privileged().registry())
         client.set_pacing("unpaced", render_frames=True)
+        pid = listening_pid(args.port)
+        gate = None
+        if args.background_game and pid is not None:
+            set_background(pid, True)
+            gate = ChunkGate(client.privileged(), pid)
+        energy_before = macos_energy.read(pid) if pid else None
         recorder = None
         if not args.no_video:
             recorder = WorkerRecorder(
@@ -271,6 +290,7 @@ def main() -> None:
                     recorder,
                     registries,
                     root / f"{episode:06d}",
+                    gate,
                 )
                 print(
                     json.dumps(
@@ -284,6 +304,20 @@ def main() -> None:
         finally:
             if recorder is not None:
                 recorder.close()
+            energy_after = macos_energy.read(pid) if pid else None
+            usage = {
+                "background_game": gate is not None,
+                "gate": gate.summary() if gate is not None else None,
+                "wall_seconds": time.monotonic() - started,
+            }
+            if energy_before is not None and energy_after is not None:
+                spent = energy_after - energy_before
+                usage["game_energy_joules"] = spent.energy_joules
+                usage["game_performance_core_joules"] = (
+                    spent.performance_core_energy_joules
+                )
+            write_json(args.dataset / "logs" / f"{args.split}-usage.json", usage)
+            print(json.dumps(usage), flush=True)
 
 
 if __name__ == "__main__":

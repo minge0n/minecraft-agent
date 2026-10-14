@@ -17,11 +17,13 @@ from minecraft_rl.minecraft_reward_model import (
     RecurrentTrainer,
     RewardTraining,
     average_precision,
+    behavior_labels,
     chronological_states,
     episode_data,
     event_labels,
     filter_episode,
     history_labels,
+    latent_ambiguity,
     probe_auc,
     report_on,
     reward_report,
@@ -212,3 +214,34 @@ def test_a_probe_separates_a_linear_signal_and_not_noise():
     assert probe_auc(x[:200], y[:200], x[200:], y[200:]) > 0.95
     noise = torch.rand(400, generator=generator) > 0.7
     assert abs(probe_auc(x[:200], noise[:200], x[200:], noise[200:]) - 0.5) < 0.15
+
+
+def test_behavior_labels_mark_spinning_and_button_spam():
+    episode = synthetic_episode(4, seed=0)
+    buttons = numpy.zeros((4, 9), dtype=bool)
+    buttons[1, 4] = True  # jump
+    buttons[2, 8] = True  # use
+    camera = numpy.zeros((4, 2), dtype=numpy.float32)
+    camera[0, 0] = -30.0
+    camera[3, 0] = 3.0
+    episode.arrays["action_buttons"], episode.arrays["action_camera"] = buttons, camera
+    labels = behavior_labels(episode)
+    assert labels["camera_spin"].tolist() == [True, False, False, False]
+    assert labels["jump_or_use"].tolist() == [False, True, True, False]
+    assert labels["neither"].tolist() == [False, False, False, True]
+
+
+def test_latent_ambiguity_is_small_when_a_zero_state_is_close():
+    rewards = torch.tensor([0.0, 0.01, 0.0])
+    labels = {"positive": rewards > 0}
+
+    class Data:
+        def __init__(self, r):
+            self.rewards, self.labels, self.steps = r, labels, 3
+
+    near = torch.tensor([[0.0], [0.0], [1.0], [2.0]])
+    other = torch.tensor([[0.0], [9.0], [1.0], [8.0]])
+    out = latent_ambiguity([near, other], [Data(rewards), Data(torch.zeros(3))])
+    assert out["positive_after_step_0"] == 1
+    # Nearest zero state of the other episode: 1.0 at distance 0; one step is 1.
+    assert out["nearest_zero_state_ratio_median"] == 0.0

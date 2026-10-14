@@ -43,6 +43,7 @@ from minecraft_rl.minecraft_reward_model import (
     chronological_states,
     episode_data,
     history_labels,
+    latent_ambiguity,
     probe_auc,
     report_on,
     train_frozen_head,
@@ -181,6 +182,7 @@ def main() -> None:
     parser.add_argument("--recurrent-updates", type=int, default=1000)
     parser.add_argument("--core-learning-rate", type=float, default=1e-4)
     parser.add_argument("--refresh-every", type=int, default=100)
+    parser.add_argument("--actor-held-out", default="3")
     parser.add_argument(
         "--stages", default="alignment,tiny,frozen,recurrent,world_model"
     )
@@ -363,6 +365,60 @@ def main() -> None:
                 }
             ),
         )
+
+    path = args.output / "actor_data.json"
+    if "actor_data" in stages and not path.exists():
+        # Whole actor episodes, split before any training: one episode of each
+        # actor policy is held out (--actor-held-out), the rest train.
+        held = int(args.actor_held_out)
+        actor_train, actor_test = [], []
+        for name in EXPLOIT:
+            for e in load_episodes(args.exploit_root / name / "train"):
+                (actor_test if e.meta.episode == held else actor_train).append(e)
+        a_train = episode_data(model, actor_train, compact)
+        evaluation_sets = {
+            "random_held_out": sets["held_out"],
+            "actor_held_out": episode_data(model, actor_test, compact),
+        }
+        model.eval()
+        mixed = train + a_train
+        states = chronological_states(model, mixed, seed=7)
+        head, history = train_frozen_head(
+            states, mixed, model.features, config, args.frozen_updates, args.seed
+        )
+        torch.save(
+            {"reward_head": head.state_dict(), "scale": head.scale},
+            args.output / "actor_data_head.pt",
+        )
+        heads = {
+            "first_actor_head": load_head(OLD_HEAD, model.features),
+            "A_random_only": load_head(args.output / "frozen_head.pt", model.features),
+            "B_random_and_actor": head,
+        }
+        out = {
+            "split": {
+                "random_train_episodes": len(train),
+                "actor_train_episodes": len(a_train),
+                "actor_train_positive_steps": int(
+                    sum(int(d.labels["positive"].sum()) for d in a_train)
+                ),
+                "random_held_out_episodes": len(sets["held_out"]),
+                "actor_held_out_episodes": len(actor_test),
+                "actor_held_out": [f"{name}/{held}" for name in EXPLOIT],
+            },
+            "updates": args.frozen_updates,
+            "history": history,
+            "reports": {
+                name: evaluate_head(model, h, evaluation_sets)
+                for name, h in heads.items()
+            },
+            "latent_ambiguity": {
+                name: latent_ambiguity(chronological_states(model, data, seed=7), data)
+                for name, data in evaluation_sets.items()
+            },
+        }
+        write(path, out)
+        print("actor_data", json.dumps(out["split"]))
 
     path = args.output / "history_probe.json"
     if "history_probe" in stages and not path.exists():

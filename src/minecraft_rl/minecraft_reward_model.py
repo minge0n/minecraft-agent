@@ -29,7 +29,7 @@ import numpy
 import torch
 
 from minecraft_rl.minecraft_actor import RewardHead
-from minecraft_rl.minecraft_dataset import Episode
+from minecraft_rl.minecraft_dataset import ACTION_BUTTONS, Episode
 from minecraft_rl.minecraft_interface import RAY_KIND_BLOCK
 from minecraft_rl.minecraft_replay import CompactVocabulary, compact_arrays
 from minecraft_rl.minecraft_reward import COMPONENTS
@@ -54,6 +54,7 @@ EVENT_TYPES = (
     "zero_repeat_view",
     "zero_other",
 )
+BEHAVIORS = ("camera_spin", "jump_or_use", "neither")
 
 
 @dataclass
@@ -122,7 +123,10 @@ def episode_data(
             torch.as_tensor(a["action_camera"]),
             torch.as_tensor(a["action_hotbar"]),
         )
-        labels = {k: torch.as_tensor(v) for k, v in event_labels(episode).items()}
+        labels = {
+            k: torch.as_tensor(v)
+            for k, v in (event_labels(episode) | behavior_labels(episode)).items()
+        }
         out.append(
             EpisodeData(
                 episode=episode.meta.episode,
@@ -229,6 +233,21 @@ def reward_report(
             "predicted_mean": float(predicted[mask].mean()) if count else None,
             "actual_mean": float(target[mask].mean()) if count else None,
             "called_at_0.005": float((predicted[mask] >= THRESHOLDS[0]).float().mean())
+            if count
+            else None,
+        }
+    out["by_behavior"] = {}
+    for name in BEHAVIORS:
+        if name not in labels:
+            continue
+        mask = labels[name] & zero
+        count = int(mask.sum())
+        out["by_behavior"][name] = {
+            "zero_reward_steps": count,
+            "predicted_mean": float(predicted[mask].mean()) if count else None,
+            "false_positive_rate_at_0.005": float(
+                (predicted[mask] >= THRESHOLDS[0]).float().mean()
+            )
             if count
             else None,
         }
@@ -505,3 +524,52 @@ def probe_auc(
         score = probe(b).squeeze(-1)
     positive, negative = score[test_y], score[~test_y]
     return float((positive.unsqueeze(1) > negative.unsqueeze(0)).float().mean())
+
+
+def behavior_labels(episode: Episode) -> dict[str, numpy.ndarray]:
+    """Bool masks per transition for the exploit behaviors of the first actor:
+    a fast camera turn (at least 10 degrees of yaw), jump or use held, and
+    neither. Evaluation only."""
+    buttons = episode.arrays["action_buttons"]
+    yaw = numpy.abs(episode.arrays["action_camera"][:, 0])
+    spin = yaw >= 10.0
+    spam = (
+        buttons[:, ACTION_BUTTONS.index("jump")]
+        | buttons[:, ACTION_BUTTONS.index("use")]
+    )
+    return {"camera_spin": spin, "jump_or_use": spam, "neither": ~spin & ~spam}
+
+
+def latent_ambiguity(
+    states: list[torch.Tensor], data: list[EpisodeData]
+) -> dict[str, Any]:
+    """For each rewarded step after step 0, the distance from its state
+    s_{t+1} to the nearest zero-reward state of another episode, against the
+    typical distance between two consecutive states. A ratio near or below 1
+    means a zero-reward history gives almost the same state."""
+    rows, rewards, episode_of = [], [], []
+    for e, (s, d) in enumerate(zip(states, data, strict=True)):
+        rows.append(s[1:])
+        rewards.append(d.rewards)
+        episode_of.append(torch.full((d.steps,), e))
+    s, r, owner = torch.cat(rows), torch.cat(rewards), torch.cat(episode_of)
+    step = torch.cat([(x[2:] - x[1:-1]).norm(dim=-1) for x in states]).median()
+    first = torch.cat([torch.arange(d.steps) == 0 for d in data])
+    targets = torch.nonzero((r > 0) & ~first).flatten()
+    ratios = []
+    for i in targets.tolist():
+        candidates = (r == 0) & (owner != owner[i])
+        distance = (s[candidates] - s[i]).norm(dim=-1).min()
+        ratios.append(float(distance / step))
+    ratios_t = torch.tensor(ratios)
+    return {
+        "positive_after_step_0": len(ratios),
+        "median_consecutive_state_distance": float(step),
+        "nearest_zero_state_ratio_median": float(ratios_t.median()) if ratios else None,
+        "share_with_ratio_at_most_1": float((ratios_t <= 1.0).float().mean())
+        if ratios
+        else None,
+        "share_with_ratio_at_most_2": float((ratios_t <= 2.0).float().mean())
+        if ratios
+        else None,
+    }
