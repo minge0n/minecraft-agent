@@ -62,38 +62,42 @@ def pitch_metrics(pitch: numpy.ndarray, task: PitchTask = PITCH_V1) -> dict:
 PITCH_FACTOR = ActionSpace.NAMES.index("pitch")
 
 
-class PitchOnlyAgent(Agent):
-    """The existing actor and critic, with every factor except pitch fixed at
-    its no-op choice. The pitch head is the only head that learns; the others
-    get no gradient because their choice is fixed and their log probability
-    and entropy are left out."""
+class RestrictedAgent(Agent):
+    """The existing actor and critic, choosing only the factors in `FREE`;
+    every other factor stays at its no-op choice. Only the free heads learn:
+    the fixed factors leave out their log probability and entropy."""
+
+    FREE: tuple[int, ...] = (PITCH_FACTOR,)
 
     def act(self, s, generator, greedy: bool = False):
-        logits = self.logits(s)[PITCH_FACTOR]
-        if greedy:
-            pitch = logits.argmax(-1)
-        else:
-            p = torch.softmax(logits, -1).reshape(-1, logits.shape[-1])
-            pitch = torch.multinomial(p, 1, generator=generator).reshape(
-                logits.shape[:-1]
-            )
-        noop = torch.as_tensor(ActionSpace.NOOP).expand(
-            *pitch.shape, len(ActionSpace.NOOP)
-        )
-        choices = noop.clone()
-        choices[..., PITCH_FACTOR] = pitch
+        logits = self.logits(s)
+        lead = s.shape[:-1]
+        choices = torch.as_tensor(ActionSpace.NOOP).expand(*lead, len(ActionSpace.NOOP))
+        choices = choices.clone()
+        for k in self.FREE:
+            if greedy:
+                choice = logits[k].argmax(-1)
+            else:
+                p = torch.softmax(logits[k], -1).reshape(-1, logits[k].shape[-1])
+                choice = torch.multinomial(p, 1, generator=generator).reshape(lead)
+            choices[..., k] = choice
         return choices
 
     def log_prob_entropy(self, s, choices):
-        logits = self.logits(s)[PITCH_FACTOR]
-        log_p = torch.log_softmax(logits, -1)
-        log_prob = log_p.gather(
-            -1, choices[..., PITCH_FACTOR : PITCH_FACTOR + 1]
-        ).squeeze(-1)
-        entropy = -(log_p.exp() * log_p).sum(-1)
-        zero = torch.zeros_like(entropy)
-        per_factor = [
-            entropy if k == PITCH_FACTOR else zero
-            for k in range(len(ActionSpace.SIZES))
-        ]
+        logits = self.logits(s)
+        log_prob = torch.zeros(s.shape[:-1])
+        entropy = torch.zeros(s.shape[:-1])
+        per_factor = [torch.zeros(s.shape[:-1]) for _ in ActionSpace.SIZES]
+        for k in self.FREE:
+            log_p = torch.log_softmax(logits[k], -1)
+            log_prob = log_prob + log_p.gather(-1, choices[..., k : k + 1]).squeeze(-1)
+            h = -(log_p.exp() * log_p).sum(-1)
+            entropy = entropy + h
+            per_factor[k] = h
         return log_prob, entropy, per_factor
+
+
+class PitchOnlyAgent(RestrictedAgent):
+    """The pitch diagnostic: only the pitch factor is free."""
+
+    FREE = (PITCH_FACTOR,)

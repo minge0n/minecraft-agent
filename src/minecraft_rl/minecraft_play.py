@@ -34,6 +34,7 @@ from minecraft_rl.minecraft_actor import (
     load_world_model,
 )
 from minecraft_rl.minecraft_dataset import (
+    ACTION_BUTTONS,
     OBSERVATION_DTYPES,
     EpisodeMeta,
     EpisodeWriter,
@@ -47,6 +48,12 @@ from minecraft_rl.minecraft_reward import (
     REWARD_V1,
     EpisodeReward,
     Registries,
+)
+from minecraft_rl.minecraft_reward_break import (
+    ATTACK_FACTOR,
+    BREAKS_KEY,
+    BreakAgent,
+    break_metrics,
 )
 from minecraft_rl.minecraft_reward_control import episode_task
 from minecraft_rl.minecraft_reward_pitch import (
@@ -74,12 +81,12 @@ def observation_arrays(
 
 class ActorPolicy:
     def __init__(
-        self, agent_path: Path, world_model: Path, seed: int, pitch_only: bool = False
+        self, agent_path: Path, world_model: Path, seed: int, agent_class=Agent
     ) -> None:
         self.model, extra = load_world_model(world_model)
         self.vocabulary = CompactVocabulary.from_json(extra["vocabulary"])
         data = torch.load(agent_path, weights_only=True)
-        self.agent = (PitchOnlyAgent if pitch_only else Agent)(self.model.features)
+        self.agent = agent_class(self.model.features)
         self.agent.load_state_dict(data["agent"])
         self.agent.eval()
         self.generator = torch.Generator().manual_seed(seed)
@@ -121,6 +128,48 @@ class RandomPitchPolicy:
         pass
 
 
+class RandomBreakPolicy:
+    """The random baseline of the block-breaking diagnostic: persistent
+    random choices for the pitch and attack factors, every other factor at
+    its no-op value. A pitch choice is held for 10 steps on average, and the
+    attack toggle starts with probability 0.1 per step and is held for 20
+    steps on average (the geometric process of the exploration policy).
+    Persistence matters because mining progress resets when the crosshair
+    leaves the block (docs/stage4-block-breaking.md). Action exploration,
+    not a mining routine: no choice depends on the observation."""
+
+    ATTACK_START, ATTACK_HOLD, PITCH_HOLD = 0.1, 20.0, 10.0
+
+    def __init__(self, seed: int) -> None:
+        self.generator = torch.Generator().manual_seed(seed)
+        self.attacking = False
+        self.pitch = ActionSpace.NOOP[PITCH_FACTOR]
+
+    def reset(self, observation: PolicyObservation) -> None:
+        self.attacking = False
+        self.pitch = ActionSpace.NOOP[PITCH_FACTOR]
+
+    def act(self, observation: PolicyObservation) -> tuple[Any, list[int]]:
+        draw = float(torch.rand((), generator=self.generator))
+        if self.attacking:
+            self.attacking = draw >= 1.0 / self.ATTACK_HOLD
+        else:
+            self.attacking = draw < self.ATTACK_START
+        if float(torch.rand((), generator=self.generator)) < 1.0 / self.PITCH_HOLD:
+            self.pitch = int(
+                torch.randint(
+                    ActionSpace.SIZES[PITCH_FACTOR], (), generator=self.generator
+                )
+            )
+        choice = list(ActionSpace.NOOP)
+        choice[PITCH_FACTOR] = self.pitch
+        choice[ATTACK_FACTOR] = int(self.attacking)
+        return ActionSpace.to_player_action(choice), choice
+
+    def observe(self, choice: list[int], observation: PolicyObservation) -> None:
+        pass
+
+
 def run_episode(
     client, args, episode: int, policy, recorder, registries, directory: Path, gate
 ) -> dict:
@@ -141,7 +190,7 @@ def run_episode(
         writer.add_privileged("yaw", server["yaw"])
 
     record_position()
-    if isinstance(policy, (ActorPolicy, RandomPitchPolicy)):
+    if isinstance(policy, (ActorPolicy, RandomPitchPolicy, RandomBreakPolicy)):
         policy.reset(observation)
     else:
         policy.reset()
@@ -152,8 +201,9 @@ def run_episode(
     terminated = False
     choices: Counter[str] = Counter()
     steps_alive = 0
+    broken_types: list[int] = []
     while writer.steps < args.max_steps and not terminated:
-        if isinstance(policy, (ActorPolicy, RandomPitchPolicy)):
+        if isinstance(policy, (ActorPolicy, RandomPitchPolicy, RandomBreakPolicy)):
             action, choice = policy.act(observation)
             for name, value in zip(ActionSpace.NAMES, choice, strict=True):
                 choices[f"{name}={value}"] += 1
@@ -174,7 +224,7 @@ def run_episode(
         )
         if not math.isfinite(step_reward.total):
             raise RuntimeError(f"non-finite reward {step_reward.components}")
-        if isinstance(policy, (ActorPolicy, RandomPitchPolicy)):
+        if isinstance(policy, (ActorPolicy, RandomPitchPolicy, RandomBreakPolicy)):
             policy.observe(choice, observation)
         writer.add(
             action.executed(),
@@ -189,6 +239,8 @@ def run_episode(
             events=step_reward.events,
         )
         record_position()
+        writer.add_privileged_step("breaks", len(result.events.blocks_broken))
+        broken_types.extend(result.events.blocks_broken)
         steps_alive += 1
     wall = time.perf_counter() - started
     video = None
@@ -222,6 +274,11 @@ def run_episode(
     control = episode_task(arrays)
     stats = {
         "pitch": pitch_metrics(arrays["obs_pitch"]),
+        "break": break_metrics(
+            arrays[BREAKS_KEY],
+            arrays["action_buttons"][:, ACTION_BUTTONS.index("attack")],
+            broken_types,
+        ),
         "control": {k: v for k, v in control.items() if k not in ("target", "rewards")},
         "episode": episode,
         "steps": writer.steps,
@@ -247,7 +304,14 @@ def main() -> None:
     parser.add_argument("--world-seed", type=int, default=100_000)
     parser.add_argument(
         "--policy",
-        choices=("random", "actor", "random-pitch", "pitch-actor"),
+        choices=(
+            "random",
+            "actor",
+            "random-pitch",
+            "pitch-actor",
+            "random-break",
+            "break-actor",
+        ),
         default="random",
         help="random-pitch and pitch-actor: the pitch diagnostic, only the "
         "pitch factor is chosen (docs/stage4-pitch-control.md)",
@@ -322,13 +386,19 @@ def main() -> None:
             for episode in todo:
                 if time.monotonic() - started > args.time_budget:
                     break
-                if args.policy in ("actor", "pitch-actor"):
+                if args.policy in ("actor", "pitch-actor", "break-actor"):
                     policy = ActorPolicy(
                         args.agent,
                         args.world_model,
                         args.policy_seed + episode,
-                        pitch_only=args.policy == "pitch-actor",
+                        agent_class={
+                            "actor": Agent,
+                            "pitch-actor": PitchOnlyAgent,
+                            "break-actor": BreakAgent,
+                        }[args.policy],
                     )
+                elif args.policy == "random-break":
+                    policy = RandomBreakPolicy(args.policy_seed + episode)
                 elif args.policy == "random-pitch":
                     policy = RandomPitchPolicy(args.policy_seed + episode)
                 else:
@@ -357,6 +427,7 @@ def main() -> None:
                                 "counts",
                                 "control",
                                 "pitch",
+                                "break",
                             )
                         }
                     ),
