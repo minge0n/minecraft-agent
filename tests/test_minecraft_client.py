@@ -119,7 +119,19 @@ def test_pacing_rejects_unknown_mode_and_sends_valid_ones(connected) -> None:
     server.sendall(reply("PACING", {"mode": "unpaced", "render_frames": False}))
     assert client.set_pacing("unpaced", render_frames=False)["mode"] == "unpaced"
     assert received_lines(server) == [
-        'v2 PACING {"mode":"unpaced","render_frames":false}'
+        'v2 PACING {"mode":"unpaced","render_frames":false,'
+        '"recorded_frames_only":false}'
+    ]
+
+
+def test_pacing_sends_the_recorded_frames_only_mode(connected) -> None:
+    client, server = connected
+    server.sendall(reply("PACING", {"mode": "unpaced", "recorded_frames_only": True}))
+    assert client.set_pacing("unpaced", recorded_frames_only=True)[
+        "recorded_frames_only"
+    ]
+    assert received_lines(server) == [
+        'v2 PACING {"mode":"unpaced","render_frames":true,"recorded_frames_only":true}'
     ]
 
 

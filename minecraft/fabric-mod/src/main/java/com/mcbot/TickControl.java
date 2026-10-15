@@ -59,7 +59,9 @@ final class TickControl {
         Lockstep.onBeforeTickRateUpdate(this::grantIfReady);
         Lockstep.pacing = Pacing.fromEnvironment();
         Lockstep.renderFrames = !"off".equals(System.getenv("MCBOT_RENDER"));
-        LOGGER.info("lockstep pacing {}, render frames {}", Lockstep.pacing, Lockstep.renderFrames);
+        Lockstep.recordedFramesOnly = "recorded".equals(System.getenv("MCBOT_RENDER"));
+        LOGGER.info("lockstep pacing {}, render frames {}, recorded frames only {}",
+                Lockstep.pacing, Lockstep.renderFrames, Lockstep.recordedFramesOnly);
         ServerLifecycleEvents.SERVER_STARTED.register(started -> {
             if (started instanceof IntegratedServer integrated) {
                 integrated.tickRateManager().setFrozen(true);
@@ -286,6 +288,8 @@ final class TickControl {
                 }
                 Lockstep.pacing = Pacing.valueOf(payload.get("mode").getAsString().toUpperCase(Locale.ROOT));
                 Lockstep.renderFrames = renderFrames;
+                Lockstep.recordedFramesOnly =
+                        payload.has("recorded_frames_only") && payload.get("recorded_frames_only").getAsBoolean();
                 reply.complete(v2("PACING", pacingJson()));
             }
             case "OBSERVE" -> reply.complete(v2("OBSERVE", observationReply(firstPlayer(current))));
@@ -479,6 +483,9 @@ final class TickControl {
         JsonObject pacing = new JsonObject();
         pacing.addProperty("mode", Lockstep.pacing.name().toLowerCase(Locale.ROOT));
         pacing.addProperty("render_frames", Lockstep.renderFrames);
+        pacing.addProperty("recorded_frames_only", Lockstep.recordedFramesOnly);
+        pacing.addProperty("frames_drawn", Lockstep.framesDrawn());
+        pacing.addProperty("frames_skipped", Lockstep.framesSkipped());
         pacing.addProperty("barrier_blocked_frames", Lockstep.barrierBlockedFrames());
         return pacing;
     }

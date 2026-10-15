@@ -196,11 +196,24 @@ class MinecraftClient:
             events=StepEvents.from_json(reply.get("events")),
         )
 
-    def set_pacing(self, mode: str, render_frames: bool = True) -> dict[str, Any]:
-        """Select paced or unpaced lockstep; never changes what a step does."""
+    def set_pacing(
+        self, mode: str, render_frames: bool = True, recorded_frames_only: bool = False
+    ) -> dict[str, Any]:
+        """Select paced or unpaced lockstep; never changes what a step does.
+
+        In unpaced mode, `recorded_frames_only` draws a frame only when the
+        session recording needs one, and no frame at all while nothing records.
+        """
         if mode not in PACING_MODES:
             raise ValueError(f"unknown pacing mode {mode!r}")
-        return self.request("PACING", {"mode": mode, "render_frames": render_frames})
+        return self.request(
+            "PACING",
+            {
+                "mode": mode,
+                "render_frames": render_frames,
+                "recorded_frames_only": recorded_frames_only,
+            },
+        )
 
     def start_recording(
         self,

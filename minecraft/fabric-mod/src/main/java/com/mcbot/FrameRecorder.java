@@ -52,6 +52,13 @@ public final class FrameRecorder {
         return session != null;
     }
 
+    // Render thread, before a frame: whether recording needs this frame drawn. It does
+    // for the first frame after a due tick, and until a requested stop has drained.
+    public static boolean needsFrame() {
+        Session current = session;
+        return current != null && current.needsFrame(Lockstep.clientTicks());
+    }
+
     // Render thread: called after a frame is drawn and before it is submitted.
     public static void onFrameRendered(Minecraft minecraft) {
         Session current = session;
@@ -210,6 +217,10 @@ public final class FrameRecorder {
             } catch (RuntimeException e) {
                 fail("capture: " + e);
             }
+        }
+
+        boolean needsFrame(long tick) {
+            return (tick > lastConsidered && isDue(tick)) || (stopRequested && !finished);
         }
 
         private boolean isDue(long tick) {

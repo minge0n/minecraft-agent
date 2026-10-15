@@ -30,12 +30,18 @@ public final class Lockstep {
     // Unpaced mode only: whether the render thread draws frames between steps. Turning
     // it off measures simulation-only throughput; it never changes step contents.
     public static volatile boolean renderFrames = true;
+    // Unpaced mode only: draw a frame only when the session recording needs one
+    // (docs/decisions/simulation-throughput.md, "Recorded frames only"). Between such
+    // frames the render thread idles. It never changes step contents.
+    public static volatile boolean recordedFramesOnly;
 
     private static final AtomicReference<PlayerAction> clientTickPermit = new AtomicReference<>();
     private static final AtomicLong armCount = new AtomicLong();
     private static final AtomicLong clientTickEndsQueued = new AtomicLong();
     private static final AtomicLong clientTickEndsProcessed = new AtomicLong();
     private static final AtomicLong barrierBlockedFrames = new AtomicLong();
+    private static final AtomicLong framesDrawn = new AtomicLong();
+    private static final AtomicLong framesSkipped = new AtomicLong();
     private static volatile PlayerAction currentClientAction;
     private static volatile long clientTickEndsSent;
     private static volatile long clientTicks;
@@ -230,7 +236,17 @@ public final class Lockstep {
     }
 
     public static boolean skipFrame() {
-        return unpacedAndGated() && !renderFrames;
+        boolean skip = unpacedAndGated() && (!renderFrames || (recordedFramesOnly && !FrameRecorder.needsFrame()));
+        (skip ? framesSkipped : framesDrawn).incrementAndGet();
+        return skip;
+    }
+
+    static long framesDrawn() {
+        return framesDrawn.get();
+    }
+
+    static long framesSkipped() {
+        return framesSkipped.get();
     }
 
     private static boolean clientTickReady() {

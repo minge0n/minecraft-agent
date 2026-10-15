@@ -391,11 +391,19 @@ def main() -> None:
     parser.add_argument("--no-video", action="store_true")
     parser.add_argument("--port", type=int, default=47140)
     parser.add_argument(
-        "--background-game",
+        "--foreground-game",
         action="store_true",
-        help="macOS: run the game on the efficiency cores behind a chunk gate",
+        help="macOS: run the game at default priority instead of on the "
+        "efficiency cores behind a chunk gate",
+    )
+    parser.add_argument(
+        "--draw-every-frame",
+        action="store_true",
+        help="draw every frame the render loop allows, not only the frames "
+        "the recording keeps",
     )
     args = parser.parse_args()
+    args.background_game = not args.foreground_game
     if args.policy != "random-break" and args.agent is None:
         parser.error("--agent is required for an actor policy")
     macos_qos.run_in_background()
@@ -429,6 +437,7 @@ def main() -> None:
             "reward": BREAK_V1.to_json(),
             "recording": None if args.no_video else RECORDING,
             "background_game": args.background_game,
+            "recorded_frames_only": not args.draw_every_frame,
         },
     )
     log = args.output / "logs" / f"{int(time.time())}.minecraft.log"
@@ -436,7 +445,7 @@ def main() -> None:
     with launched_client(args.port, args.world_seed, log, 240.0) as client:
         write_json(args.output / "schema.json", client.request("SCHEMA"))
         registries = Registries.from_json(client.privileged().registry())
-        client.set_pacing("unpaced", render_frames=True)
+        client.set_pacing("unpaced", recorded_frames_only=not args.draw_every_frame)
         pid = listening_pid(args.port)
         gate = None
         if args.background_game and pid is not None:

@@ -204,3 +204,39 @@ Correctness, all with no regression:
 Background policy, one pass each (`--background`): vanilla 43.7 steps/s at 0.032-0.036 J per step; sodium-extra 66.6 steps/s at 0.013 J per step without recording but 43.7 steps/s at 0.044 J per step with recording. One pass with this spread does not support a change.
 
 Decision: vanilla stays the default renderer. `MCBOT_RENDERER=sodium-extra` remains available for viewing at a lower framebuffer, and the dependency stays pinned. No other mod was tried.
+
+### Recorded frames only
+
+Question: in unpaced lockstep, the render thread draws as many frames as it can (frame limit 260), but the recording keeps one frame every 2 ticks. Can the client draw only the frames that the recording keeps, and does that lower the cost?
+
+Answer: **yes, and it is now the default of `minecraft_life`.** The mode never changes a step, the recording stays complete, and the game draws less than half the frames. The energy gain is small on the efficiency cores and clearer at default priority. It is not a heat solution on its own.
+
+Mechanism: the PACING command takes `recorded_frames_only` (Python `set_pacing(..., recorded_frames_only=True)`, or `MCBOT_RENDER=recorded` at launch). In unpaced mode, `Lockstep.skipFrame` then skips `renderFrame` unless `FrameRecorder.needsFrame()`: the first frame after a client tick that the recording keeps, and every frame while a requested stop drains. With no recording, no frame is drawn. Client ticks still run, so a step does the same work. `STATUS` reports `frames_drawn` and `frames_skipped`. `minecraft_life` uses the mode and the efficiency cores by default; `--draw-every-frame` and `--foreground-game` turn them off.
+
+Correctness (`scripts/minecraft-frame-probe.py`, and the existing probes):
+
+- The controlled replay trace with the mode equals the trace without it: 0 of 243 policy steps differ, no unexplained field.
+- Every recorded walk: 211 of 211 frames due were captured and sent, 0 missed, 0 dropped, video complete. A 300-tick `minecraft_life` smoke run: 3 segments, 51 of 51 frames each, complete.
+- The tick-gate, equivalence and recording probes pass.
+
+Measured, the 420-step sprint walk with recording every 2 ticks, one warm-up walk, then 3 walks per mode interleaved (`runs/minecraft-frames/`):
+
+| | Frames drawn per step | Steps/s | Game J per step | Game CPU ms per step |
+|---|---|---|---|---|
+| Default priority, every frame | 1.07 | 87 | 0.112 | 27.0 |
+| Default priority, recorded frames only | 0.50 | 118 | 0.102 | 23.6 |
+| Efficiency cores, every frame | 1.22 | 41 | 0.032 | 69.0 |
+| Efficiency cores, recorded frames only | 0.50 | 48 | 0.031 | 64.0 |
+
+Without recording (no frame at all, 3 walks each on the efficiency cores, `/tmp` script, not kept): 0.025-0.036 J per step drawing every frame against 0.014-0.025 drawing none, at 36-39 against 57-90 steps/s.
+
+Die temperature, one 60-second run per row in one client process, `CpuTemperature`, idle 56 C before (ordered, so later rows start warmer):
+
+| | Steps/s | Game W | Die mean / max |
+|---|---|---|---|
+| Efficiency cores, every frame | 57 | 0.58 | 56 / 57 C |
+| Efficiency cores, no frames | 76 | 0.59 | 58 / 62 C |
+| Default priority, every frame | 59 | 0.53 | 63 / 68 C |
+| Default priority, no frames | 216 | 0.55 | 64 / 74 C |
+
+Reading: the game's power stays nearly the same, about 0.5-1.5 W on the efficiency cores. Fewer frames make each step cheaper, so the game runs more steps in the same power. Work per step falls, but heat per second does not. The efficiency cores are what keep the die near idle temperature. Heat per second falls only with fewer steps per second, which is the pause the duty cycle already gives, or with less work per step. These are single measurements on one machine with other programs running.
