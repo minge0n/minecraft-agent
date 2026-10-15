@@ -18,14 +18,20 @@ one render distance in a fresh client process:
   from the operating system.
 
 `--compare` reads the result of every render distance and checks them against the
-reference distance. Recorded sessions are written under the run directory.
+reference distance. `--renderer` (vanilla, sodium, sodium-extra) selects the
+client renderer, and `--compare-renderers` checks every renderer run at one
+render distance against vanilla: the same controlled trace, the walk's chunk
+readiness, throughput, energy and recording. Recorded sessions are written
+under the run directory.
 """
 
 import argparse
 import json
 import platform
+import re
 import statistics
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -35,7 +41,7 @@ import numpy as np
 from minecraft_rl import macos_energy
 from minecraft_rl.minecraft_client import MinecraftClient
 from minecraft_rl.minecraft_interface import PlayerAction
-from minecraft_rl.minecraft_launch import launched_client
+from minecraft_rl.minecraft_launch import RENDERERS, launched_client
 from minecraft_rl.provenance import git_commit
 from minecraft_rl.recording import WorkerRecorder, write_json
 from minecraft_rl.replay import (
@@ -107,6 +113,71 @@ def usage_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]
     return out
 
 
+class PowerSampler:
+    """System-wide CPU and GPU power from the built-in `powermetrics`
+    (`sudo -n`, so it needs a cached or passwordless sudo), sampled in a
+    thread. It counts every process, so `idle()` measures the same machine
+    without the game first, and the difference is the game's share. Without
+    sudo it records nothing. macOS only; no extra profiler."""
+
+    COMMAND = ["sudo", "-n", "powermetrics", "--samplers", "cpu_power,gpu_power"]
+
+    def __init__(self, interval_ms: int = 500) -> None:
+        self.interval_ms = interval_ms
+        self.samples: list[tuple[float, float]] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def read(self) -> tuple[float, float] | None:
+        """(CPU watts, GPU watts) over one interval, or None."""
+        out = subprocess.run(
+            [*self.COMMAND, "-i", str(self.interval_ms), "-n", "1"],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+        cpu = re.search(r"^CPU Power: (\d+) mW", out, re.M)
+        gpu = re.findall(r"^GPU Power: (\d+) mW", out, re.M)
+        if not cpu or not gpu:
+            return None
+        return int(cpu.group(1)) / 1000.0, int(gpu[-1]) / 1000.0
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            value = self.read()
+            if value is None:
+                return
+            self.samples.append(value)
+
+    def __enter__(self) -> "PowerSampler":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self._stop.set()
+        self._thread.join()
+
+    def idle(self, count: int = 6) -> dict[str, Any]:
+        for _ in range(count):
+            value = self.read()
+            if value is None:
+                break
+            self.samples.append(value)
+        return self.summary()
+
+    def summary(self) -> dict[str, Any]:
+        if not self.samples:
+            return {"samples": 0}
+        cpu = [c for c, _ in self.samples]
+        gpu = [g for _, g in self.samples]
+        return {
+            "samples": len(self.samples),
+            "system_cpu_watts": statistics.fmean(cpu),
+            "system_gpu_watts": statistics.fmean(gpu),
+            "system_cpu_gpu_watts": statistics.fmean(cpu) + statistics.fmean(gpu),
+        }
+
+
 def run_controlled(client: MinecraftClient, seed: int) -> list[dict[str, Any]]:
     scene = build_controlled_replay(client, seed)
     client.set_pacing("unpaced")
@@ -168,10 +239,11 @@ def run_throughput(
     step_ms = []
     before = process_usage(pid)
     started = time.perf_counter()
-    for action in actions:
-        step_started = time.perf_counter()
-        client.step(action)
-        step_ms.append((time.perf_counter() - step_started) * 1000.0)
+    with PowerSampler() as power:
+        for action in actions:
+            step_started = time.perf_counter()
+            client.step(action)
+            step_ms.append((time.perf_counter() - step_started) * 1000.0)
     elapsed = time.perf_counter() - started
     usage = usage_delta(before, process_usage(pid))
     out: dict[str, Any] = {
@@ -181,6 +253,7 @@ def run_throughput(
         "median_step_ms": statistics.median(step_ms),
         "p95_step_ms": statistics.quantiles(step_ms, n=20)[-1],
         "game_process": usage,
+        "system_power": power.summary(),
     }
     if "cpu_seconds" in usage:
         out["game_cpu_ms_per_step"] = usage["cpu_seconds"] * 1000.0 / len(actions)
@@ -195,20 +268,28 @@ def run_throughput(
     return out
 
 
-def measure(args: argparse.Namespace) -> None:
+def run_name(args: argparse.Namespace) -> str:
     name = f"render-{args.render_distance}"
-    output = args.output / (name + "-background" if args.background else name)
+    if args.renderer:
+        name += f"-{args.renderer}"
+    return name + "-background" if args.background else name
+
+
+def measure(args: argparse.Namespace) -> None:
+    output = args.output / run_name(args)
     output.mkdir(parents=True, exist_ok=True)
     result: dict[str, Any] = {
         "tool": "minecraft-render-distance-probe",
         "commit": git_commit(),
         "render_distance": args.render_distance,
         "background_policy": args.background,
+        "renderer": args.renderer or "default",
         "seed": args.seed,
         "walk_seed": WALK_SEED,
         "host": {"system": platform.system(), "machine": platform.machine()},
         "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
+    result["idle_system_power"] = PowerSampler().idle()
     recorder: WorkerRecorder | None = None
     launched = time.perf_counter()
     try:
@@ -217,7 +298,8 @@ def measure(args: argparse.Namespace) -> None:
             args.seed,
             output / "workers" / WORKER / "minecraft.log",
             args.startup_timeout,
-            extra_environment={"MCBOT_RENDER_DISTANCE": str(args.render_distance)},
+            extra_environment={"MCBOT_RENDER_DISTANCE": str(args.render_distance)}
+            | ({"MCBOT_RENDERER": args.renderer} if args.renderer else {}),
             background=args.background,
         ) as client:
             result["startup_seconds"] = time.perf_counter() - launched
@@ -262,6 +344,70 @@ def measure(args: argparse.Namespace) -> None:
     print(json.dumps(result, indent=2))
     if not result["passed"]:
         raise SystemExit(1)
+
+
+def compare_renderers(args: argparse.Namespace) -> None:
+    """Compare the renderers at one render distance against `vanilla`."""
+    runs = {}
+    for renderer in RENDERERS:
+        directory = args.output / f"render-{args.render_distance}-{renderer}"
+        if (directory / "metadata.json").exists():
+            runs[renderer] = {
+                "metadata": json.loads((directory / "metadata.json").read_text()),
+                "controlled": json.loads((directory / "controlled.json").read_text()),
+            }
+    if "vanilla" not in runs:
+        raise SystemExit("no vanilla result to compare against")
+    out: dict[str, Any] = {"reference": "vanilla", "renderers": {}}
+    for renderer, run in runs.items():
+        comparison = compare_traces(runs["vanilla"]["controlled"], run["controlled"])
+        meta = run["metadata"]
+        timed = {t["recording"]: t for t in meta.get("throughput", [])}
+        out["renderers"][renderer] = {
+            "passed": meta["passed"],
+            "controlled_policy_steps_differing": comparison["policy_observation"][
+                "differing_steps"
+            ],
+            "controlled_unexplained_fields": unexplained_fields(comparison),
+            "framebuffer": [
+                meta["client_settings"].get("framebuffer_width"),
+                meta["client_settings"].get("framebuffer_height"),
+            ],
+            "window": [
+                meta["client_settings"].get("window_width"),
+                meta["client_settings"].get("window_height"),
+            ],
+            "throughput": {
+                ("recording" if recording else "rendering"): {
+                    key: t.get(key)
+                    for key in (
+                        "steps_per_second",
+                        "median_step_ms",
+                        "game_cpu_ms_per_step",
+                        "game_joules_per_step",
+                        "game_cpu_cores",
+                    )
+                }
+                | {"system_power": t.get("system_power")}
+                | {"resident_mib": t["game_process"].get("resident_mib_after")}
+                for recording, t in timed.items()
+            },
+            "idle_system_power": meta.get("idle_system_power"),
+            "recording": timed.get(True, {}).get("capture"),
+            "walk_chunks": [
+                {
+                    key: walk[key]
+                    for key in (
+                        "steps_with_unloaded_sensor_chunk",
+                        "steps_with_non_ticking_sensor_chunk",
+                        "steps_with_non_ticking_simulation_chunk",
+                    )
+                }
+                for walk in meta["walks"]
+            ],
+        }
+    write_json(args.output / f"renderers-{args.render_distance}.json", out)
+    print(json.dumps(out, indent=2))
 
 
 def compare(args: argparse.Namespace) -> None:
@@ -324,6 +470,16 @@ def main() -> None:
         action="store_true",
         help="start the game under taskpolicy -b (efficiency cores, macOS)",
     )
+    parser.add_argument(
+        "--renderer",
+        choices=RENDERERS,
+        help="client renderer (MCBOT_RENDERER); the run directory names it",
+    )
+    parser.add_argument(
+        "--compare-renderers",
+        action="store_true",
+        help="compare the renderer runs at --render-distance against vanilla",
+    )
     parser.add_argument("--reference", type=int, default=8)
     parser.add_argument("--port", type=int, default=47130)
     parser.add_argument("--seed", type=int, default=12345)
@@ -332,7 +488,9 @@ def main() -> None:
         "--output", type=Path, default=Path("runs/minecraft-render-distance")
     )
     args = parser.parse_args()
-    if args.compare:
+    if args.compare_renderers:
+        compare_renderers(args)
+    elif args.compare:
         compare(args)
     elif args.render_distance is None:
         parser.error("give --render-distance or --compare")

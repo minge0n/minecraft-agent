@@ -23,10 +23,35 @@ if (worker != null && !(worker ==~ /\d{4}/)) {
     throw new GradleException("mcbot.worker must be four digits, got '${worker}'")
 }
 
+// Client renderer (docs/decisions/simulation-throughput.md). `vanilla` (the
+// default, the measured best) runs neither mod, `sodium` runs Sodium alone,
+// `sodium-extra` runs Sodium and Sodium Extra with Reduce Resolution on macOS.
+// The mods are development runtime dependencies only: they are never bundled
+// into the mcbot jar and never change what a step does.
+def renderer = providers.gradleProperty('mcbot.renderer').orElse('vanilla').get()
+if (!(renderer in ['vanilla', 'sodium', 'sodium-extra'])) {
+    throw new GradleException("mcbot.renderer must be vanilla, sodium or sodium-extra, got '${renderer}'")
+}
+
+repositories {
+    exclusiveContent {
+        forRepository {
+            maven {
+                name = 'Modrinth'
+                url = 'https://api.modrinth.com/maven'
+            }
+        }
+        filter {
+            includeGroup 'maven.modrinth'
+        }
+    }
+}
+
 loom {
     runs {
         configureEach {
             runDirectory = runtimeMinecraftDir.dir(name)
+            property 'mcbot.renderer', renderer
         }
         if (worker != null) {
             client {
@@ -43,6 +68,15 @@ dependencies {
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
     implementation "net.fabricmc:fabric-loader:${project.loader_version}"
     implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+    // The unobfuscated Loom has no `mod*` configurations: `localRuntime` is
+    // its `modLocalRuntime`, on the dev run classpath and never published.
+    if (renderer != 'vanilla') {
+        localRuntime "maven.modrinth:${project.sodium_project}:${project.sodium_version}"
+    }
+    if (renderer == 'sodium-extra') {
+        localRuntime "maven.modrinth:${project.sodium_extra_project}:${project.sodium_extra_version}"
+    }
 
     testImplementation platform("org.junit:junit-bom:${project.junit_version}")
     testImplementation 'org.junit.jupiter:junit-jupiter'

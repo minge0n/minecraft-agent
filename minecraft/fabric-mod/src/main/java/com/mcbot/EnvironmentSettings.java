@@ -1,6 +1,7 @@
 package com.mcbot;
 
 import com.google.gson.JsonObject;
+import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.CloudStatus;
 import net.minecraft.client.GraphicsPreset;
 import net.minecraft.client.InactivityFpsLimit;
@@ -82,8 +83,17 @@ final class EnvironmentSettings {
         json.addProperty("frame_limit", options.framerateLimit().get());
         json.addProperty("particles", options.particles().get().name().toLowerCase(java.util.Locale.ROOT));
         json.addProperty("master_volume", options.getSoundSourceVolume(SoundSource.MASTER));
-        json.addProperty("framebuffer_width", minecraft.getWindow().getWidth());
-        json.addProperty("framebuffer_height", minecraft.getWindow().getHeight());
+        var window = minecraft.getWindow();
+        json.addProperty("framebuffer_width", window.getWidth());
+        json.addProperty("framebuffer_height", window.getHeight());
+        // The logical window size in screen points; the framebuffer divided by
+        // it is the pixel density (2 on a Retina display, 1 when reduced).
+        json.addProperty("window_width", window.getScreenWidth());
+        json.addProperty("window_height", window.getScreenHeight());
+        json.addProperty("renderer", System.getProperty("mcbot.renderer", "unknown"));
+        json.addProperty("sodium_loaded", FabricLoader.getInstance().isModLoaded("sodium"));
+        json.addProperty(
+                "sodium_extra_loaded", FabricLoader.getInstance().isModLoaded("sodium-extra"));
         return json;
     }
 }

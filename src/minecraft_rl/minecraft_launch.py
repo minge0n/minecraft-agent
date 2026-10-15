@@ -3,6 +3,7 @@
 Integration tooling only; nothing here is part of the policy or environment API.
 """
 
+import json
 import os
 import signal
 import subprocess
@@ -15,6 +16,18 @@ from pathlib import Path
 from minecraft_rl.minecraft_client import MinecraftClient
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+# Client renderer (docs/decisions/simulation-throughput.md): `vanilla` (the
+# default, the measured best), `sodium`, or `sodium-extra` (Sodium and Sodium
+# Extra with Reduce Resolution on macOS). Select it with MCBOT_RENDERER.
+RENDERERS = ("vanilla", "sodium", "sodium-extra")
+DEFAULT_RENDERER = "vanilla"
+
+
+def renderer_of(environment: Mapping[str, str]) -> str:
+    renderer = environment.get("MCBOT_RENDERER", DEFAULT_RENDERER)
+    if renderer not in RENDERERS:
+        raise ValueError(f"MCBOT_RENDERER must be one of {RENDERERS}, got {renderer!r}")
+    return renderer
 
 
 def wait_for_world(port: int, deadline: float) -> MinecraftClient:
@@ -34,6 +47,34 @@ def wait_for_world(port: int, deadline: float) -> MinecraftClient:
         client.close()
         time.sleep(1)
     raise TimeoutError("Minecraft did not reach a frozen, gated, unpaused world")
+
+
+SODIUM_EXTRA_CONFIG = "sodium-extra-options.json"
+
+
+def client_game_directory(worker: int | None) -> Path:
+    if worker is not None:
+        return worker_game_directory(worker)
+    return REPOSITORY_ROOT / ".runtime" / "minecraft" / "client"
+
+
+def write_renderer_config(game_directory: Path, renderer: str) -> None:
+    """Turn on Reduce Resolution on macOS in the project-owned Sodium Extra
+    config before the client starts. Other settings keep their values; a
+    missing file becomes one with this setting, which Sodium Extra completes
+    with its defaults on load. Never touches a personal installation."""
+    if renderer != "sodium-extra":
+        return
+    path = game_directory / "config" / SODIUM_EXTRA_CONFIG
+    data = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data = {}
+    data.setdefault("extra_settings", {})["reduce_resolution_on_mac"] = True
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
 def worker_game_directory(worker: int) -> Path:
@@ -65,6 +106,8 @@ def launched_client(
     and the game process it starts inherit the background policy and run on
     the efficiency cores. It changes where and how fast the game computes,
     never what a step does.
+
+    The renderer comes from MCBOT_RENDERER (`renderer_of`).
     """
     environment = (
         os.environ
@@ -76,6 +119,9 @@ def launched_client(
         command = [str(REPOSITORY_ROOT / "scripts" / "gradle"), "runClient"]
         if background and sys.platform == "darwin":
             command = ["taskpolicy", "-b", *command]
+        renderer = renderer_of(environment)
+        write_renderer_config(client_game_directory(worker), renderer)
+        command.append(f"-Pmcbot.renderer={renderer}")
         if worker is not None:
             command.append(f"-Pmcbot.worker={worker:04d}")
         game = subprocess.Popen(

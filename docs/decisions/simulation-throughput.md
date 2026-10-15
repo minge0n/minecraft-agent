@@ -152,3 +152,55 @@ Negative finding: chunk generation then falls behind lockstep. In the first walk
 
 Measured once, on the Stage 4 actor-retry evaluation (`docs/stage4-reward-actor-data.md`, 4 episodes, 4,000 steps, recording on): 73 waits in 4,004 checks, 42 s waiting, longest 6.4 s, 11 boosts for 22 s; game energy 153 J (0.038 J per step, 0.1 J on the performance cores) in 195 s (20.5 steps per second). Not yet compared with a default-priority run of the same episodes, and not yet a training default.
 
+
+### Sodium and Sodium Extra
+
+Question: do Sodium 0.9.2 and Sodium Extra 0.9.4 with Reduce Resolution on macOS lower the game's energy per step without hurting throughput or correctness?
+
+Answer: **no. The default stays vanilla.** Reduce Resolution works (the framebuffer falls from 1708 x 960 to 854 x 480), but both mods raise the game's CPU energy per step by about a quarter. The GPU was not the main cost: the game's heat is CPU work, and Sodium's chunk meshing threads add CPU work.
+
+Setup: `minecraft/fabric-mod/build.gradle` adds the two mods as Loom `localRuntime` dependencies from the Modrinth Maven repository, never bundled into the mcbot jar (the unobfuscated Loom has no `modLocalRuntime`; `localRuntime` is its equivalent). Versions are pinned in `gradle.properties`:
+
+| Mod | Version | Maven coordinate | File |
+|---|---|---|---|
+| Sodium | mc26.3-0.9.2-fabric | `maven.modrinth:AANobbMI:bAZQdGpg` | sodium-fabric-0.9.2+mc26.3.jar |
+| Sodium Extra | mc26.3-0.9.4+fabric | `maven.modrinth:PtjYWJkn:te2y9qZn` | sodium-extra-fabric-0.9.4+mc26.3.jar |
+
+One option selects the renderer: `MCBOT_RENDERER` (`vanilla`, the default; `sodium`; `sodium-extra`), passed by `launched_client` to Gradle as `-Pmcbot.renderer`. With `sodium-extra`, `launched_client` first writes `extra_settings.reduce_resolution_on_mac = true` into `sodium-extra-options.json` of the project-owned game directory (`.runtime/minecraft/client`, or the worker's own directory); other settings keep their values. `STATUS` reports the renderer, which mods loaded, the logical window size and the framebuffer size.
+
+Measured framebuffer (window 854 x 480 points on the Retina display):
+
+| Renderer | Framebuffer | Pixel density | Recording output |
+|---|---|---|---|
+| vanilla | 1708 x 960 | 2 | 426 x 240 |
+| sodium | 1708 x 960 | 2 | 426 x 240 |
+| sodium-extra | 854 x 480 | 1 | 426 x 240 |
+
+Benchmark: `scripts/minecraft-render-distance-probe.py --render-distance 6 --renderer R`, normal priority, render distance 6, simulation distance 6, the same 420-step sprint walk (seed 12345, as for the render-distance benchmark), the same window, recording 426 x 240 every tick. Three passes per renderer in the order vanilla, sodium, sodium-extra and back (`runs/minecraft-renderer/first`, `second`, and the top level); means and ranges:
+
+| | vanilla | sodium | sodium-extra |
+|---|---|---|---|
+| Game CPU energy per step, rendering (J) | 0.113 (0.111-0.116) | 0.143 (0.136-0.147) | 0.139 (0.129-0.145) |
+| Game CPU energy per step, recording (J) | 0.109 | 0.137 | 0.135 |
+| Steps/s, rendering | 86.7 (81.4-93.6) | 96.8 (84.4-104.9) | 89.8 (82.6-102.0) |
+| Steps/s, recording | 83.8 | 90.0 | 89.5 |
+| Game CPU per step (ms) | 28.9 | 36.4 | 36.0 |
+| Game CPU cores in use | 2.5 | 3.5 | 3.2 |
+| Game resident memory (MiB) | 2,176 | 2,606 | 2,667 |
+| Recording: frames written / due, dropped | 421 / 421, 0 | 421 / 421, 0 | 421 / 421, 0 |
+| Steps with an unloaded sensor chunk, 6 walks | 0 | 540 (in 2 walks) | 0 |
+
+Against vanilla, energy per step: Sodium +27% (rendering) and +26% (recording); Sodium Extra +23% and +24%. Steps per second: Sodium +12% and +7%; Sodium Extra +4% and +7%, inside the run-to-run noise (vanilla alone spans 81-94).
+
+GPU: per-process GPU time from `powermetrics --show-process-gpu` read 0 for the game, so only system-wide GPU power was available (`sudo -n powermetrics`, recorded by the probe's `PowerSampler`). It moves with other programs on the machine (5-8 W idle before different passes) and showed no consistent difference between renderers; it is reported per run, not used for the decision.
+
+Correctness, all with no regression:
+
+- The controlled replay trace is identical to vanilla for both mods (0 differing policy steps, no unexplained field).
+- The tick-gate, observation, equivalence, recording, worker and abstract-action probes pass with the default and with `MCBOT_RENDERER=sodium-extra`; each worker got its own Sodium Extra config.
+- Recording: no dropped frame; videos are 426 x 240 (aspect 1.775), no black frame, the same scene brightness by thirds of the image at the same times as vanilla. Frames were checked as image statistics, not watched.
+- Sodium alone left sensor-range chunks unloaded in 2 of 6 walks (302 and 238 of 420 steps). Sodium Extra and vanilla had none. The cause was not investigated, because Sodium is not selected.
+
+Background policy, one pass each (`--background`): vanilla 43.7 steps/s at 0.032-0.036 J per step; sodium-extra 66.6 steps/s at 0.013 J per step without recording but 43.7 steps/s at 0.044 J per step with recording. One pass with this spread does not support a change.
+
+Decision: vanilla stays the default renderer. `MCBOT_RENDERER=sodium-extra` remains available for viewing at a lower framebuffer, and the dependency stays pinned. No other mod was tried.
