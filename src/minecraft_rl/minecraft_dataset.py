@@ -24,7 +24,7 @@ replay samples contiguous windows inside one episode.
 
 import json
 import os
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +99,16 @@ class EpisodeMeta:
     reward_version: str | None = None
     policy: str | None = None
     episode_return: float | None = None
+    # One Minecraft life can be stored as consecutive segments
+    # (docs/stage4-temporal-attack.md). `episode` is then the life,
+    # `segment` its index and `first_step` the life step of its first
+    # transition. `terminated` and `truncated` describe the life end and
+    # are false on every segment but the last. `stop_reason` is "death",
+    # or the external stop of a truncated life.
+    segment: int | None = None
+    first_step: int | None = None
+    final_segment: bool | None = None
+    stop_reason: str | None = None
 
 
 class EpisodeWriter:
@@ -258,3 +268,44 @@ def load_episode(directory: Path) -> Episode:
 def load_episodes(root: Path, split: str | None = None) -> list[Episode]:
     episodes = [load_episode(path) for path in episode_directories(root)]
     return [e for e in episodes if split is None or e.meta.split == split]
+
+
+def join_segments(segments: list[Episode]) -> list[Episode]:
+    """One Episode per life from its stored segments, in step order. A
+    segment's first observation is the previous segment's last, so it is
+    kept once. Episodes without a segment index pass through."""
+    lives: dict[int, list[Episode]] = {}
+    out = []
+    for episode in segments:
+        if episode.meta.segment is None:
+            out.append(episode)
+        else:
+            lives.setdefault(episode.meta.episode, []).append(episode)
+    for life in lives.values():
+        life.sort(key=lambda e: e.meta.segment)
+        expected = 0
+        for e in life:
+            if e.meta.first_step != expected:
+                raise ValueError(f"life {e.meta.episode}: segment gap at {expected}")
+            expected += e.steps
+        stored = [life[0]] + [e for e in life[1:] if e.steps]
+        arrays = {}
+        for name in life[0].arrays:
+            per_observation = life[0].arrays[name].shape[0] == life[0].steps + 1
+            parts = [life[0].arrays[name]] + [
+                e.arrays[name][1:] if per_observation else e.arrays[name]
+                for e in stored[1:]
+            ]
+            arrays[name] = numpy.concatenate(parts)
+        last = life[-1].meta
+        meta = replace(
+            last,
+            steps=expected,
+            first_tick=life[0].meta.first_tick,
+            segment=None,
+            first_step=0,
+            final_segment=None,
+            episode_return=sum(e.meta.episode_return or 0.0 for e in life),
+        )
+        out.append(Episode(meta, arrays))
+    return out
