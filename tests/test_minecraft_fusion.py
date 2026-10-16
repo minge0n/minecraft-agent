@@ -152,6 +152,7 @@ def test_a_v1_checkpoint_loads_as_the_shared_encoder(setup, tmp_path):
     model = model_for(vocabulary, "shared")
     config = model.config.to_json()
     del config["fusion"], config["self_skip"]
+    del config["heads"], config["item_slot_features"]
     data = {
         "format": "minecraft-rssm-checkpoint-v1",
         "config": config,

@@ -43,12 +43,17 @@ from minecraft_rl.minecraft_interface import (
     RAY_KIND_ENTITY,
     RAY_KIND_NONE,
 )
-from minecraft_rl.minecraft_replay import CompactVocabulary, SequenceReplay
+from minecraft_rl.minecraft_replay import (
+    RegistryVocabulary,
+    SequenceReplay,
+    VocabularyMap,
+)
 from minecraft_rl.minecraft_world_model import (
     COUNT_LOG_SCALE,
     FOOD_SCALE,
     HEALTH_SCALE,
     PITCH_SCALE,
+    FactoredDecoder,
     MinecraftRSSM,
     latent_statistics,
     ray_class,
@@ -65,10 +70,13 @@ BUTTON = {name: index for index, name in enumerate(ACTION_BUTTONS)}
 MOVEMENT_BUTTONS = ("forward", "back", "left", "right", "jump")
 
 
-def unknown_classes(compact: CompactVocabulary, model: MinecraftRSSM) -> torch.Tensor:
-    """Bool (ray_classes,): the joint ray classes that stand for unknown."""
+def unknown_classes(compact: VocabularyMap, model: MinecraftRSSM) -> torch.Tensor:
+    """Bool (ray_classes,): the joint ray classes that stand for unknown. A
+    registry vocabulary has none."""
     v = model.vocabulary
     out = torch.zeros(v.ray_classes, dtype=torch.bool)
+    if isinstance(compact, RegistryVocabulary):
+        return out
     for kind, first in v.kind_offsets().items():
         family = {1: "block", 2: "fluid", 3: "entity"}[kind]
         out[first + compact.unknown(family)] = True
@@ -120,8 +128,22 @@ def pitch_baseline(
     return {"pitch_mae": (error, torch.ones_like(error))}
 
 
+def categorical_outputs(
+    model: MinecraftRSSM, prediction: dict[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    """The decoder outputs with the categorical logits of the joint heads.
+    A factored decoder gives its ray-class log probabilities and item
+    logits; they equal logits up to a constant per ray, so argmax and
+    cross-entropy are the same."""
+    decoder = model.decoder
+    if not isinstance(decoder, FactoredDecoder):
+        return prediction
+    return prediction | decoder.categorical_logits(prediction)
+
+
 def point_prediction(prediction: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Decoder outputs as values in observation units."""
+    """Decoder outputs as values in observation units. A factored decoder's
+    output must pass `categorical_outputs` first."""
     scalars = prediction["scalars"]
     return {
         "ray_class": prediction["ray_class"].argmax(-1),
@@ -391,7 +413,7 @@ def one_step(
             )
             z = model.sample(model.prior_logits(h), generator, straight_through=False)
             s = torch.cat([h, z], -1).unflatten(0, h_prev.shape[:2])
-            prediction = model.decoder(s)
+            prediction = categorical_outputs(model, model.decoder(s))
             metrics = point_metrics(
                 point_prediction(prediction), target, reference, unknown, max_distance
             )
@@ -445,7 +467,7 @@ def one_step(
             acc.add((subset, "frequency"), frequency, mask)
         posterior_s = torch.cat([f["h"][:, k], f["z"][:, k]], -1)
         reconstruction = point_metrics(
-            point_prediction(model.decoder(posterior_s)),
+            point_prediction(categorical_outputs(model, model.decoder(posterior_s))),
             target,
             target,
             unknown,
@@ -545,7 +567,7 @@ def imagination(
             ("model_shuffled_actions", shuffled),
         ):
             s = model.imagine(h, z, action, generator)
-            prediction = model.decoder(s)
+            prediction = categorical_outputs(model, model.decoder(s))
             metrics = point_metrics(
                 point_prediction(prediction), target, reference, unknown, max_distance
             )

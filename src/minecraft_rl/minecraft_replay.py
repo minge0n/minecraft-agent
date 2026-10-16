@@ -11,7 +11,11 @@ raw ids of each registry to a dense index over the ids that occur in the
 training split, plus one shared index for any id that does not occur there
 (`unknown`). The map is a data property, not Minecraft knowledge, and it
 keeps the categorical output layers small. Held-out data reports how often
-it hits the unknown index.
+it hits the unknown index. The Stage 3 and Stage 4 models use it.
+
+`RegistryVocabulary` replaces it for new models: every registered id is
+its own category, and no id is unknown
+(docs/decisions/registry-vocabulary.md).
 """
 
 import hashlib
@@ -29,6 +33,7 @@ from minecraft_rl.minecraft_interface import (
     RAY_KIND_ENTITY,
     RAY_KIND_FLUID,
 )
+from minecraft_rl.minecraft_registry import Registry
 from minecraft_rl.minecraft_world_model import (
     Vocabulary,
     action_tensor,
@@ -109,6 +114,101 @@ class CompactVocabulary:
         return cls({f: list(data["ids"][f]) for f in FAMILIES}, dict(data["raw_sizes"]))
 
 
+REGISTRY_VOCABULARY = "registry-vocabulary-v1"
+
+
+@dataclass(frozen=True)
+class RegistryVocabulary:
+    """Every registered type of the pinned Minecraft version is its own
+    model category (docs/decisions/registry-vocabulary.md). The model index
+    is the raw registry index, so nothing depends on which ids a dataset
+    holds, and an id that no training episode shows keeps its own category.
+    No index means unknown. An index outside the registry is an error.
+
+    It has the interface of `CompactVocabulary`, so the replay and the
+    filter read data the same way."""
+
+    registry: Registry
+
+    @property
+    def raw_sizes(self) -> dict[str, int]:
+        return self.registry.sizes()
+
+    def size(self, family: str) -> int:
+        return self.raw_sizes[family]
+
+    def table(self, family: str) -> numpy.ndarray:
+        return numpy.arange(self.size(family), dtype=numpy.int64)
+
+    def model_vocabulary(
+        self, rows: int, columns: int, max_distance: float
+    ) -> Vocabulary:
+        sizes = self.raw_sizes
+        return Vocabulary(
+            rows=rows,
+            columns=columns,
+            max_distance=max_distance,
+            block_types=sizes["block"],
+            fluid_types=sizes["fluid"],
+            entity_types=sizes["entity"],
+            item_types=sizes["item"],
+            effect_types=sizes["effect"],
+        )
+
+    def identifier(self) -> str:
+        return self.registry.fingerprint[:16]
+
+    def to_json(self) -> dict[str, Any]:
+        return registry_metadata(self.registry)
+
+
+def registry_metadata(registry: Registry) -> dict[str, Any]:
+    """What a registry-vocabulary checkpoint and run record about it."""
+    return {
+        "format": REGISTRY_VOCABULARY,
+        "minecraft_version": registry.minecraft_version,
+        "fingerprint": registry.fingerprint,
+        "sizes": registry.sizes(),
+    }
+
+
+def check_registry(metadata: dict[str, Any], registry: Registry) -> None:
+    """Refuse a model whose recorded registry is not `registry`."""
+    if metadata.get("format") != REGISTRY_VOCABULARY:
+        raise ValueError("the model has no registry vocabulary")
+    if metadata["fingerprint"] != registry.fingerprint:
+        raise ValueError(
+            "registry mismatch: the model was built for registry "
+            f"{metadata['fingerprint'][:16]} of Minecraft "
+            f"{metadata['minecraft_version']}, the data uses "
+            f"{registry.fingerprint[:16]} of {registry.minecraft_version}"
+        )
+
+
+def check_raw_ids(arrays: dict[str, numpy.ndarray], registry: Registry) -> None:
+    """Refuse episode arrays with an id outside the registry."""
+    sizes = registry.sizes()
+    kind, kind_type = arrays["obs_ray_kind"], arrays["obs_ray_type"]
+    for family, value in (
+        ("block", RAY_KIND_BLOCK),
+        ("fluid", RAY_KIND_FLUID),
+        ("entity", RAY_KIND_ENTITY),
+    ):
+        ids = kind_type[kind == value]
+        if ids.size and (ids.min() < 0 or ids.max() >= sizes[family]):
+            raise ValueError(f"a {family} id is outside the registry")
+    for name in ("obs_inventory_item", "obs_armor_item", "obs_offhand_item"):
+        ids = arrays[name]
+        if ids.size and (ids.min() < 0 or ids.max() >= sizes["item"]):
+            raise ValueError(f"an item id in {name} is outside the registry")
+    ids = arrays["obs_effect_type"]
+    if ids.size and (ids.min() < 0 or ids.max() >= sizes["effect"]):
+        raise ValueError("an effect id is outside the registry")
+
+
+VocabularyMap = CompactVocabulary | RegistryVocabulary
+
+
 def raw_sizes(schema: dict[str, Any]) -> dict[str, int]:
     return {
         "block": schema["block_types"],
@@ -124,9 +224,13 @@ def load_schema(dataset: Path) -> dict[str, Any]:
 
 
 def compact_arrays(
-    arrays: dict[str, numpy.ndarray], vocabulary: CompactVocabulary
+    arrays: dict[str, numpy.ndarray], vocabulary: "VocabularyMap"
 ) -> dict[str, numpy.ndarray]:
-    """A copy of episode arrays with every categorical id in compact form."""
+    """A copy of episode arrays with every categorical id in model form:
+    compact indices, or the raw registry ids checked against the registry."""
+    if isinstance(vocabulary, RegistryVocabulary):
+        check_raw_ids(arrays, vocabulary.registry)
+        return dict(arrays)
     out = dict(arrays)
     kind, kind_type = arrays["obs_ray_kind"], arrays["obs_ray_type"].astype(numpy.int64)
     compact = numpy.zeros_like(kind_type)
